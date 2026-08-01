@@ -25,6 +25,12 @@
   "triggers": {
     "crons": ["0 * * * *"]
   },
+  "vars": {
+    "ALPACA_DATA_FEED": "iex",
+    "ALPACA_TRADING_ENABLED": "false",
+    "ALPACA_MAX_STRATEGY_PCT": "0.02",
+    "ALPACA_MAX_PORTFOLIO_PCT": "0.20"
+  },
   "observability": {
     "enabled": true
   }

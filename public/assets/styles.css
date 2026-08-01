@@ -110,7 +110,7 @@ main { padding: 0 clamp(18px, 3vw, 44px) 36px; max-width: 1760px; margin: auto; 
 .audit-copy strong { font-size: 11px; font-weight: 600; display: flex; align-items: center; gap: 6px; }
 .audit-copy p { color: var(--muted); font: 10px/1.5 var(--mono); margin: 5px 0 0; }
 .event-dot { width: 6px; height: 6px; display: inline-block; border-radius: 50%; background: var(--blue); }
-.event-dot.PROMOTE, .event-dot.HEALTHY { background: var(--green); }.event-dot.DROP { background: var(--red); }.event-dot.REWORK, .event-dot.ADJUST { background: var(--amber); }.event-dot.REPRODUCE { background: var(--violet); }
+.event-dot.PROMOTE, .event-dot.HEALTHY, .event-dot.ORDER { background: var(--green); }.event-dot.DROP, .event-dot.ORDER_ERROR { background: var(--red); }.event-dot.REWORK, .event-dot.ADJUST { background: var(--amber); }.event-dot.REPRODUCE, .event-dot.ALPACA { background: var(--violet); }
 
 .roster-panel { margin-top: 16px; }
 .roster-heading { min-height: 68px; }

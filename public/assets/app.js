@@ -83,6 +83,9 @@ function ensureSelection() {
 function renderSummary() {
   $("#cycle-value").textContent = String(state.meta.cycle).padStart(2, "0");
   $("#capital-value").textContent = money(state.summary.capital);
+  $("#environment-value").textContent = state.meta.environment;
+  $("#data-source-value").textContent = state.alpaca?.connected ? `${String(state.alpaca.feed).toUpperCase()} · ${state.alpaca.trading_enabled ? "TRADE ON" : "READ ONLY"}` : "SYNTHETIC";
+  $("#sync-button").disabled = !("alpaca" in state);
   $("#seed-value").textContent = state.meta.seed;
   $("#count-generated").textContent = String(state.summary.generated).padStart(2, "0");
   $("#count-testing").textContent = String(state.summary.testing).padStart(2, "0");
@@ -228,6 +231,7 @@ async function action(path, payload, successMessage) {
 $("#generate-button").addEventListener("click", () => action("/api/generate", { count: 6 }, "Six new strategy DNAs seeded."));
 $("#review-button").addEventListener("click", () => action("/api/review", {}, "Supervisor review cycle complete."));
 $("#advance-button").addEventListener("click", () => action("/api/advance", { periods: 1 }, "Paper market advanced by 21 sessions."));
+$("#sync-button").addEventListener("click", () => action("/api/alpaca/sync", {}, "Alpaca account and market data synchronized."));
 $("#reproduce-button").addEventListener("click", async () => {
   const parent = getSelected();
   if (!parent) return;

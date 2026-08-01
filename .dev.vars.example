@@ -1,3 +1,5 @@
 # Copy this file to .dev.vars for authenticated local mutation requests.
 # Generate a long random value; never commit the real token.
 ADMIN_TOKEN=replace-with-a-long-random-secret
+ALPACA_API_KEY=replace-with-your-paper-key-id
+ALPACA_API_SECRET=replace-with-your-paper-secret-key

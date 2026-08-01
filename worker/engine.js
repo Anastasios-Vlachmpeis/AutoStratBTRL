@@ -1,7 +1,7 @@
 /** Deterministic strategy generation, backtesting, and lifecycle supervision. */
 
 export const REGIMES = ["Expansion", "Compression", "Stress", "Recovery"];
-export const ASSETS = ["BTC/USD", "ETH/USD", "SPY", "EUR/USD"];
+export const ASSETS = ["SPY", "QQQ", "IWM", "TLT"];
 
 const NAMES = [
   "Orion Pulse", "Kestrel Drift", "Helix Break", "Cobalt Revert",
@@ -56,7 +56,7 @@ const clone = (value) => structuredClone(value);
 
 export function marketSeries(seed, length = 420, assetIndex = 0) {
   const rng = new SeededRandom(seed * 97 + assetIndex * 7919);
-  let price = [31800, 1850, 420, 1.08][assetIndex];
+  let price = [450, 380, 190, 100][assetIndex];
   const prices = [price];
   const labels = [];
   const specs = {
@@ -117,6 +117,25 @@ function signal(strategy, prices) {
   const trend = prices.at(-1) / prices.at(-params.lookback) - 1;
   if (realized > params.vol_ceiling) return 0;
   return trend > params.threshold ? 1 : trend < -params.threshold ? -1 : 0;
+}
+
+export function latestSignal(strategy, prices) {
+  return signal(strategy, prices);
+}
+
+export function evaluateStrategyWindow(strategy, prices, window = 21) {
+  const returns = [];
+  const start = Math.max(52, prices.length - window - 1);
+  let priorPosition = 0;
+  for (let index = start; index < prices.length - 1; index += 1) {
+    const rawSignal = signal(strategy, prices.slice(0, index + 1));
+    const position = rawSignal > 0 ? strategy.params.position_size : 0;
+    const marketReturn = prices[index + 1] / prices[index] - 1;
+    const cost = Math.abs(position - priorPosition) * 0.0005;
+    returns.push(position * marketReturn - cost);
+    priorPosition = position;
+  }
+  return { signal: signal(strategy, prices) > 0 ? 1 : 0, returns };
 }
 
 export function backtest(strategy, prices, regimes) {
@@ -314,6 +333,55 @@ export function reviewCandidates(state, bootstrap = false) {
   state.marketClock += 8;
 }
 
+function marketRegimes(prices) {
+  return prices.map((price, index) => {
+    if (index < 20) return "Compression";
+    const window = prices.slice(index - 20, index + 1);
+    const recentReturns = window.slice(1).map((value, offset) => value / window[offset] - 1);
+    const trend = price / window[0] - 1;
+    const volatility = stdev(recentReturns) * Math.sqrt(252);
+    if (trend > 0.04) return "Expansion";
+    if (trend < -0.04) return "Stress";
+    if (volatility < 0.13) return "Compression";
+    return "Recovery";
+  });
+}
+
+export function reviewCandidatesWithBars(state, barsBySymbol) {
+  const candidates = state.strategies.filter((item) => ["generated", "rework"].includes(item.state));
+  if (!candidates.length) {
+    event(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
+    return;
+  }
+  const releasePool = [];
+  for (const strategy of candidates) {
+    const allPrices = (barsBySymbol[strategy.asset] ?? []).map((bar) => Number(bar.c)).filter((value) => Number.isFinite(value) && value > 0);
+    if (allPrices.length < 180) {
+      strategy.state = "rework";
+      event(state, "REWORK", `${strategy.name} waiting for data`, `Only ${allPrices.length} Alpaca daily bars were available.`);
+      continue;
+    }
+    const prices = allPrices.slice(-600);
+    const windowSize = Math.max(160, Math.floor(prices.length * 0.65));
+    const ends = [Math.floor(prices.length * 0.80), Math.floor(prices.length * 0.90), prices.length];
+    const results = ends.map((end) => {
+      const windowPrices = prices.slice(Math.max(0, end - windowSize), end);
+      return backtest(strategy, windowPrices, marketRegimes(windowPrices));
+    });
+    strategy.backtests += results.length;
+    strategy.metrics = aggregateResults(results);
+    const [nextState, reason] = decision(strategy.metrics);
+    strategy.state = nextState;
+    if (nextState === "released") releasePool.push(strategy);
+    event(state, nextState === "released" ? "PROMOTE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, `${reason} · Alpaca IEX data`);
+  }
+  releasePool.sort((left, right) => right.metrics.score - left.metrics.score).slice(3).forEach((strategy) => {
+    strategy.state = "rework";
+    event(state, "REWORK", `${strategy.name} held`, "Release cap reached; retained for the next evidence cycle.");
+  });
+  state.marketClock += 8;
+}
+
 export function reproduce(state, strategyId) {
   const parent = state.strategies.find((item) => item.id === strategyId);
   if (!parent) throw new Error("Strategy not found");
@@ -377,6 +445,87 @@ export function advanceMarket(state, periods = 1, bootstrap = false) {
   }
 }
 
+function monitorStrategy(state, strategy, newReturns) {
+  const monitor = strategy.monitor;
+  monitor.returns = [...monitor.returns, ...newReturns].slice(-63);
+  const observed = monitor.returns.slice(-42);
+  const sharpe = mean(observed) / Math.max(stdev(observed), 0.0001) * Math.sqrt(252);
+  let equity = 1;
+  let peak = 1;
+  let drawdown = 0;
+  for (const value of observed) {
+    equity *= 1 + value;
+    peak = Math.max(peak, equity);
+    drawdown = Math.max(drawdown, 1 - equity / peak);
+  }
+  const expected = Math.max((strategy.metrics?.annualized ?? 0.03) / 252, 0.0001);
+  const ratio = mean(observed) / expected;
+  Object.assign(monitor, { sharpe: round(sharpe, 2), drawdown: round(drawdown, 4), ratio: round(ratio, 2) });
+  const failing = sharpe < 0.30 || drawdown > 0.08 || ratio < 0.45;
+  monitor.streak = failing ? monitor.streak + 1 : 0;
+  if (drawdown > 0.12 || (monitor.streak >= 2 && (sharpe < -0.50 || ratio < 0.10)) || monitor.adjustments >= 3) {
+    strategy.state = "dropped";
+    event(state, "DROP", `${strategy.name} retired`, `Alpaca monitor Sharpe ${sharpe.toFixed(2)} · rolling DD ${(drawdown * 100).toFixed(1)}%`);
+  } else if (monitor.streak >= 2) {
+    strategy.state = "adjusted";
+    strategy.params.position_size = round(strategy.params.position_size * 0.80, 2);
+    monitor.adjustments += 1;
+    monitor.streak = 0;
+    event(state, "ADJUST", `${strategy.name} risk reduced`, "position size cut 20% after two weak live-data windows.");
+  } else if (failing) {
+    strategy.state = "watch";
+  } else {
+    if (strategy.state !== "healthy") event(state, "HEALTHY", `${strategy.name} cleared Alpaca monitor`, `rolling Sharpe ${sharpe.toFixed(2)} · DD ${(drawdown * 100).toFixed(1)}%`);
+    strategy.state = "healthy";
+  }
+}
+
+export function applyAlpacaCycle(state, cycle) {
+  if (cycle.scheduled_bucket && state.alpaca?.last_cycle_bucket === cycle.scheduled_bucket) return false;
+  const barTimes = Object.values(cycle.evaluations ?? {}).map((evaluation) => evaluation.bar_time).filter(Boolean);
+  const latestBarTime = barTimes.sort().at(-1) ?? state.alpaca?.last_bar_time ?? null;
+  const hasNewMarketData = latestBarTime != null && latestBarTime !== state.alpaca?.last_bar_time;
+  for (const strategy of state.strategies) {
+    const evaluation = cycle.evaluations?.[strategy.id];
+    if (evaluation && ["released", "healthy", "watch", "adjusted"].includes(strategy.state)) {
+      if (hasNewMarketData) monitorStrategy(state, strategy, evaluation.returns ?? []);
+      strategy.live = {
+        signal: evaluation.signal,
+        latest_price: evaluation.latest_price,
+        bar_time: evaluation.bar_time,
+      };
+    }
+  }
+  const priorManaged = new Set(state.alpaca?.managed_symbols ?? []);
+  for (const order of cycle.submitted_orders ?? []) {
+    if (order.side === "buy") priorManaged.add(order.symbol);
+    event(state, "ORDER", `${order.side.toUpperCase()} ${order.symbol} submitted`, `${order.status} · ${order.client_order_id}`);
+  }
+  for (const failure of cycle.order_errors ?? []) {
+    event(state, "ORDER_ERROR", `${failure.symbol} order failed`, failure.message);
+  }
+  state.alpaca = {
+    connected: true,
+    fetched_at: cycle.fetched_at,
+    feed: cycle.feed,
+    trading_enabled: cycle.trading_enabled,
+    can_trade_now: cycle.can_trade_now,
+    account: cycle.account,
+    positions: cycle.positions,
+    open_orders: cycle.open_orders,
+    clock: cycle.clock,
+    proposed_orders: cycle.proposed_orders,
+    submitted_orders: cycle.submitted_orders,
+    order_errors: cycle.order_errors,
+    managed_symbols: [...priorManaged],
+    last_cycle_bucket: cycle.scheduled_bucket,
+    last_bar_time: latestBarTime,
+  };
+  if (hasNewMarketData) state.marketClock += 21;
+  event(state, "ALPACA", "Alpaca paper account synchronized", `${cycle.feed.toUpperCase()} data · ${cycle.positions.length} positions · trading ${cycle.trading_enabled ? "enabled" : "disabled"}`);
+  return true;
+}
+
 export function createDemoState() {
   const state = {
     seed: 20260801,
@@ -386,6 +535,7 @@ export function createDemoState() {
     strategies: [],
     events: [],
     lastScheduledBucket: null,
+    alpaca: { connected: false, managed_symbols: [], last_cycle_bucket: null },
   };
   generateBatch(state, 8, true);
   reviewCandidates(state, true);
@@ -399,14 +549,15 @@ export function snapshot(state) {
   const released = strategies.filter((item) => ACTIVE_STATES.has(item.state));
   const scored = strategies.filter((item) => item.metrics);
   const averageScore = mean(scored.map((item) => item.metrics.score));
-  const capital = released.length
+  const simulatedCapital = released.length
     ? 10000000 * product(released.map((item) => 1 + clamp(mean(item.monitor.returns), -0.02, 0.02)))
     : 10000000;
+  const capital = state.alpaca?.connected ? Number(state.alpaca.account?.equity ?? simulatedCapital) : simulatedCapital;
   return {
     meta: {
       cycle: state.cycle,
       clock: state.marketClock,
-      environment: "PAPER",
+      environment: state.alpaca?.connected ? "ALPACA PAPER" : "PAPER SIM",
       seed: state.seed,
       last_scheduled_bucket: state.lastScheduledBucket,
     },
@@ -420,6 +571,7 @@ export function snapshot(state) {
     },
     strategies,
     events: clone(state.events),
+    alpaca: clone(state.alpaca ?? { connected: false }),
     policy: { release_score: 61, min_sharpe: 0.55, max_drawdown: 0.20, monitor_window: 21 },
   };
 }

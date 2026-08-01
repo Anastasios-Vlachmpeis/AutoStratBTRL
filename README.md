@@ -31,7 +31,7 @@ npm install
 Copy-Item .dev.vars.example .dev.vars
 ```
 
-Replace the placeholder in `.dev.vars` with a long random admin token. The file is ignored by Git.
+Replace the placeholders in `.dev.vars` with a long random admin token and your **paper** Alpaca key pair. The file is ignored by Git. Never use live-account credentials in this project.
 
 ```powershell
 npm run dev:cloudflare
@@ -50,12 +50,54 @@ Invoke-WebRequest "http://127.0.0.1:8787/cdn-cgi/handler/scheduled?format=json"
 ```powershell
 npx wrangler login
 npx wrangler secret put ADMIN_TOKEN
+npx wrangler secret put ALPACA_API_KEY
+npx wrangler secret put ALPACA_API_SECRET
 npm run deploy
 ```
 
 Wrangler prints the resulting `*.workers.dev` URL. Configure a custom domain later from **Cloudflare Dashboard → Workers & Pages → axiom-strategy-foundry → Settings → Domains & Routes**.
 
+Each command asks for the value without writing it to the repository. In the Cloudflare dashboard, the equivalent location is **Worker → Settings → Variables & Secrets → Add → Secret**. These are runtime secrets; do not put them in Workers Builds variables.
+
+Required secrets:
+
+| Secret | Value |
+|---|---|
+| `ADMIN_TOKEN` | Your own long random dashboard password |
+| `ALPACA_API_KEY` | Alpaca paper API key ID |
+| `ALPACA_API_SECRET` | Alpaca paper secret key |
+
+The same Alpaca paper key pair authenticates paper-account and market-data requests. No additional data key is needed for the default IEX feed.
+
 `ADMIN_TOKEN` is never stored in `wrangler.jsonc` or the repository. Without the secret, mutation endpoints are intentionally open for local/demo use. Read-only strategy state remains public; use Cloudflare Access in front of the Worker if the entire terminal must be private.
+
+## Alpaca paper connection
+
+The Cloudflare Worker connects only to:
+
+- `https://paper-api.alpaca.markets` for the account, positions, clock, assets, open orders, and paper orders.
+- `https://data.alpaca.markets` for historical and monitoring bars.
+
+The first integration supports four US equity ETFs: `SPY`, `QQQ`, `IWM`, and `TLT`. It uses three years of daily IEX bars for supervisor reviews and 45 days of hourly IEX bars for monitoring. IEX is Alpaca's free single-exchange feed; it is not the full consolidated SIP market feed.
+
+Press **Sync Alpaca** to verify the credentials and load account equity, positions, market status, and current bars. Scheduled hourly runs perform the same synchronization automatically.
+
+Automated orders are disabled by default:
+
+```json
+"ALPACA_TRADING_ENABLED": "false"
+```
+
+While disabled, the terminal calculates and displays proposed orders but submits nothing. To enable paper orders after reviewing the proposals and logs, change that value in `wrangler.jsonc` to `"true"` and redeploy.
+
+Paper execution is deliberately restricted:
+
+- Long-only market orders; no shorts, leverage targets, options, or crypto.
+- Maximum 2% of account equity per released strategy.
+- Maximum 20% aggregate strategy allocation.
+- Orders only while the US equity market is open and the account is not blocked.
+- Sells only reduce symbols previously bought by Axiom; existing manual positions are not adopted automatically.
+- Stable client order IDs prevent scheduler retries from placing the same order twice.
 
 ### Monitoring cadence
 
@@ -65,7 +107,7 @@ The default schedule in `wrangler.jsonc` is hourly, in UTC:
 "crons": ["0 * * * *"]
 ```
 
-Each invocation advances one simulated 21-session monitor window. For a real daily evaluation, change it before deployment to `"0 0 * * *"`. Scheduled invocations are idempotent per UTC hour, so a Cloudflare retry does not double-advance the same window.
+Each invocation synchronizes the Alpaca paper account and evaluates a new hourly-bar monitor window. For one daily evaluation, change it before deployment to `"0 0 * * *"`. Scheduled invocations and paper orders use stable UTC-hour identifiers so Cloudflare retries do not intentionally duplicate the same cycle.
 
 Cloudflare and local Python states are intentionally separate. Resetting or running one environment does not affect the other.
 

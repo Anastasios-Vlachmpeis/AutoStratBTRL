@@ -7,7 +7,7 @@
     "dev:cloudflare": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
-    "check": "node --check worker/index.js && node --check worker/engine.js && node --test worker/engine.test.js"
+    "check": "node --check worker/index.js && node --check worker/engine.js && node --check worker/alpaca.js && node --test worker/engine.test.js worker/alpaca.test.js"
   },
   "devDependencies": {
     "wrangler": "^4.68.0"

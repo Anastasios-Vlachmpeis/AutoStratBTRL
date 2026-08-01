@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  applyAlpacaCycle,
   advanceMarket,
   backtest,
   createDemoState,
@@ -9,6 +10,7 @@ import {
   marketSeries,
   reproduce,
   reviewCandidates,
+  reviewCandidatesWithBars,
   snapshot,
 } from "./engine.js";
 
@@ -60,4 +62,39 @@ test("market advance records monitoring evidence", () => {
     assert.ok(current.monitor.returns.length >= 21);
     assert.notEqual(current.monitor.sharpe, null);
   }
+});
+
+test("live-data review consumes Alpaca bars", () => {
+  const state = createDemoState();
+  generateBatch(state, 2);
+  const bars = Object.fromEntries(["SPY", "QQQ", "IWM", "TLT"].map((symbol) => [symbol,
+    Array.from({ length: 620 }, (_, index) => ({ c: 100 + index * 0.08 + Math.sin(index / 8) }))
+  ]));
+  reviewCandidatesWithBars(state, bars);
+  assert.equal(snapshot(state).summary.generated, 0);
+  assert.ok(state.strategies.slice(0, 2).every((strategy) => strategy.backtests === 3));
+  assert.ok(state.events.some((item) => item.detail.includes("Alpaca IEX data")));
+});
+
+test("Alpaca cycles are idempotent and record managed symbols", () => {
+  const state = createDemoState();
+  const active = state.strategies.find((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
+  const cycle = {
+    scheduled_bucket: "2026-08-03T15",
+    fetched_at: "2026-08-03T15:05:00Z",
+    feed: "iex",
+    trading_enabled: true,
+    can_trade_now: true,
+    account: { equity: 100000 },
+    positions: [], open_orders: [],
+    clock: { is_open: true },
+    proposed_orders: [],
+    submitted_orders: [{ symbol: active.asset, side: "buy", status: "accepted", client_order_id: "axiom-test" }],
+    order_errors: [],
+    evaluations: { [active.id]: { signal: 1, latest_price: 500, bar_time: "2026-08-03T15:00:00Z", returns: [0.001, 0.002] } },
+  };
+  assert.equal(applyAlpacaCycle(state, cycle), true);
+  assert.equal(applyAlpacaCycle(state, cycle), false);
+  assert.ok(state.alpaca.managed_symbols.includes(active.asset));
+  assert.equal(snapshot(state).summary.capital, 100000);
 });

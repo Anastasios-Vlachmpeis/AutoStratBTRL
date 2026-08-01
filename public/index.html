@@ -30,7 +30,8 @@
           <h1>Strategy Foundry <span>/ AXIOM</span></h1>
         </div>
         <div class="top-status">
-          <div><span class="label">ENV</span><strong class="env-badge">PAPER</strong></div>
+          <div><span class="label">ENV</span><strong class="env-badge" id="environment-value">PAPER SIM</strong></div>
+          <div><span class="label">DATA</span><strong id="data-source-value">SYNTHETIC</strong></div>
           <div><span class="label">CYCLE</span><strong id="cycle-value">—</strong></div>
           <div><span class="label">CAPITAL</span><strong id="capital-value">—</strong></div>
           <button class="icon-button" id="reset-button" title="Restore deterministic demo" aria-label="Restore deterministic demo">↻</button>
@@ -46,7 +47,8 @@
           <div class="command-actions">
             <button class="button secondary" id="generate-button"><span>＋</span> Seed cohort</button>
             <button class="button secondary" id="review-button"><span>⌁</span> Run supervisor</button>
-            <button class="button primary" id="advance-button"><span>▶</span> Advance 21 sessions</button>
+            <button class="button secondary" id="advance-button"><span>▷</span> Advance simulation</button>
+            <button class="button primary" id="sync-button"><span>↯</span> Sync Alpaca</button>
           </div>
         </section>
 

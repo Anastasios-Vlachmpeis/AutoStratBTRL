@@ -1,12 +1,15 @@
 import { DurableObject } from "cloudflare:workers";
 import {
+  applyAlpacaCycle,
   advanceMarket,
   createDemoState,
   generateBatch,
   reproduce,
   reviewCandidates,
+  reviewCandidatesWithBars,
   snapshot,
 } from "./engine.js";
+import { buildPaperCycle, getResearchBars } from "./alpaca.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = "axiom-global-supervisor";
@@ -22,6 +25,35 @@ function labStub(env) {
 function authorized(request, env) {
   if (!env.ADMIN_TOKEN) return true;
   return request.headers.get("authorization") === `Bearer ${env.ADMIN_TOKEN}`;
+}
+
+async function stateFrom(stub) {
+  const response = await stub.fetch(new Request("https://axiom.internal/api/state"));
+  if (!response.ok) throw new Error("Unable to load supervisor state");
+  return response.json();
+}
+
+async function synchronizeAlpaca(env, stub, bucket, orderBucket = bucket) {
+  const appState = await stateFrom(stub);
+  const cycle = await buildPaperCycle(env, appState, bucket, orderBucket);
+  return stub.fetch(new Request("https://axiom.internal/internal/alpaca-cycle", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(cycle),
+  }));
+}
+
+async function reviewWithAlpaca(env, stub) {
+  const appState = await stateFrom(stub);
+  const symbols = [...new Set(appState.strategies
+    .filter((strategy) => ["generated", "rework"].includes(strategy.state))
+    .map((strategy) => strategy.asset))];
+  const bars = await getResearchBars(env, symbols);
+  return stub.fetch(new Request("https://axiom.internal/internal/review-live", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bars }),
+  }));
 }
 
 export class AxiomLab extends DurableObject {
@@ -73,6 +105,16 @@ export class AxiomLab extends DurableObject {
       if (request.method === "POST" && url.pathname === "/api/reset") {
         return this.save(createDemoState());
       }
+      if (request.method === "POST" && url.pathname === "/internal/review-live") {
+        const body = await request.json();
+        reviewCandidatesWithBars(state, body.bars ?? {});
+        return this.save(state);
+      }
+      if (request.method === "POST" && url.pathname === "/internal/alpaca-cycle") {
+        const cycle = await request.json();
+        const changed = applyAlpacaCycle(state, cycle);
+        return changed ? this.save(state) : json(snapshot(state));
+      }
       if (request.method === "POST" && url.pathname === "/internal/scheduled") {
         const scheduledBucket = request.headers.get("x-axiom-scheduled-bucket");
         if (!scheduledBucket) return json({ error: "Missing schedule bucket" }, 400);
@@ -96,17 +138,29 @@ export default {
       if (request.method !== "GET" && !authorized(request, env)) {
         return json({ error: "Admin token required" }, 401);
       }
-      return labStub(env).fetch(request);
+      const stub = labStub(env);
+      try {
+        if (request.method === "POST" && url.pathname === "/api/alpaca/sync") {
+          const hour = new Date().toISOString().slice(0, 13);
+          return await synchronizeAlpaca(env, stub, `manual-${Date.now()}`, hour);
+        }
+        if (request.method === "POST" && url.pathname === "/api/review") {
+          return await reviewWithAlpaca(env, stub);
+        }
+        return stub.fetch(request);
+      } catch (error) {
+        return json({ error: error instanceof Error ? error.message : "Alpaca request failed" }, 502);
+      }
     }
     return env.ASSETS.fetch(request);
   },
 
   async scheduled(controller, env, ctx) {
     const bucket = new Date(controller.scheduledTime).toISOString().slice(0, 13);
-    const request = new Request("https://axiom.internal/internal/scheduled", {
-      method: "POST",
-      headers: { "x-axiom-scheduled-bucket": bucket },
-    });
-    ctx.waitUntil(labStub(env).fetch(request));
+    if (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET) {
+      console.warn("Alpaca schedule skipped: credentials are not configured");
+      return;
+    }
+    ctx.waitUntil(synchronizeAlpaca(env, labStub(env), bucket));
   },
 };
