@@ -1,0 +1,142 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Axiom autonomous strategy foundry and paper-release terminal">
+  <title>Axiom / Strategy Foundry</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/assets/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="rail" aria-label="Primary navigation">
+      <a class="mark" href="#" aria-label="Axiom home"><span>AX</span></a>
+      <nav class="rail-nav">
+        <button class="rail-button active" data-view="overview" aria-label="Foundry overview"><span class="rail-icon">⌘</span><span>Foundry</span></button>
+        <button class="rail-button" data-view="testing" aria-label="Backtest queue"><span class="rail-icon">⌁</span><span>Tests</span></button>
+        <button class="rail-button" data-view="released" aria-label="Released strategies"><span class="rail-icon">◇</span><span>Market</span></button>
+        <button class="rail-button" data-view="lineage" aria-label="Strategy lineage"><span class="rail-icon">⑂</span><span>Lineage</span></button>
+      </nav>
+      <div class="rail-foot"><span class="pulse-dot"></span><span>SIM<br>ONLINE</span></div>
+    </aside>
+
+    <div class="workspace">
+      <header class="topbar">
+        <div class="brand-copy">
+          <span class="eyebrow">AUTONOMOUS RESEARCH SYSTEM</span>
+          <h1>Strategy Foundry <span>/ AXIOM</span></h1>
+        </div>
+        <div class="top-status">
+          <div><span class="label">ENV</span><strong class="env-badge">PAPER</strong></div>
+          <div><span class="label">CYCLE</span><strong id="cycle-value">—</strong></div>
+          <div><span class="label">CAPITAL</span><strong id="capital-value">—</strong></div>
+          <button class="icon-button" id="reset-button" title="Restore deterministic demo" aria-label="Restore deterministic demo">↻</button>
+        </div>
+      </header>
+
+      <main>
+        <section class="command-strip" aria-label="Foundry controls">
+          <div>
+            <span class="section-kicker">SELF-SUPERVISING PIPELINE</span>
+            <p>Generate from first principles. Promote on evidence. Kill on drift.</p>
+          </div>
+          <div class="command-actions">
+            <button class="button secondary" id="generate-button"><span>＋</span> Seed cohort</button>
+            <button class="button secondary" id="review-button"><span>⌁</span> Run supervisor</button>
+            <button class="button primary" id="advance-button"><span>▶</span> Advance 21 sessions</button>
+          </div>
+        </section>
+
+        <section class="pipeline" aria-label="Strategy release pipeline">
+          <article class="pipeline-step">
+            <div class="step-index">01</div><div><span>GENERATED</span><strong id="count-generated">0</strong></div>
+            <small>fresh DNA</small>
+          </article>
+          <div class="pipeline-link"><span></span></div>
+          <article class="pipeline-step">
+            <div class="step-index amber">02</div><div><span>UNDER REVIEW</span><strong id="count-testing">0</strong></div>
+            <small>3× regimes</small>
+          </article>
+          <div class="pipeline-link"><span></span></div>
+          <article class="pipeline-step">
+            <div class="step-index green">03</div><div><span>IN MARKET</span><strong id="count-released">0</strong></div>
+            <small>paper live</small>
+          </article>
+          <div class="pipeline-link"><span></span></div>
+          <article class="pipeline-step">
+            <div class="step-index muted">04</div><div><span>RETIRED</span><strong id="count-dropped">0</strong></div>
+            <small>evidence failed</small>
+          </article>
+        </section>
+
+        <section class="main-grid">
+          <article class="panel performance-panel">
+            <div class="panel-header">
+              <div>
+                <span class="section-kicker">SELECTED STRATEGY</span>
+                <h2 id="selected-name">Choose a strategy</h2>
+                <div class="selected-meta" id="selected-meta"></div>
+              </div>
+              <div class="panel-actions">
+                <span class="status-badge" id="selected-status">—</span>
+                <button class="button compact" id="reproduce-button" disabled>Reproduce DNA</button>
+              </div>
+            </div>
+            <div class="metric-row" id="metric-row"></div>
+            <div class="chart-wrap">
+              <div class="chart-labels"><span>OUT-OF-SAMPLE EQUITY</span><span id="chart-delta">—</span></div>
+              <svg id="equity-chart" viewBox="0 0 900 255" role="img" aria-label="Selected strategy backtest equity curve"></svg>
+            </div>
+          </article>
+
+          <aside class="panel audit-panel">
+            <div class="panel-header simple">
+              <div><span class="section-kicker">SUPERVISOR TAPE</span><h2>Decision log</h2></div>
+              <span class="live-marker"><i></i>LIVE</span>
+            </div>
+            <div class="audit-feed" id="audit-feed" aria-live="polite"></div>
+          </aside>
+        </section>
+
+        <section class="panel roster-panel">
+          <div class="panel-header roster-heading">
+            <div>
+              <span class="section-kicker">STRATEGY ROSTER</span>
+              <h2 id="roster-title">All research units</h2>
+            </div>
+            <div class="roster-summary"><span id="average-score">—</span><small>AVG SCORE</small></div>
+          </div>
+          <div class="table-scroll">
+            <table>
+              <thead><tr><th>Unit</th><th>Archetype / market</th><th>Stage</th><th>Evidence</th><th>Sharpe</th><th>Max DD</th><th>Score</th><th></th></tr></thead>
+              <tbody id="strategy-table"></tbody>
+            </table>
+          </div>
+          <div class="empty-state" id="empty-state" hidden>No strategies match this desk.</div>
+        </section>
+
+        <section class="detail-grid">
+          <article class="panel dna-panel">
+            <div class="panel-header simple"><div><span class="section-kicker">STRATEGY DNA</span><h2>Blueprint & lineage</h2></div><span class="mono" id="selected-id">—</span></div>
+            <div id="dna-content" class="dna-content"></div>
+          </article>
+          <article class="panel regime-panel">
+            <div class="panel-header simple"><div><span class="section-kicker">REGIME FITNESS</span><h2>Generalization map</h2></div><span class="mono">4 / 4 SCENARIOS</span></div>
+            <div id="regime-content" class="regime-content"></div>
+          </article>
+          <article class="panel gates-panel">
+            <div class="panel-header simple"><div><span class="section-kicker">RELEASE POLICY</span><h2>Supervisor gates</h2></div><span class="policy-lock">LOCKED</span></div>
+            <div id="gate-content" class="gate-content"></div>
+          </article>
+        </section>
+      </main>
+      <footer><span>AXIOM v0.1 / DETERMINISTIC SEED <b id="seed-value">—</b></span><span>RESEARCH & PAPER SIMULATION ONLY — NOT INVESTMENT ADVICE</span></footer>
+    </div>
+  </div>
+  <div class="toast" id="toast" role="status" aria-live="polite"></div>
+  <script src="/assets/app.js"></script>
+</body>
+</html>
