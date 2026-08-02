@@ -287,7 +287,7 @@ class StrategyLab:
         diagnosis = self._diagnose_development(strategy)["text"] if source_stage in {"development", "validation"} else reason
         strategy["rework"] = {
             **prior, "max_attempts": 3, "diagnosis": diagnosis,
-            "source_stage": source_stage, "change": None,
+            "source_stage": source_stage, "change": prior.get("change"),
         }
         strategy["state"] = "rework"
 

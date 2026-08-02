@@ -350,7 +350,7 @@ function queueRework(strategy, sourceStage, reason) {
     max_attempts: MAX_REWORK_ATTEMPTS,
     diagnosis,
     source_stage: sourceStage,
-    change: null,
+    change: prior.change ?? null,
   };
   strategy.state = "rework";
 }
