@@ -196,16 +196,11 @@ class StrategyLab:
     def reset(self) -> None:
         with getattr(self, "_lock", threading.RLock()):
             self.seed = 20_260_801
-            self.cycle = 14
-            self.market_clock = 126
-            self.next_id = 38
+            self.cycle = 0
+            self.market_clock = 0
+            self.next_id = 1
             self.strategies: list[dict[str, Any]] = []
             self.events: list[dict[str, str]] = []
-            self.generate_batch(8, bootstrap=True)
-            self.review_candidates(bootstrap=True)
-            self.validate_candidates(bootstrap=True)
-            self.advance_market(2, bootstrap=True)
-            self._event("SYSTEM", "Foundry restored", "Deterministic paper environment is online.")
 
     def _event(self, kind: str, title: str, detail: str) -> None:
         timestamp = datetime(2026, 8, 1, 9, 20, tzinfo=timezone.utc) + timedelta(minutes=self.market_clock)
@@ -406,7 +401,7 @@ class StrategyLab:
             active_states = {"released", "healthy", "watch", "adjusted"}
             released = [item for item in strategies if item["state"] in active_states]
             avg_score = mean([item["metrics"]["score"] for item in strategies if item["metrics"]])
-            capital = 10_000_000 * math.prod(1 + clamp(mean(item["monitor"]["returns"]), -0.02, 0.02) for item in released) if released else 10_000_000
+            capital = 100_000 * math.prod(1 + clamp(mean(item["monitor"]["returns"]), -0.02, 0.02) for item in released) if released else 100_000
             return {
                 "meta": {"cycle": self.cycle, "clock": self.market_clock, "environment": "PAPER", "seed": self.seed},
                 "summary": {

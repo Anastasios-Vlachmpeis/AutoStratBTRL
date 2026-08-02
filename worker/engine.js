@@ -608,38 +608,22 @@ export function applyAlpacaCycle(state, cycle) {
 }
 
 export function createDemoState() {
-  const state = {
-    schemaVersion: 2,
+  return {
+    schemaVersion: 3,
     seed: 20260801,
-    cycle: 14,
-    marketClock: 126,
-    nextId: 38,
+    cycle: 0,
+    marketClock: 0,
+    nextId: 1,
     strategies: [],
     events: [],
     lastScheduledBucket: null,
     alpaca: { connected: false, managed_symbols: [], last_cycle_bucket: null },
   };
-  generateBatch(state, 8, true);
-  reviewCandidates(state, true);
-  validateCandidates(state, true);
-  advanceMarket(state, 2, true);
-  event(state, "SYSTEM", "Foundry restored", "Durable paper environment is online.");
-  return state;
 }
 
 export function migrateState(state) {
-  if ((state.schemaVersion ?? 1) >= 2) return state;
-  let moved = 0;
-  for (const strategy of state.strategies ?? []) {
-    if (strategy.validation === undefined) strategy.validation = null;
-    if (ACTIVE_STATES.has(strategy.state) && !strategy.validation) {
-      strategy.state = "validation";
-      moved += 1;
-    }
-  }
-  state.schemaVersion = 2;
-  if (moved) event(state, "VALIDATE", "Validation gate migration applied", `${moved} previously released strategies now require untouched-data validation.`);
-  return state;
+  if ((state.schemaVersion ?? 1) >= 3) return state;
+  return createDemoState();
 }
 
 export function snapshot(state) {
@@ -648,15 +632,15 @@ export function snapshot(state) {
   const scored = strategies.filter((item) => item.metrics);
   const averageScore = mean(scored.map((item) => item.metrics.score));
   const simulatedCapital = released.length
-    ? 10000000 * product(released.map((item) => 1 + clamp(mean(item.monitor.returns), -0.02, 0.02)))
-    : 10000000;
+    ? 100000 * product(released.map((item) => 1 + clamp(mean(item.monitor.returns), -0.02, 0.02)))
+    : 100000;
   const capital = state.alpaca?.connected ? Number(state.alpaca.account?.equity ?? simulatedCapital) : simulatedCapital;
   return {
     meta: {
       cycle: state.cycle,
       clock: state.marketClock,
       environment: state.alpaca?.connected ? "ALPACA PAPER" : "PAPER SIM",
-      schema_version: state.schemaVersion ?? 2,
+      schema_version: state.schemaVersion ?? 3,
       seed: state.seed,
       last_scheduled_bucket: state.lastScheduledBucket,
     },

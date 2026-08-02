@@ -16,12 +16,24 @@ import {
   validateCandidates,
 } from "./engine.js";
 
-test("demo state is deterministic and begins with a release book", () => {
+function addReleasedStrategy(state) {
+  generateBatch(state, 1);
+  const strategy = state.strategies[0];
+  strategy.state = "released";
+  strategy.metrics = { score: 70, annualized: 0.12, sharpe: 1.1, drawdown: 0.08, trades: 30 };
+  strategy.validation = { sharpe: 0.8, return: 0.06, drawdown: 0.07 };
+  return strategy;
+}
+
+test("initial state is deterministic and completely empty", () => {
   const first = snapshot(createDemoState());
   const second = snapshot(createDemoState());
-  assert.deepEqual(first.strategies, second.strategies);
-  assert.ok(first.summary.released >= 1);
-  assert.ok(first.strategies.every((strategy) => strategy.backtests >= 3));
+  assert.deepEqual(first, second);
+  assert.deepEqual(first.strategies, []);
+  assert.deepEqual(first.events, []);
+  assert.equal(first.summary.released, 0);
+  assert.equal(first.summary.capital, 100000);
+  assert.equal(first.meta.cycle, 0);
 });
 
 test("cohorts wait for evidence before supervisor review", () => {
@@ -37,7 +49,7 @@ test("cohorts wait for evidence before supervisor review", () => {
 
 test("reproduction preserves lineage and mutates DNA", () => {
   const state = createDemoState();
-  const parent = state.strategies.find((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
+  const parent = addReleasedStrategy(state);
   reproduce(state, parent.id);
   const child = state.strategies[0];
   assert.equal(child.parent, parent.id);
@@ -57,6 +69,7 @@ test("no-signal backtests stay finite", () => {
 
 test("market advance records monitoring evidence", () => {
   const state = createDemoState();
+  addReleasedStrategy(state);
   const active = state.strategies.filter((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
   advanceMarket(state);
   for (const prior of active) {
@@ -99,7 +112,9 @@ test("supervisor cannot see the untouched final quarter", () => {
 
 test("supervisor approval enters validation before release", () => {
   const state = createDemoState();
-  generateBatch(state, 12);
+  state.cycle = 14;
+  state.nextId = 38;
+  generateBatch(state, 8);
   reviewCandidates(state);
   const awaiting = state.strategies.filter((strategy) => strategy.state === "validation");
   assert.ok(awaiting.length > 0);
@@ -108,20 +123,19 @@ test("supervisor approval enters validation before release", () => {
   assert.equal(state.strategies.filter((strategy) => strategy.state === "validation").length, 0);
 });
 
-test("legacy releases are migrated behind the validation gate", () => {
+test("legacy preloaded state is migrated to an empty workspace", () => {
   const state = createDemoState();
-  state.schemaVersion = 1;
-  const active = state.strategies.find((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
-  active.validation = null;
-  migrateState(state);
-  assert.equal(state.schemaVersion, 2);
-  assert.equal(active.state, "validation");
-  assert.ok(state.events.some((item) => item.title.includes("migration")));
+  addReleasedStrategy(state);
+  state.schemaVersion = 2;
+  const migrated = migrateState(state);
+  assert.equal(migrated.schemaVersion, 3);
+  assert.deepEqual(migrated.strategies, []);
+  assert.deepEqual(migrated.events, []);
 });
 
 test("Alpaca cycles are idempotent and record managed symbols", () => {
   const state = createDemoState();
-  const active = state.strategies.find((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
+  const active = addReleasedStrategy(state);
   const cycle = {
     scheduled_bucket: "2026-08-03T15",
     fetched_at: "2026-08-03T15:05:00Z",

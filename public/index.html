@@ -34,7 +34,7 @@
           <div><span class="label">DATA</span><strong id="data-source-value">SYNTHETIC</strong></div>
           <div><span class="label">CYCLE</span><strong id="cycle-value">—</strong></div>
           <div><span class="label">CAPITAL</span><strong id="capital-value">—</strong></div>
-          <button class="icon-button" id="reset-button" title="Restore deterministic demo" aria-label="Restore deterministic demo">↻</button>
+          <button class="icon-button" id="reset-button" title="Clear strategy workspace" aria-label="Clear strategy workspace">↻</button>
         </div>
       </header>
 
@@ -42,10 +42,10 @@
         <section class="command-strip" aria-label="Foundry controls">
           <div>
             <span class="section-kicker">SELF-SUPERVISING PIPELINE</span>
-            <p>Generate from first principles. Promote on evidence. Kill on drift.</p>
           </div>
           <div class="command-actions">
-            <button class="button secondary" id="generate-button"><span>＋</span> Seed cohort</button>
+            <label class="cohort-control"><span>COHORT</span><select id="cohort-size" aria-label="Cohort size"><option value="1">1</option><option value="3">3</option><option value="6" selected>6</option><option value="12">12</option></select></label>
+            <button class="button secondary" id="generate-button"><span>＋</span>Generate new strats</button>
             <button class="button secondary" id="review-button"><span>⌁</span> Run supervisor</button>
             <button class="button secondary" id="validate-button"><span>◈</span> Validate holdout</button>
             <button class="button secondary" id="advance-button"><span>▷</span> Advance simulation</button>

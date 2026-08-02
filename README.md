@@ -10,7 +10,7 @@ python main.py
 
 Open `http://127.0.0.1:8765`. The application uses only the Python standard library.
 
-The local server keeps its state in memory and restores the deterministic demo whenever it restarts. It is intended for development.
+The local server keeps its state in memory and starts with an empty strategy workspace whenever it restarts. Nothing is generated until you press **Seed cohort**.
 
 ## Cloudflare deployment
 

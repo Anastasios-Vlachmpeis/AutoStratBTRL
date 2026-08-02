@@ -73,6 +73,10 @@ function getSelected() {
 
 function ensureSelection() {
   const visible = filteredStrategies();
+  if (!state.strategies.length) {
+    selectedId = null;
+    return;
+  }
   if (!state.strategies.some((item) => item.id === selectedId)) {
     const best = state.strategies.find((item) => ["healthy", "released", "watch", "adjusted"].includes(item.state));
     selectedId = (best || state.strategies[0])?.id || null;
@@ -92,7 +96,7 @@ function renderSummary() {
   $("#count-validation").textContent = String(state.summary.validation || 0).padStart(2, "0");
   $("#count-released").textContent = String(state.summary.released).padStart(2, "0");
   $("#count-dropped").textContent = String(state.summary.dropped).padStart(2, "0");
-  $("#average-score").textContent = number(state.summary.average_score, 1);
+  $("#average-score").textContent = state.strategies.length ? number(state.summary.average_score, 1) : "—";
 }
 
 function renderChart(strategy) {
@@ -125,7 +129,24 @@ function metric(label, value, className = "") {
 
 function renderSelected() {
   const strategy = getSelected();
-  if (!strategy) return;
+  if (!strategy) {
+    $("#selected-name").textContent = "No strategy selected";
+    $("#selected-meta").innerHTML = "<span>Seed your first cohort to begin</span>";
+    const emptyStatus = $("#selected-status");
+    emptyStatus.textContent = "Empty";
+    emptyStatus.className = "status-badge";
+    $("#reproduce-button").disabled = true;
+    $("#selected-id").textContent = "—";
+    $("#metric-row").innerHTML = [
+      metric("SUPERVISOR SCORE", "—"), metric("ANNUALIZED", "—"),
+      metric("DEV SHARPE", "—"), metric("UNSEEN SHARPE", "—"), metric("MAX DRAWDOWN", "—")
+    ].join("");
+    renderChart(null);
+    $("#dna-content").innerHTML = '<div class="empty-state">No strategy DNA yet.</div>';
+    $("#regime-content").innerHTML = '<div class="empty-state">No regime evidence yet.</div>';
+    $("#gate-content").innerHTML = '<div class="empty-state">No supervisor decision yet.</div>';
+    return;
+  }
   const metrics = strategy.metrics;
   $("#selected-name").textContent = strategy.name;
   $("#selected-meta").innerHTML = `<span>${escapeHtml(strategy.archetype)}</span><span>${escapeHtml(strategy.asset)}</span><span>GEN ${strategy.generation}</span>`;
@@ -192,7 +213,9 @@ function renderGates(strategy) {
 }
 
 function renderAudit() {
-  $("#audit-feed").innerHTML = state.events.map((event) => `<article class="audit-item"><span class="audit-time">${escapeHtml(event.time)}</span><div class="audit-copy"><strong><i class="event-dot ${escapeHtml(event.kind)}"></i>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.detail)}</p></div></article>`).join("");
+  $("#audit-feed").innerHTML = state.events.length
+    ? state.events.map((event) => `<article class="audit-item"><span class="audit-time">${escapeHtml(event.time)}</span><div class="audit-copy"><strong><i class="event-dot ${escapeHtml(event.kind)}"></i>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.detail)}</p></div></article>`).join("")
+    : '<div class="empty-state">No supervisor decisions yet.</div>';
 }
 
 function renderTable() {
@@ -230,7 +253,10 @@ async function action(path, payload, successMessage) {
   } catch (_) { /* api already surfaced the error */ }
 }
 
-$("#generate-button").addEventListener("click", () => action("/api/generate", { count: 6 }, "Six new strategy DNAs seeded."));
+$("#generate-button").addEventListener("click", () => {
+  const count = Number($("#cohort-size").value);
+  action("/api/generate", { count }, `${count} new strategy DNA${count === 1 ? "" : "s"} seeded.`);
+});
 $("#review-button").addEventListener("click", () => action("/api/review", {}, "Supervisor review cycle complete."));
 $("#validate-button").addEventListener("click", () => action("/api/validate", {}, "Untouched holdout validation complete."));
 $("#advance-button").addEventListener("click", () => action("/api/advance", { periods: 1 }, "Paper market advanced by 21 sessions."));
@@ -249,7 +275,7 @@ $("#reproduce-button").addEventListener("click", async () => {
     showToast(`Child DNA created from ${parent.id}.`);
   } catch (_) { /* handled */ }
 });
-$("#reset-button").addEventListener("click", () => action("/api/reset", {}, "Deterministic demo restored."));
+$("#reset-button").addEventListener("click", () => action("/api/reset", {}, "Strategy workspace cleared."));
 
 $$(".rail-button").forEach((button) => button.addEventListener("click", () => {
   activeView = button.dataset.view;

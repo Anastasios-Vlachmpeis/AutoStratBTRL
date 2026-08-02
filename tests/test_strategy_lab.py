@@ -5,12 +5,25 @@ from strategy_lab import StrategyLab, backtest, market_series
 
 
 class StrategyLabTests(unittest.TestCase):
-    def test_demo_state_is_deterministic_and_has_a_release_book(self):
+    @staticmethod
+    def released_lab():
+        lab = StrategyLab()
+        lab.generate_batch(1)
+        strategy = lab.strategies[0]
+        strategy["state"] = "released"
+        strategy["metrics"] = {"score": 70, "annualized": 0.12, "sharpe": 1.1, "drawdown": 0.08, "trades": 30}
+        strategy["validation"] = {"sharpe": 0.8, "return": 0.06, "drawdown": 0.07}
+        return lab, strategy
+
+    def test_initial_state_is_deterministic_and_empty(self):
         first = StrategyLab().snapshot()
         second = StrategyLab().snapshot()
         self.assertEqual(first, second)
-        self.assertGreaterEqual(first["summary"]["released"], 1)
-        self.assertTrue(all(item["backtests"] >= 3 for item in first["strategies"]))
+        self.assertEqual(first["strategies"], [])
+        self.assertEqual(first["events"], [])
+        self.assertEqual(first["summary"]["released"], 0)
+        self.assertEqual(first["summary"]["capital"], 100_000)
+        self.assertEqual(first["meta"]["cycle"], 0)
 
     def test_generated_cohort_waits_for_review(self):
         lab = StrategyLab()
@@ -26,8 +39,7 @@ class StrategyLabTests(unittest.TestCase):
         self.assertTrue(all(item["backtests"] == 3 for item in reviewed["strategies"][:4]))
 
     def test_reproduction_preserves_lineage_and_mutates_dna(self):
-        lab = StrategyLab()
-        parent = next(item for item in lab.snapshot()["strategies"] if item["state"] in {"released", "healthy", "watch", "adjusted"})
+        lab, parent = self.released_lab()
         lab.reproduce(parent["id"])
         child = lab.snapshot()["strategies"][0]
         self.assertEqual(child["parent"], parent["id"])
@@ -47,7 +59,7 @@ class StrategyLabTests(unittest.TestCase):
         self.assertTrue(math.isfinite(result["profit_factor"]))
 
     def test_market_advance_records_a_monitor_window(self):
-        lab = StrategyLab()
+        lab, _ = self.released_lab()
         active_before = [item for item in lab.snapshot()["strategies"] if item["state"] in {"released", "healthy", "watch", "adjusted"}]
         lab.advance_market()
         by_id = {item["id"]: item for item in lab.snapshot()["strategies"]}
