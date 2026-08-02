@@ -415,7 +415,6 @@ function renderDeskOverview() {
   renderCombinedChart(strategies, desk.chart);
   $("#dna-content").innerHTML = `<div class="empty-state">Select a ${desk.noun} to inspect its DNA and lineage.</div>`;
   $("#regime-content").innerHTML = `<div class="empty-state">Select a ${desk.noun} to inspect its regime fitness.</div>`;
-  $("#gate-content").innerHTML = `<div class="empty-state">Select a ${desk.noun} to inspect its release gates.</div>`;
 }
 
 function renderSelected() {
@@ -440,7 +439,6 @@ function renderSelected() {
     renderChart(null);
     $("#dna-content").innerHTML = '<div class="empty-state">No strategy DNA yet.</div>';
     $("#regime-content").innerHTML = '<div class="empty-state">No regime evidence yet.</div>';
-    $("#gate-content").innerHTML = '<div class="empty-state">No supervisor decision yet.</div>';
     return;
   }
   const metrics = strategy.metrics;
@@ -464,25 +462,100 @@ function renderSelected() {
   renderChart(strategy);
   renderDNA(strategy);
   renderRegimes(strategy);
-  renderGates(strategy);
 }
 
 function labelParam(key) {
   return key.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 }
 
+const dnaParameterBounds = {
+  fast: [5, 14], slow: [17, 52], threshold: [.001, .018], lookback: [9, 38],
+  entry_z: [.75, 1.75], exit_z: [0, 1], buffer: [.0005, .006], vol_ceiling: [.16, .42],
+};
+
+function normalizeDNAParameter(key, value) {
+  const bounds = dnaParameterBounds[key];
+  if (!bounds) return .5;
+  return Math.max(0, Math.min(1, (Number(value) - bounds[0]) / (bounds[1] - bounds[0])));
+}
+
+function formatDNAParameter(key, value) {
+  if (["threshold", "buffer"].includes(key)) return Number(value).toFixed(4);
+  if (Number.isInteger(Number(value))) return String(value);
+  return number(value, 2);
+}
+
+function bindDNARotation() {
+  const viewport = $("#dna-3d-viewport");
+  const scene = $("#dna-3d-scene");
+  if (!viewport || !scene) return;
+  let rotateX = -18, rotateY = 32, dragging = false, previousX = 0, previousY = 0;
+  const update = () => scene.style.transform = `rotateX(${rotateX}deg) rotateY(${rotateY}deg)`;
+  viewport.addEventListener("pointerdown", (event) => {
+    dragging = true;
+    previousX = event.clientX;
+    previousY = event.clientY;
+    viewport.classList.add("dragging");
+    viewport.setPointerCapture(event.pointerId);
+  });
+  viewport.addEventListener("pointermove", (event) => {
+    if (!dragging) return;
+    rotateY += (event.clientX - previousX) * .65;
+    rotateX = Math.max(-72, Math.min(72, rotateX - (event.clientY - previousY) * .5));
+    previousX = event.clientX;
+    previousY = event.clientY;
+    update();
+  });
+  const stop = (event) => {
+    dragging = false;
+    viewport.classList.remove("dragging");
+    if (viewport.hasPointerCapture(event.pointerId)) viewport.releasePointerCapture(event.pointerId);
+  };
+  viewport.addEventListener("pointerup", stop);
+  viewport.addEventListener("pointercancel", stop);
+  viewport.addEventListener("dblclick", () => { rotateX = -18; rotateY = 32; update(); });
+  viewport.addEventListener("keydown", (event) => {
+    const moves = { ArrowLeft: [0, -8], ArrowRight: [0, 8], ArrowUp: [8, 0], ArrowDown: [-8, 0] };
+    if (!moves[event.key]) return;
+    event.preventDefault();
+    rotateX = Math.max(-72, Math.min(72, rotateX + moves[event.key][0]));
+    rotateY += moves[event.key][1];
+    update();
+  });
+  update();
+}
+
 function renderDNA(strategy) {
   const lineage = strategy.parent
     ? `<span>PARENT</span><strong>${escapeHtml(strategy.parent)}</strong><span class="arrow">→</span><strong>${escapeHtml(strategy.id)}</strong>`
     : `<span>ORIGIN</span><strong>FIRST-PRINCIPLE SEED</strong><span class="arrow">→</span><strong>${escapeHtml(strategy.id)}</strong>`;
-  const params = Object.entries(strategy.params).map(([key, value]) => {
-    const formatted = key === "position_size" ? pct(value, 0) : value;
-    return `<div class="param"><span>${escapeHtml(labelParam(key))}</span><strong>${escapeHtml(formatted)}</strong></div>`;
+  const positionSize = Math.max(0, Math.min(1, Number(strategy.params.position_size) || 0));
+  const dimensions = Object.entries(strategy.params).filter(([key]) => key !== "position_size").slice(0, 3);
+  const axes = dimensions.map(([key, value], index) => {
+    const length = Math.max(6, normalizeDNAParameter(key, value) * 48);
+    return `<i class="dna-cube-axis axis-${index}" style="width:${length.toFixed(1)}px"></i>`;
   }).join("");
+  const legend = dimensions.map(([key, value], index) => `<div><i class="axis-color-${index}"></i><span>${escapeHtml(labelParam(key))}</span><strong>${escapeHtml(formatDNAParameter(key, value))}</strong></div>`).join("");
   const rework = strategy.rework?.attempt
     ? `<div class="rework-note"><span>REWORK ${strategy.rework.attempt}/${strategy.rework.max_attempts || 3}</span><strong>${escapeHtml(strategy.rework.diagnosis || "Development improvement pass")}</strong>${strategy.rework.change ? `<small>${escapeHtml(labelParam(strategy.rework.change.parameter))}: ${escapeHtml(strategy.rework.change.from)} → ${escapeHtml(strategy.rework.change.to)}</small>` : ""}</div>`
     : "";
-  $("#dna-content").innerHTML = `<div class="dna-lineage">${lineage}</div>${rework}<div class="param-grid">${params}</div>`;
+  $("#dna-content").innerHTML = `<div class="dna-lineage compact">${lineage}</div>${rework}
+    <section class="dna-position-chart" aria-label="Position size ${pct(positionSize, 0)}">
+      <div><span>POSITION SIZE</span><strong>${pct(positionSize, 0)}</strong></div>
+      <div class="dna-position-track"><i style="width:${(positionSize * 100).toFixed(1)}%"></i><span></span><span></span><span></span></div>
+      <small><span>0%</span><span>RISK ALLOCATION</span><span>100%</span></small>
+    </section>
+    <section class="dna-parameter-chart">
+      <div class="dna-chart-head"><span>3D PARAMETER SPACE</span><small>DRAG TO ROTATE · DOUBLE-CLICK TO RESET</small></div>
+      <div class="dna-3d-viewport" id="dna-3d-viewport" tabindex="0" role="img" aria-label="Rotatable three-dimensional strategy parameter chart">
+        <div class="dna-3d-scene" id="dna-3d-scene">
+          <i class="dna-cube-face cube-front"></i><i class="dna-cube-face cube-back"></i><i class="dna-cube-face cube-right"></i><i class="dna-cube-face cube-left"></i><i class="dna-cube-face cube-top"></i><i class="dna-cube-face cube-bottom"></i>
+          ${axes}<b class="dna-cube-origin"></b>
+        </div>
+      </div>
+      <div class="dna-axis-legend">${legend}</div>
+    </section>`;
+  bindDNARotation();
 }
 
 function renderRegimes(strategy) {
@@ -548,21 +621,6 @@ function renderRegimes(strategy) {
       <div><span>WEAKEST</span><strong class="${weakest[1] < 0 ? "negative" : ""}">${escapeHtml(weakest[0])} ${weakest[1] >= 0 ? "+" : ""}${number(weakest[1], 2)}</strong></div>
     </div>
   </div>`;
-}
-
-function renderGates(strategy) {
-  const m = strategy.metrics;
-  const gates = [
-    ["Supervisor score", state.policy.release_score, m?.score, (v, t) => v >= t, (v) => number(v, 1)],
-    ["Development Sharpe", state.policy.min_sharpe, m?.sharpe, (v, t) => v >= t, (v) => number(v, 2)],
-    ["Unseen return", 0, strategy.validation?.return, (v, t) => v > t, (v) => signedPct(v)],
-    ["Unseen Sharpe", state.policy.validation_min_sharpe || .30, strategy.validation?.sharpe, (v, t) => v >= t, (v) => number(v, 2)],
-    ["Unseen drawdown", state.policy.validation_max_drawdown || .20, strategy.validation?.drawdown, (v, t) => v <= t, (v) => pct(v)]
-  ];
-  $("#gate-content").innerHTML = gates.map(([label, threshold, value, test, format]) => {
-    const known = value != null, pass = known && test(value, threshold);
-    return `<div class="gate ${known ? pass ? "pass" : "fail" : ""}"><span class="gate-mark">${known ? pass ? "✓" : "×" : "·"}</span><span>${label}</span><strong>${known ? format(value) : "PENDING"}</strong></div>`;
-  }).join("");
 }
 
 function renderAudit() {
