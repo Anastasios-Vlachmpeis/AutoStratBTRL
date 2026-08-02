@@ -828,7 +828,7 @@ let operationBusy = false;
 function resetOperationCurveChart(kind, candidateCount) {
   const chart = $("#operation-equity-chart");
   const caption = $("#operation-curve-caption");
-  chart.hidden = false;
+  chart.removeAttribute("hidden");
   caption.hidden = false;
   chart.classList.remove("dragging");
   chart.onpointerdown = null;
