@@ -222,7 +222,7 @@ footer b { color: var(--muted); font-weight: 400; }
 .operation-step small { opacity: 0; color: var(--operation-accent); font: inherit; }
 .operation-step.active { color: var(--ink); transform: translateX(3px); }.operation-step.active i { border-color: var(--operation-accent); background: var(--operation-accent); box-shadow: 0 0 10px color-mix(in srgb, var(--operation-accent) 55%, transparent); animation: operation-blink .8s steps(2, end) infinite; }.operation-step.active small { opacity: 1; }
 .operation-step.done { color: var(--muted); }.operation-step.done i { border-color: var(--operation-accent); background: transparent; }.operation-step.done small { opacity: 1; color: var(--dim); }
-.operation-footer { position: relative; z-index: 2; min-height: 69px; padding: 15px 18px 17px; border-top: 1px solid var(--line); background: rgba(8,11,9,.45); }
+.operation-footer { position: relative; z-index: 2; display: block; min-height: 69px; padding: 15px 18px 17px; border-top: 1px solid var(--line); background: rgba(8,11,9,.45); }
 .operation-footer > div { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 9px; color: var(--dim); font: 8px var(--mono); letter-spacing: .1em; }
 .operation-footer strong { color: var(--operation-accent); font-weight: 400; }
 .operation-progress { display: block; height: 3px; overflow: hidden; background: var(--line); }
@@ -230,6 +230,7 @@ footer b { color: var(--muted); font-weight: 400; }
 .operation-scanline { position: absolute; z-index: 1; left: 0; right: 0; top: -80px; height: 70px; pointer-events: none; background: linear-gradient(transparent, color-mix(in srgb, var(--operation-accent) 8%, transparent), transparent); animation: operation-scan 2.5s linear infinite; }
 body.operation-generate #generate-button, body.operation-review #review-button, body.operation-validate #validate-button { border-color: var(--blue); color: var(--blue); animation: operation-button 1s ease-in-out infinite; }
 body.operation-review #review-button { border-color: var(--amber); color: var(--amber); } body.operation-validate #validate-button { border-color: var(--violet); color: var(--violet); }
+body:is(.operation-generate,.operation-review,.operation-validate) { overflow: hidden; }
 body.reveal-generate .pipeline-step:nth-of-type(1), body.reveal-review .pipeline-step:nth-of-type(2), body.reveal-validate .pipeline-step:nth-of-type(3) { animation: pipeline-stage-flash 1.05s ease-out; }
 body.reveal-generate #strategy-table tr, body.reveal-review #strategy-table tr, body.reveal-validate #strategy-table tr { animation: strategy-materialize .52s ease-out backwards; }
 body:is(.reveal-generate,.reveal-review,.reveal-validate) #strategy-table tr:nth-child(2) { animation-delay: .05s; } body:is(.reveal-generate,.reveal-review,.reveal-validate) #strategy-table tr:nth-child(3) { animation-delay: .1s; } body:is(.reveal-generate,.reveal-review,.reveal-validate) #strategy-table tr:nth-child(4) { animation-delay: .15s; } body:is(.reveal-generate,.reveal-review,.reveal-validate) #strategy-table tr:nth-child(n+5) { animation-delay: .2s; }
