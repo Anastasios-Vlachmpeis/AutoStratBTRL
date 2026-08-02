@@ -4,6 +4,7 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 let state = null;
 let selectedId = null;
 let activeView = "portfolio";
+let marketOverview = true;
 let toastTimer = null;
 let adminToken = sessionStorage.getItem("axiom-admin-token") || "";
 
@@ -80,6 +81,10 @@ function getSelected() {
 
 function ensureSelection() {
   const visible = filteredStrategies();
+  if (activeView === "released" && marketOverview) {
+    selectedId = null;
+    return;
+  }
   if (!state.strategies.length) {
     selectedId = null;
     return;
@@ -256,6 +261,8 @@ function renderPortfolio() {
 
 function renderChart(strategy) {
   const svg = $("#equity-chart");
+  $("#chart-title").textContent = "OUT-OF-SAMPLE EQUITY";
+  $("#market-chart-legend").hidden = true;
   const values = strategy?.metrics?.curve || [1, 1, 1, 1];
   const width = 900, height = 255, left = 18, right = 64, top = 14, bottom = 30;
   const min = Math.min(...values, 0.96), max = Math.max(...values, 1.04);
@@ -278,11 +285,92 @@ function renderChart(strategy) {
   $("#chart-delta").textContent = strategy?.metrics ? `${signedPct(strategy.metrics.return)} net` : "Awaiting evidence";
 }
 
+function focusMarketStrategy(strategyId) {
+  marketOverview = false;
+  selectedId = strategyId;
+  render();
+}
+
+function renderMarketChart(strategies) {
+  const svg = $("#equity-chart");
+  const palette = ["#a8f05a", "#70a7ee", "#a28bdd", "#e9b655", "#ee736a", "#70d7c7", "#d99fe8", "#c7d36f"];
+  const curves = strategies.map((strategy, index) => ({
+    strategy,
+    color: palette[index % palette.length],
+    values: (strategy.metrics?.curve ?? []).map(Number).filter(Number.isFinite),
+  })).filter((item) => item.values.length >= 2);
+  $("#chart-title").textContent = "ALL RELEASED EQUITY CURVES";
+  $("#chart-delta").textContent = `${curves.length} CURVE${curves.length === 1 ? "" : "S"}`;
+  const legend = $("#market-chart-legend");
+  legend.hidden = curves.length === 0;
+  legend.innerHTML = curves.map(({ strategy, color }) => `<button type="button" data-strategy-id="${escapeHtml(strategy.id)}"><i style="background:${color}"></i><span>${escapeHtml(strategy.name)}</span><small>${escapeHtml(strategy.asset)}</small></button>`).join("");
+  $$("#market-chart-legend button").forEach((button) => button.addEventListener("click", () => focusMarketStrategy(button.dataset.strategyId)));
+  if (!curves.length) {
+    svg.innerHTML = '<text class="market-chart-empty" x="450" y="128" text-anchor="middle">NO RELEASED STRATEGY CURVES YET</text>';
+    return;
+  }
+  const width = 900, height = 255, left = 18, right = 64, top = 14, bottom = 30;
+  const allValues = curves.flatMap((item) => item.values);
+  const minimum = Math.min(...allValues, 0.96), maximum = Math.max(...allValues, 1.04);
+  const spread = Math.max(maximum - minimum, 0.04);
+  const x = (index, length) => left + index / Math.max(length - 1, 1) * (width - left - right);
+  const y = (value) => top + (maximum - value) / spread * (height - top - bottom);
+  let grid = "";
+  for (let index = 0; index < 5; index += 1) {
+    const gridY = top + index * (height - top - bottom) / 4;
+    const label = maximum - spread * index / 4;
+    grid += `<line class="grid-line" x1="${left}" y1="${gridY}" x2="${width - right}" y2="${gridY}"/><text class="axis-label" x="${width - right + 9}" y="${gridY + 3}">${label.toFixed(2)}×</text>`;
+  }
+  const paths = curves.map(({ values, color }) => {
+    const path = values.map((value, index) => `${index ? "L" : "M"}${x(index, values.length).toFixed(1)},${y(value).toFixed(1)}`).join(" ");
+    return `<path class="market-equity-line" stroke="${color}" d="${path}"/><circle class="market-end-dot" fill="${color}" cx="${x(values.length - 1, values.length)}" cy="${y(values.at(-1))}" r="4"/>`;
+  }).join("");
+  svg.innerHTML = `${grid}<line class="benchmark-line" x1="${left}" y1="${y(1)}" x2="${width - right}" y2="${y(1)}"/>${paths}
+    <text class="axis-label" x="${left}" y="${height - 8}">START</text><text class="axis-label" x="${width - right}" y="${height - 8}" text-anchor="end">LATEST</text>`;
+}
+
 function metric(label, value, className = "") {
   return `<div class="metric"><span>${label}</span><strong class="${className}">${value}</strong></div>`;
 }
 
+function renderMarketOverview() {
+  const strategies = filteredStrategies();
+  const metrics = strategies.map((strategy) => strategy.metrics).filter(Boolean);
+  const validations = strategies.map((strategy) => strategy.validation).filter(Boolean);
+  const average = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
+  $("#selected-name").textContent = strategies.length ? "Released strategy book" : "No released strategies";
+  $("#selected-meta").innerHTML = strategies.length
+    ? `<span>${strategies.length} ACTIVE STRATEG${strategies.length === 1 ? "Y" : "IES"}</span><span>CLICK A CURVE OR ROW TO FOCUS</span>`
+    : "<span>Complete supervision and validation to populate this view</span>";
+  const status = $("#selected-status");
+  status.textContent = strategies.length ? "Book" : "Empty";
+  status.className = `status-badge ${strategies.length ? "released" : ""}`;
+  $("#show-all-curves-button").hidden = true;
+  $("#reproduce-button").disabled = true;
+  $("#selected-id").textContent = "ALL";
+  const averageScore = average(metrics.map((item) => item.score));
+  const averageAnnualized = average(metrics.map((item) => item.annualized));
+  const averageSharpe = average(metrics.map((item) => item.sharpe));
+  const averageUnseen = average(validations.map((item) => item.sharpe));
+  const worstDrawdown = metrics.length ? Math.max(...metrics.map((item) => item.drawdown)) : null;
+  $("#metric-row").innerHTML = [
+    metric("AVG SUPERVISOR SCORE", averageScore == null ? "—" : number(averageScore, 1), averageScore >= 61 ? "positive" : ""),
+    metric("AVG ANNUALIZED", averageAnnualized == null ? "—" : signedPct(averageAnnualized), averageAnnualized >= 0 ? "positive" : "negative"),
+    metric("AVG DEV SHARPE", averageSharpe == null ? "—" : number(averageSharpe), averageSharpe >= .55 ? "positive" : ""),
+    metric("AVG UNSEEN SHARPE", averageUnseen == null ? "—" : number(averageUnseen), averageUnseen >= .30 ? "positive" : ""),
+    metric("WORST MAX DRAWDOWN", worstDrawdown == null ? "—" : pct(worstDrawdown), worstDrawdown > .2 ? "negative" : ""),
+  ].join("");
+  renderMarketChart(strategies);
+  $("#dna-content").innerHTML = '<div class="empty-state">Select a released strategy to inspect its DNA and lineage.</div>';
+  $("#regime-content").innerHTML = '<div class="empty-state">Select a released strategy to inspect its regime fitness.</div>';
+  $("#gate-content").innerHTML = '<div class="empty-state">Select a released strategy to inspect its release gates.</div>';
+}
+
 function renderSelected() {
+  if (activeView === "released" && marketOverview) {
+    renderMarketOverview();
+    return;
+  }
   const strategy = getSelected();
   if (!strategy) {
     $("#selected-name").textContent = "No strategy selected";
@@ -291,6 +379,7 @@ function renderSelected() {
     emptyStatus.textContent = "Empty";
     emptyStatus.className = "status-badge";
     $("#reproduce-button").disabled = true;
+    $("#show-all-curves-button").hidden = true;
     $("#selected-id").textContent = "—";
     $("#metric-row").innerHTML = [
       metric("SUPERVISOR SCORE", "—"), metric("ANNUALIZED", "—"),
@@ -312,6 +401,7 @@ function renderSelected() {
   $("#selected-id").textContent = strategy.id;
   const allowed = ["released", "healthy", "watch", "adjusted"].includes(strategy.state);
   $("#reproduce-button").disabled = !allowed;
+  $("#show-all-curves-button").hidden = activeView !== "released";
   $("#metric-row").innerHTML = [
     metric("SUPERVISOR SCORE", metrics ? number(metrics.score, 1) : "PENDING", metrics?.score >= 61 ? "positive" : ""),
     metric("ANNUALIZED", metrics ? signedPct(metrics.annualized) : "—", metrics?.annualized >= 0 ? "positive" : "negative"),
@@ -392,8 +482,11 @@ function renderTable() {
       <td class="score-cell">${m ? number(m.score, 1) : "—"}${m ? `<div class="score-bar"><i style="width:${Math.min(m.score, 100)}%"></i></div>` : ""}</td><td class="row-arrow">›</td></tr>`;
   }).join("");
   $$("#strategy-table tr").forEach((row) => row.addEventListener("click", () => {
-    selectedId = row.dataset.id;
-    renderSelected(); renderTable();
+    if (activeView === "released") focusMarketStrategy(row.dataset.id);
+    else {
+      selectedId = row.dataset.id;
+      renderSelected(); renderTable();
+    }
   }));
 }
 
@@ -423,6 +516,11 @@ $("#validate-button").addEventListener("click", () => action("/api/validate", {}
 $("#advance-button").addEventListener("click", () => action("/api/advance", { periods: 1 }, "Paper market advanced by 21 sessions."));
 $("#sync-button").addEventListener("click", () => action("/api/alpaca/sync", {}, "Alpaca account and market data synchronized."));
 $("#portfolio-refresh-button").addEventListener("click", () => action("/api/alpaca/portfolio", {}, "Alpaca balances, positions, and orders refreshed read-only."));
+$("#show-all-curves-button").addEventListener("click", () => {
+  marketOverview = true;
+  selectedId = null;
+  render();
+});
 $("#reproduce-button").addEventListener("click", async () => {
   const parent = getSelected();
   if (!parent) return;
@@ -441,6 +539,10 @@ $("#reset-button").addEventListener("click", () => action("/api/reset", {}, "Str
 
 $$(".rail-button").forEach((button) => button.addEventListener("click", () => {
   activeView = button.dataset.view;
+  if (activeView === "released") {
+    marketOverview = true;
+    selectedId = null;
+  }
   $$(".rail-button").forEach((item) => item.classList.toggle("active", item === button));
   render();
 }));

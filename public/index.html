@@ -127,13 +127,15 @@
               </div>
               <div class="panel-actions">
                 <span class="status-badge" id="selected-status">—</span>
+                <button class="button compact" id="show-all-curves-button" hidden>Show all curves</button>
                 <button class="button compact" id="reproduce-button" disabled>Reproduce DNA</button>
               </div>
             </div>
             <div class="metric-row" id="metric-row"></div>
             <div class="chart-wrap">
-              <div class="chart-labels"><span>OUT-OF-SAMPLE EQUITY</span><span id="chart-delta">—</span></div>
-              <svg id="equity-chart" viewBox="0 0 900 255" role="img" aria-label="Selected strategy backtest equity curve"></svg>
+              <div class="chart-labels"><span id="chart-title">OUT-OF-SAMPLE EQUITY</span><span id="chart-delta">—</span></div>
+              <div class="market-chart-legend" id="market-chart-legend" hidden></div>
+              <svg id="equity-chart" viewBox="0 0 900 255" role="img" aria-label="Strategy equity curve chart"></svg>
             </div>
           </article>
 
