@@ -5,6 +5,7 @@ let state = null;
 let selectedId = null;
 let activeView = "portfolio";
 let deskOverview = true;
+let curveLegendVisible = false;
 let toastTimer = null;
 let adminToken = sessionStorage.getItem("axiom-admin-token") || "";
 
@@ -301,6 +302,8 @@ function renderChart(strategy) {
   const svg = $("#equity-chart");
   $("#chart-title").textContent = "OUT-OF-SAMPLE EQUITY";
   $("#market-chart-legend").hidden = true;
+  $("#curve-legend-button").hidden = true;
+  $("#curve-legend-button").setAttribute("aria-expanded", "false");
   const values = strategy?.metrics?.curve || [1, 1, 1, 1];
   const width = 900, height = 255, left = 18, right = 64, top = 14, bottom = 30;
   const min = Math.min(...values, 0.96), max = Math.max(...values, 1.04);
@@ -340,8 +343,12 @@ function renderCombinedChart(strategies, chartTitle) {
   $("#chart-title").textContent = chartTitle;
   $("#chart-delta").textContent = `${curves.length} CURVE${curves.length === 1 ? "" : "S"}`;
   const legend = $("#market-chart-legend");
-  legend.hidden = curves.length === 0;
+  legend.hidden = curves.length === 0 || !curveLegendVisible;
   legend.innerHTML = curves.map(({ strategy, color }) => `<button type="button" data-strategy-id="${escapeHtml(strategy.id)}"><i style="background:${color}"></i><span>${escapeHtml(strategy.name)}</span><small>${escapeHtml(strategy.asset)}</small></button>`).join("");
+  const legendButton = $("#curve-legend-button");
+  legendButton.hidden = curves.length === 0;
+  legendButton.textContent = curveLegendVisible ? "Hide legend" : "Show legend";
+  legendButton.setAttribute("aria-expanded", String(curves.length > 0 && curveLegendVisible));
   $$("#market-chart-legend button").forEach((button) => button.addEventListener("click", () => focusStrategy(button.dataset.strategyId)));
   if (!curves.length) {
     svg.innerHTML = '<text class="market-chart-empty" x="450" y="128" text-anchor="middle">NO STRATEGY CURVES IN THIS FILTER YET</text>';
@@ -531,6 +538,7 @@ function renderStrategyFilters() {
   $$("#strategy-filters .strategy-filter").forEach((button) => button.addEventListener("click", () => {
     activeFilters[activeView] = button.dataset.filter;
     deskOverview = true;
+    curveLegendVisible = false;
     selectedId = null;
     render();
   }));
@@ -734,8 +742,17 @@ $("#validate-button").addEventListener("click", () => {
 $("#advance-button").addEventListener("click", () => action("/api/advance", { periods: 1 }, "Paper market advanced by 21 sessions."));
 $("#sync-button").addEventListener("click", () => action("/api/alpaca/sync", {}, "Alpaca account and market data synchronized."));
 $("#portfolio-refresh-button").addEventListener("click", () => action("/api/alpaca/portfolio", {}, "Alpaca balances, positions, and orders refreshed read-only."));
+$("#curve-legend-button").addEventListener("click", () => {
+  const legend = $("#market-chart-legend");
+  if (!legend.children.length) return;
+  curveLegendVisible = !curveLegendVisible;
+  legend.hidden = !curveLegendVisible;
+  $("#curve-legend-button").textContent = curveLegendVisible ? "Hide legend" : "Show legend";
+  $("#curve-legend-button").setAttribute("aria-expanded", String(curveLegendVisible));
+});
 $("#show-all-curves-button").addEventListener("click", () => {
   deskOverview = true;
+  curveLegendVisible = false;
   selectedId = null;
   render();
 });
@@ -760,6 +777,7 @@ $$(".rail-button").forEach((button) => button.addEventListener("click", () => {
   activeView = button.dataset.view;
   if (multiStrategyViews.has(activeView)) {
     deskOverview = true;
+    curveLegendVisible = false;
     selectedId = null;
     if (activeView in activeFilters) activeFilters[activeView] = "all";
   }
