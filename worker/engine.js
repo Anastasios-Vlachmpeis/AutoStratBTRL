@@ -129,13 +129,13 @@ export function evaluateStrategyWindow(strategy, prices, window = 21) {
   let priorPosition = 0;
   for (let index = start; index < prices.length - 1; index += 1) {
     const rawSignal = signal(strategy, prices.slice(0, index + 1));
-    const position = rawSignal > 0 ? strategy.params.position_size : 0;
+    const position = rawSignal * strategy.params.position_size;
     const marketReturn = prices[index + 1] / prices[index] - 1;
     const cost = Math.abs(position - priorPosition) * 0.0005;
     returns.push(position * marketReturn - cost);
     priorPosition = position;
   }
-  return { signal: signal(strategy, prices) > 0 ? 1 : 0, returns };
+  return { signal: signal(strategy, prices), returns };
 }
 
 export function backtest(strategy, prices, regimes) {
@@ -144,6 +144,8 @@ export function backtest(strategy, prices, regimes) {
   const curve = [equity];
   const returns = [];
   const tradeReturns = [];
+  const tradeEvents = [];
+  const exposureCurve = [];
   const regimeReturns = Object.fromEntries(REGIMES.map((name) => [name, []]));
   let priorPosition = 0;
   const warmup = 52;
@@ -157,7 +159,12 @@ export function backtest(strategy, prices, regimes) {
     curve.push(equity);
     returns.push(daily);
     regimeReturns[regimes[index]].push(daily);
-    if (position !== priorPosition) tradeReturns.push(daily);
+    exposureCurve.push(round(position, 6));
+    if (position !== priorPosition) {
+      tradeReturns.push(daily);
+      tradeEvents.push({ signal_index: index, fill_index: index + 1,
+        direction: position > priorPosition ? "buy" : "sell", from: round(priorPosition, 6), to: round(position, 6) });
+    }
     priorPosition = position;
   }
 
@@ -210,6 +217,8 @@ export function backtest(strategy, prices, regimes) {
     win_rate: round(wins.length / Math.max(tradeReturns.length, 1), 4),
     profit_factor: round(Math.min(profitFactor, 9.99), 3),
     trades: tradeReturns.length,
+    trade_events: tradeEvents,
+    exposure_curve: exposureCurve,
     regimes: regimeSummary,
     curve: curve.filter((_, index) => index % sampleEvery === 0).map((point) => round(point, 5)),
   };
@@ -227,6 +236,8 @@ function aggregateResults(results) {
   summary.positive_regimes = scoreValues.filter((value) => value > 0).length;
   summary.regime_scores = Object.fromEntries(Object.entries(regimeScores).map(([key, value]) => [key, round(value, 3)]));
   summary.curve = results[0].curve;
+  summary.trade_events = results[0].trade_events ?? [];
+  summary.exposure_curve = results[0].exposure_curve ?? [];
   return summary;
 }
 
@@ -297,6 +308,10 @@ function newStrategy(state, parent = null, mutateParent = true) {
     backtests: 0,
     metrics: null,
     validation: null,
+    dna_hash: null,
+    engine_family: null,
+    dataset_id: null,
+    backtest_runs: {},
     rework: emptyRework(parent?.rework?.attempt ?? 0, parent?.rework?.history ?? []),
     monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
   };
@@ -498,8 +513,15 @@ export function reviewCandidatesWithBars(state, barsBySymbol) {
     const windowSize = Math.max(140, Math.floor(development.length * 0.68));
     const ends = [Math.floor(development.length * 0.80), Math.floor(development.length * 0.90), development.length];
     const results = ends.map((end) => {
-      const windowPrices = development.slice(Math.max(0, end - windowSize), end);
-      return backtest(strategy, windowPrices, marketRegimes(windowPrices));
+      const start = Math.max(0, end - windowSize);
+      const windowBars = (barsBySymbol[strategy.asset] ?? []).slice(-600).slice(0, developmentEnd).slice(start, end);
+      const windowPrices = windowBars.map((bar) => Number(bar.c));
+      const result = backtest(strategy, windowPrices, marketRegimes(windowPrices));
+      result.trade_events = result.trade_events.map((trade) => ({ ...trade,
+        signal_time: windowBars[trade.signal_index]?.t ?? null,
+        fill_time: windowBars[trade.fill_index]?.t ?? null,
+      }));
+      return result;
     });
     strategy.backtests += results.length;
     strategy.metrics = aggregateResults(results);
@@ -567,10 +589,14 @@ export function validateCandidates(state, bootstrap = false) {
   state.marketClock += 5;
 }
 
-export function validateCandidatesWithBars(state, barsBySymbol) {
-  const candidates = state.strategies.filter((item) => item.state === "validation");
+export function validateCandidatesWithBars(state, barsBySymbol, options = {}) {
+  const family = options.family ?? null;
+  const strategyIds = options.strategyIds ? new Set(options.strategyIds) : null;
+  const candidates = state.strategies.filter((item) => item.state === "validation"
+    && (!family || (item.engine_family ?? "legacy") === family)
+    && (!strategyIds || strategyIds.has(item.id)));
   if (!candidates.length) {
-    event(state, "VALIDATE", "No strategies awaiting validation", "Supervisor approval is required before holdout testing.");
+    if (!options.silent) event(state, "VALIDATE", "No strategies awaiting validation", "Supervisor approval is required before holdout testing.");
     return;
   }
   for (const strategy of candidates) {
@@ -589,7 +615,7 @@ export function validateCandidatesWithBars(state, barsBySymbol) {
     if (nextState === "rework") queueRework(strategy, "validation", reason);
     event(state, nextState === "released" ? "RELEASE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, `${reason} · untouched final 25%`);
   }
-  state.marketClock += 5;
+  if (options.advanceClock !== false) state.marketClock += 5;
 }
 
 export function reproduce(state, strategyId) {
@@ -703,11 +729,13 @@ export function applyAlpacaOverview(state, overview) {
     clock: overview.clock,
     feed: previous.feed ?? "iex",
     trading_enabled: previous.trading_enabled ?? false,
+    short_trading_enabled: previous.short_trading_enabled ?? false,
     can_trade_now: Boolean(previous.trading_enabled && overview.clock?.is_open
       && !overview.account?.trading_blocked && !overview.account?.account_blocked),
     proposed_orders: previous.proposed_orders ?? [],
     submitted_orders: previous.submitted_orders ?? [],
     order_errors: previous.order_errors ?? [],
+    safety_reasons: previous.safety_reasons ?? [],
     managed_symbols: previous.managed_symbols ?? [],
   };
   event(state, "ALPACA", "Alpaca portfolio refreshed", `${overview.positions.length} positions · ${overview.open_orders.length} open orders · read only`);
@@ -731,17 +759,24 @@ export function applyAlpacaCycle(state, cycle) {
   }
   const priorManaged = new Set(state.alpaca?.managed_symbols ?? []);
   for (const order of cycle.submitted_orders ?? []) {
-    if (order.side === "buy") priorManaged.add(order.symbol);
+    // Reconciliation never submits against an unmanaged position, so every
+    // accepted Axiom order (including a new short sale) safely establishes
+    // management for that symbol.
+    priorManaged.add(order.symbol);
     event(state, "ORDER", `${order.side.toUpperCase()} ${order.symbol} submitted`, `${order.status} · ${order.client_order_id}`);
   }
   for (const failure of cycle.order_errors ?? []) {
     event(state, "ORDER_ERROR", `${failure.symbol} order failed`, failure.message);
+  }
+  for (const safety of cycle.safety_reasons ?? []) {
+    event(state, "ALPACA_SAFETY", `${safety.symbol ?? "Portfolio"} safety check`, safety.reason ?? safety.message ?? "order skipped");
   }
   state.alpaca = {
     connected: true,
     fetched_at: cycle.fetched_at,
     feed: cycle.feed,
     trading_enabled: cycle.trading_enabled,
+    short_trading_enabled: cycle.short_trading_enabled ?? false,
     can_trade_now: cycle.can_trade_now,
     account: cycle.account,
     positions: cycle.positions,
@@ -751,6 +786,7 @@ export function applyAlpacaCycle(state, cycle) {
     proposed_orders: cycle.proposed_orders,
     submitted_orders: cycle.submitted_orders,
     order_errors: cycle.order_errors,
+    safety_reasons: cycle.safety_reasons ?? [],
     managed_symbols: [...priorManaged],
     last_cycle_bucket: cycle.scheduled_bucket,
     last_bar_time: latestBarTime,
@@ -762,7 +798,7 @@ export function applyAlpacaCycle(state, cycle) {
 
 export function createDemoState() {
   return {
-    schemaVersion: 4,
+    schemaVersion: 5,
     seed: 20260801,
     cycle: 0,
     marketClock: 0,
@@ -770,20 +806,26 @@ export function createDemoState() {
     strategies: [],
     events: [],
     lastScheduledBucket: null,
-    alpaca: { connected: false, managed_symbols: [], last_cycle_bucket: null },
+    alpaca: { connected: false, managed_symbols: [], last_cycle_bucket: null, short_trading_enabled: false, safety_reasons: [] },
   };
 }
 
 export function migrateState(state) {
   const version = state.schemaVersion ?? 1;
   if (version < 3) return createDemoState();
-  if (version >= 4) return state;
+  if (version >= 5) return state;
   const migrated = clone(state);
-  migrated.schemaVersion = 4;
+  migrated.schemaVersion = 5;
   migrated.strategies = (migrated.strategies ?? []).map((strategy) => ({
     ...strategy,
     rework: strategy.rework ?? emptyRework(),
+    dna_hash: strategy.dna_hash ?? null,
+    engine_family: strategy.engine_family ?? null,
+    dataset_id: strategy.dataset_id ?? null,
+    backtest_runs: strategy.backtest_runs ?? {},
   }));
+  migrated.datasets ??= {};
+  migrated.backtestArtifacts ??= {};
   return migrated;
 }
 
@@ -801,7 +843,7 @@ export function snapshot(state) {
       cycle: state.cycle,
       clock: state.marketClock,
       environment: state.alpaca?.connected ? "ALPACA PAPER" : "PAPER SIM",
-      schema_version: state.schemaVersion ?? 4,
+      schema_version: state.schemaVersion ?? 5,
       seed: state.seed,
       last_scheduled_bucket: state.lastScheduledBucket,
     },

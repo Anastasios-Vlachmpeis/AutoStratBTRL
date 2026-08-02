@@ -66,6 +66,30 @@ Required secrets:
 | `ADMIN_TOKEN` | Your own long random dashboard password |
 | `ALPACA_API_KEY` | Alpaca paper API key ID |
 | `ALPACA_API_SECRET` | Alpaca paper secret key |
+| `BACKTEST_SERVICE_SECRET` | HMAC secret shared only with that service |
+
+## Remote Backtrader shadow mode
+
+The Worker remains the control plane. It seals each Alpaca history snapshot into
+an immutable 75% development slice and 25% holdout slice inside the Durable
+Object, then sends only the relevant slice to Cloud Run. Start with:
+
+```bash
+npx wrangler secret put BACKTEST_SERVICE_SECRET
+```
+
+Set `BACKTEST_SERVICE_URL` as a normal Worker variable containing the Cloud Run
+HTTPS URL under **Worker → Settings → Variables & Secrets**. The checked-in
+`BACKTEST_ENGINE` default is `shadow`; without both a
+service URL and secret the Worker safely falls back to the legacy engine. In
+shadow mode legacy results still decide strategy lifecycle while signed remote
+artifacts and comparison metadata are retained. Change it to `backtrader` only
+after reviewing those artifacts. `legacy` is an immediate rollback. Raw holdout
+bars are never returned from `/api/backtest-artifacts/:id`.
+
+Cloud Run is configured with zero minimum instances: it may scale down while
+idle, then wakes when the Worker requests a backtest. The hourly Cloudflare Cron
+continues independently and does not require a permanently running process.
 
 The same Alpaca paper key pair authenticates paper-account and market-data requests. No additional data key is needed for the default IEX feed.
 
@@ -82,7 +106,7 @@ The first integration supports four US equity ETFs: `SPY`, `QQQ`, `IWM`, and `TL
 
 Press **Sync Alpaca** to verify the credentials and load account equity, positions, market status, and current bars. Scheduled hourly runs perform the same synchronization automatically.
 
-The **Account** desk is the default landing page. It displays Alpaca's three-month daily P/L history, a locally calculated 20-session rolling Sharpe chart, equity, cash, buying power, daily P/L, open positions, and working paper orders. Sharpe uses the daily portfolio-return series with a zero risk-free rate and annualizes by `sqrt(252)`. Its **Refresh account** button is read-only: it never evaluates strategies or submits orders, even when automated paper trading is enabled. Positions are marked `AXIOM / MIXED` only when Axiom has previously bought that symbol; Alpaca aggregates manual and automated shares, so exact share-level attribution is not implied.
+The **Account** desk is the default landing page. It displays Alpaca's three-month daily P/L history, a locally calculated 20-session rolling Sharpe chart, equity, cash, buying power, daily P/L, open positions, and working paper orders. Sharpe uses the daily portfolio-return series with a zero risk-free rate and annualizes by `sqrt(252)`. Its **Refresh account** button is read-only: it never evaluates strategies or submits orders, even when automated paper trading is enabled. Positions are marked `AXIOM / MIXED` only when Axiom has previously traded that symbol; Alpaca aggregates manual and automated shares, so exact share-level attribution is not implied.
 
 Automated orders are disabled by default:
 
@@ -94,12 +118,22 @@ While disabled, the terminal calculates and displays proposed orders but submits
 
 Paper execution is deliberately restricted:
 
-- Long-only market orders; no shorts, leverage targets, options, or crypto.
+- Signed long/short market targets; no options, crypto, or hard-to-borrow locates.
 - Maximum 2% of account equity per released strategy.
-- Maximum 20% aggregate strategy allocation.
+- Maximum 20% aggregate gross strategy exposure.
 - Orders only while the US equity market is open and the account is not blocked.
-- Sells only reduce symbols previously bought by Axiom; existing manual positions are not adopted automatically.
+- Long entries may be fractional; short entries are whole-share and require the asset to be tradable, shortable, and easy to borrow.
+- Direction changes flatten the existing position first and open the opposite side on the next scheduler cycle.
+- Existing manual positions are not adopted automatically; mixed or unknown symbols are skipped.
 - Stable client order IDs prevent scheduler retries from placing the same order twice.
+
+Short entries have a separate safety switch and remain unsubmitted until both
+paper trading flags are explicitly enabled:
+
+```json
+"ALPACA_TRADING_ENABLED": "true",
+"ALPACA_SHORT_TRADING_ENABLED": "true"
+```
 
 ### Monitoring cadence
 

@@ -12,10 +12,24 @@ const credentials = {
   ALPACA_MAX_PORTFOLIO_PCT: "0.20",
 };
 
+function momentumStrategy(asset = "SPY", size = 0.5) {
+  return {
+    id: `AX-${asset}-01`, name: "Trend", state: "released", asset, archetype: "Momentum",
+    params: { fast: 5, slow: 20, threshold: 0.001, position_size: size },
+  };
+}
+
+function stateFor(...strategies) {
+  return { strategies, alpaca: { managed_symbols: [] } };
+}
+
 function fixtureFetch({
   existingOrder = null,
   positions = [],
   orders = [],
+  assets = {},
+  account = {},
+  descendingSymbols = [],
   portfolioHistory = {
     timestamp: [1785456000, 1785542400, 1785628800],
     equity: [100000, 100250, 100425.5],
@@ -36,6 +50,7 @@ function fixtureFetch({
       status: "ACTIVE", currency: "USD", cash: "100000", buying_power: "200000",
       equity: "100000", last_equity: "100000", portfolio_value: "100000",
       daytrade_count: 0, trading_blocked: false, account_blocked: false, pattern_day_trader: false,
+      ...account,
     });
     if (url.pathname === "/v2/positions") return Response.json(positions);
     if (url.pathname === "/v2/orders" && init.method !== "POST") return Response.json(orders);
@@ -48,11 +63,18 @@ function fixtureFetch({
       const symbols = url.searchParams.get("symbols").split(",");
       const bars = Object.fromEntries(symbols.map((symbol) => [symbol, Array.from({ length: 260 }, (_, index) => ({
         t: new Date(Date.UTC(2025, 0, 1) + index * 3600000).toISOString(),
-        o: 100 + index, h: 101 + index, l: 99 + index, c: 100.5 + index, v: 1000 + index,
+        o: descendingSymbols.includes(symbol) ? 400 - index : 100 + index,
+        h: descendingSymbols.includes(symbol) ? 401 - index : 101 + index,
+        l: descendingSymbols.includes(symbol) ? 399 - index : 99 + index,
+        c: descendingSymbols.includes(symbol) ? 400.5 - index : 100.5 + index, v: 1000 + index,
       }))]));
       return Response.json({ bars, next_page_token: null });
     }
-    if (url.pathname.startsWith("/v2/assets/")) return Response.json({ tradable: true, fractionable: true, status: "active" });
+    if (url.pathname.startsWith("/v2/assets/")) {
+      const symbol = decodeURIComponent(url.pathname.split("/").at(-1));
+      return Response.json({ tradable: true, fractionable: true, shortable: true,
+        borrow_status: "easy_to_borrow", status: "active", ...(assets[symbol] ?? {}) });
+    }
     if (url.pathname === "/v2/orders:by_client_order_id") {
       return existingOrder ? Response.json(existingOrder) : Response.json({ message: "not found" }, { status: 404 });
     }
@@ -143,7 +165,7 @@ test("paper cycle proposes but does not submit while trading is disabled", async
   assert.equal(mock.submitted.length, 0);
 });
 
-test("explicit paper-trading enablement submits an idempotent long-only order", async () => {
+test("explicit paper-trading enablement submits an idempotent long order", async () => {
   const mock = fixtureFetch();
   globalThis.fetch = mock;
   const appState = {
@@ -159,4 +181,81 @@ test("explicit paper-trading enablement submits an idempotent long-only order", 
   assert.equal(mock.submitted[0].side, "buy");
   assert.equal(mock.submitted[0].time_in_force, "day");
   assert.match(mock.submitted[0].client_order_id, /^axiom-/);
+});
+
+test("signed signals propose a whole-share ETB short but do not submit it by default", async () => {
+  const mock = fixtureFetch({ descendingSymbols: ["SPY"] });
+  globalThis.fetch = mock;
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T16");
+  assert.equal(cycle.evaluations["AX-SPY-01"].signal, -1);
+  assert.equal(cycle.proposed_orders[0].side, "sell");
+  assert.ok(cycle.proposed_orders[0].qty > 0);
+  assert.equal(cycle.submitted_orders.length, 0);
+  assert.match(cycle.safety_reasons[0].reason, /short_trading_disabled/);
+});
+
+test("ETB shorts submit only with explicit short enablement", async () => {
+  const mock = fixtureFetch({ descendingSymbols: ["SPY"] });
+  globalThis.fetch = mock;
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true", ALPACA_SHORT_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T17");
+  assert.equal(cycle.submitted_orders.length, 1);
+  assert.equal(mock.submitted[0].side, "sell");
+  assert.ok("qty" in mock.submitted[0]);
+  assert.equal("notional" in mock.submitted[0], false);
+});
+
+test("borrow loss blocks a new short while preserving the safety reason", async () => {
+  globalThis.fetch = fixtureFetch({ descendingSymbols: ["SPY"], assets: { SPY: { borrow_status: "hard_to_borrow" } } });
+  const cycle = await buildPaperCycle(credentials, stateFor(momentumStrategy()), "2026-08-03T18");
+  assert.equal(cycle.proposed_orders.length, 0);
+  assert.deepEqual(cycle.safety_reasons, [{ symbol: "SPY", reason: "short_borrow_unavailable" }]);
+});
+
+test("existing short can be covered after borrow eligibility is lost", async () => {
+  globalThis.fetch = fixtureFetch({
+    positions: [{ symbol: "SPY", side: "short", qty: "5", market_value: "-725", current_price: "145" }],
+    assets: { SPY: { borrow_status: "hard_to_borrow" } },
+  });
+  const appState = stateFor(momentumStrategy());
+  appState.alpaca.managed_symbols = ["SPY"];
+  const cycle = await buildPaperCycle(credentials, appState, "2026-08-03T19");
+  assert.equal(cycle.proposed_orders[0].side, "buy");
+  assert.equal(cycle.proposed_orders[0].qty, 5);
+});
+
+test("direction flips flatten the managed position before opening the opposite side", async () => {
+  globalThis.fetch = fixtureFetch({
+    positions: [{ symbol: "SPY", side: "long", qty: "4", market_value: "1000", current_price: "250" }],
+    descendingSymbols: ["SPY"],
+  });
+  const appState = stateFor(momentumStrategy());
+  appState.alpaca.managed_symbols = ["SPY"];
+  const cycle = await buildPaperCycle(credentials, appState, "2026-08-03T20");
+  assert.equal(cycle.proposed_orders.length, 1);
+  assert.equal(cycle.proposed_orders[0].side, "sell");
+  assert.equal(cycle.proposed_orders[0].qty, 4);
+  assert.match(cycle.proposed_orders[0].client_order_id, /flatten-long/);
+});
+
+test("unmanaged positions and blocked accounts cannot receive automated orders", async () => {
+  globalThis.fetch = fixtureFetch({ positions: [{ symbol: "SPY", side: "long", qty: "2", market_value: "500", current_price: "250" }] });
+  let cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T21");
+  assert.equal(cycle.proposed_orders.length, 0);
+  assert.equal(cycle.safety_reasons[0].reason, "unmanaged_existing_position");
+
+  const mock = fixtureFetch({ account: { trading_blocked: true } });
+  globalThis.fetch = mock;
+  cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T22");
+  assert.equal(cycle.can_trade_now, false);
+  assert.equal(cycle.submitted_orders.length, 0);
+  assert.equal(cycle.proposed_orders.length, 1);
+});
+
+test("gross portfolio cap scales opposing and same-direction strategy targets by absolute exposure", async () => {
+  const mock = fixtureFetch();
+  globalThis.fetch = mock;
+  const strategies = [momentumStrategy("SPY", 1), momentumStrategy("QQQ", 1), momentumStrategy("IWM", 1)];
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_MAX_STRATEGY_PCT: "0.05", ALPACA_MAX_PORTFOLIO_PCT: "0.05" }, stateFor(...strategies), "2026-08-03T23");
+  assert.equal(cycle.proposed_orders.length, 3);
+  assert.ok(cycle.proposed_orders.reduce((sum, order) => sum + order.notional, 0) <= 5000);
 });

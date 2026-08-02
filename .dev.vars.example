@@ -3,3 +3,10 @@
 ADMIN_TOKEN=replace-with-a-long-random-secret
 ALPACA_API_KEY=replace-with-your-paper-key-id
 ALPACA_API_SECRET=replace-with-your-paper-secret-key
+ALPACA_TRADING_ENABLED=false
+ALPACA_SHORT_TRADING_ENABLED=false
+# Optional remote Backtrader service. Start in shadow, use legacy for an
+# immediate rollback, and switch to backtrader only after parity review.
+BACKTEST_SERVICE_URL=https://your-cloud-run-service.run.app
+BACKTEST_SERVICE_SECRET=replace-with-a-second-long-random-secret
+BACKTEST_ENGINE=shadow

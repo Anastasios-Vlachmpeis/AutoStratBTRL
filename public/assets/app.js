@@ -451,7 +451,11 @@ function renderSelected() {
   const metrics = strategy.metrics;
   $("#selected-name").textContent = strategy.name;
   const attempt = strategy.rework?.attempt ? `<span>REWORK ${strategy.rework.attempt}/${strategy.rework.max_attempts || 3}</span>` : "";
-  $("#selected-meta").innerHTML = `<span>${escapeHtml(strategy.archetype)}</span><span>${escapeHtml(strategy.asset)}</span><span>GEN ${strategy.generation}</span>${attempt}`;
+  const engineRun = strategy.backtest_runs?.development ?? strategy.backtest_runs?.holdout;
+  const engineName = strategy.engine_family ? strategy.engine_family.toUpperCase() : "UNASSIGNED";
+  const engineVersion = engineRun?.engine?.version ? ` ${engineRun.engine.version}` : "";
+  const shadow = strategy.backtest_runs?.shadow || strategy.backtest_runs?.shadow_validation ? "<span>SHADOW COMPARED</span>" : "";
+  $("#selected-meta").innerHTML = `<span>${escapeHtml(strategy.archetype)}</span><span>${escapeHtml(strategy.asset)}</span><span>GEN ${strategy.generation}</span><span>${escapeHtml(engineName + engineVersion)} ENGINE</span>${shadow}${attempt}`;
   const status = $("#selected-status");
   status.textContent = statusLabels[strategy.state] || strategy.state;
   status.className = `status-badge ${strategy.state}`;

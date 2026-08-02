@@ -7,6 +7,7 @@ import {
   advanceMarket,
   backtest,
   createDemoState,
+  evaluateStrategyWindow,
   generateBatch,
   marketSeries,
   migrateState,
@@ -130,6 +131,14 @@ test("no-signal backtests stay finite", () => {
   assert.ok(Number.isFinite(result.profit_factor));
 });
 
+test("live monitoring measures signed short exposure", () => {
+  const strategy = { archetype: "Momentum", params: { fast: 3, slow: 10, threshold: .001, position_size: .5 } };
+  const prices = Array.from({ length: 90 }, (_, index) => 200 * (.99 ** index));
+  const result = evaluateStrategyWindow(strategy, prices, 21);
+  assert.equal(result.signal, -1);
+  assert.ok(result.returns.reduce((sum, value) => sum + value, 0) > 0);
+});
+
 test("market advance records monitoring evidence", () => {
   const state = createDemoState();
   addReleasedStrategy(state);
@@ -191,20 +200,36 @@ test("legacy preloaded state is migrated to an empty workspace", () => {
   addReleasedStrategy(state);
   state.schemaVersion = 2;
   const migrated = migrateState(state);
-  assert.equal(migrated.schemaVersion, 4);
+  assert.equal(migrated.schemaVersion, 5);
   assert.deepEqual(migrated.strategies, []);
   assert.deepEqual(migrated.events, []);
 });
 
-test("schema 3 migration preserves user strategies and adds rework metadata", () => {
+test("schema 3 migration preserves user strategies and adds backtest provenance metadata", () => {
   const state = createDemoState();
   generateBatch(state, 1);
   delete state.strategies[0].rework;
   state.schemaVersion = 3;
   const migrated = migrateState(state);
-  assert.equal(migrated.schemaVersion, 4);
+  assert.equal(migrated.schemaVersion, 5);
   assert.equal(migrated.strategies.length, 1);
   assert.equal(migrated.strategies[0].rework.attempt, 0);
+  assert.equal(migrated.strategies[0].engine_family, null);
+  assert.deepEqual(migrated.strategies[0].backtest_runs, {});
+});
+
+test("schema 4 migration preserves strategies while upgrading to sealed-backtest state", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  const id = state.strategies[0].id;
+  state.schemaVersion = 4;
+  delete state.strategies[0].backtest_runs;
+  delete state.datasets;
+  const migrated = migrateState(state);
+  assert.equal(migrated.schemaVersion, 5);
+  assert.equal(migrated.strategies[0].id, id);
+  assert.deepEqual(migrated.strategies[0].backtest_runs, {});
+  assert.deepEqual(migrated.datasets, {});
 });
 
 test("Alpaca cycles are idempotent and record managed symbols", () => {
@@ -228,6 +253,21 @@ test("Alpaca cycles are idempotent and record managed symbols", () => {
   assert.equal(applyAlpacaCycle(state, cycle), false);
   assert.ok(state.alpaca.managed_symbols.includes(active.asset));
   assert.equal(snapshot(state).summary.capital, 100000);
+});
+
+test("an accepted Axiom short marks the symbol as managed for later covers", () => {
+  const state = createDemoState();
+  const active = addReleasedStrategy(state);
+  const cycle = {
+    scheduled_bucket: "2026-08-03T18", fetched_at: "2026-08-03T18:05:00Z", feed: "iex",
+    trading_enabled: true, short_trading_enabled: true, can_trade_now: true,
+    account: { equity: 100000 }, positions: [], open_orders: [], clock: { is_open: true },
+    proposed_orders: [], order_errors: [], safety_reasons: [],
+    submitted_orders: [{ symbol: active.asset, side: "sell", status: "accepted", client_order_id: "axiom-test-short" }],
+    evaluations: {},
+  };
+  applyAlpacaCycle(state, cycle);
+  assert.ok(state.alpaca.managed_symbols.includes(active.asset));
 });
 
 test("read-only Alpaca overview refresh preserves strategy ownership state", () => {

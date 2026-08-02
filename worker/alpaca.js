@@ -196,6 +196,11 @@ async function getAssets(env, symbols) {
     return [symbol, {
       tradable: Boolean(asset.tradable),
       fractionable: Boolean(asset.fractionable),
+      shortable: Boolean(asset.shortable),
+      // `easy_to_borrow` is retained while Alpaca transitions clients to
+      // `borrow_status`.  Do not infer borrowability when neither is present.
+      borrow_status: asset.borrow_status ?? null,
+      easy_to_borrow: asset.easy_to_borrow === true,
       status: asset.status,
     }];
   }));
@@ -221,6 +226,24 @@ function orderId(bucket, symbol, side) {
   return `axiom-${bucket.replace(/[^0-9]/g, "").slice(0, 12)}-${symbol.toLowerCase()}-${side}`;
 }
 
+function signedPositionValue(position) {
+  if (!position) return 0;
+  const magnitude = Math.abs(cleanNumber(position.market_value))
+    || Math.abs(cleanNumber(position.qty) * cleanNumber(position.current_price));
+  return position.side === "short" || cleanNumber(position.qty) < 0 ? -magnitude : magnitude;
+}
+
+function shortBorrowable(asset) {
+  return Boolean(asset?.tradable && asset?.shortable
+    && (asset.borrow_status === "easy_to_borrow" || asset.easy_to_borrow));
+}
+
+function wholeSharesForNotional(notional, position) {
+  const price = Math.abs(cleanNumber(position?.current_price))
+    || Math.abs(cleanNumber(position?.market_value) / cleanNumber(position?.qty));
+  return price > 0 ? Math.floor(Math.abs(notional) / price) : 0;
+}
+
 export async function buildPaperCycle(env, appState, scheduledBucket, orderBucket = scheduledBucket) {
   const overview = await getAccountOverview(env);
   const active = appState.strategies.filter((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
@@ -240,67 +263,127 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
     const prices = symbolBars.map((bar) => bar.c);
     if (prices.length < 60) continue;
     const evaluation = evaluateStrategyWindow(strategy, prices, 21);
+    // Keep execution explicitly tied to the frozen strategy's signed signal.
+    const signal = latestSignal(strategy, prices);
     evaluations[strategy.id] = {
       ...evaluation,
+      signal,
       latest_price: prices.at(-1),
       bar_time: symbolBars.at(-1).t,
     };
-    if (evaluation.signal > 0) {
-      desiredBySymbol[strategy.asset] += strategyCap * strategy.params.position_size;
-    }
+    desiredBySymbol[strategy.asset] += Math.max(-strategyCap, Math.min(strategyCap,
+      strategyCap * Number(strategy.params.position_size || 0) * signal));
   }
 
-  const desiredTotal = Object.values(desiredBySymbol).reduce((sum, value) => sum + value, 0);
-  const scale = desiredTotal > portfolioCap && desiredTotal > 0 ? portfolioCap / desiredTotal : 1;
+  const desiredGross = Object.values(desiredBySymbol).reduce((sum, value) => sum + Math.abs(value), 0);
+  const scale = desiredGross > portfolioCap && desiredGross > 0 ? portfolioCap / desiredGross : 1;
   const positionBySymbol = Object.fromEntries(overview.positions.map((position) => [position.symbol, position]));
   const openSymbols = new Set(overview.open_orders.map((order) => order.symbol));
   const managedSymbols = new Set(appState.alpaca?.managed_symbols ?? []);
-  const candidateSymbols = SUPPORTED_SYMBOLS.filter((symbol) => desiredBySymbol[symbol] > 0 || managedSymbols.has(symbol));
+  const candidateSymbols = SUPPORTED_SYMBOLS.filter((symbol) => desiredBySymbol[symbol] !== 0 || managedSymbols.has(symbol));
   const assets = candidateSymbols.length ? await getAssets(env, candidateSymbols) : {};
   const proposed = [];
+  const safety_reasons = [];
 
   for (const symbol of candidateSymbols) {
-    if (openSymbols.has(symbol)) continue;
+    if (openSymbols.has(symbol)) {
+      safety_reasons.push({ symbol, reason: "open_order_pending" });
+      continue;
+    }
     const target = desiredBySymbol[symbol] * scale;
     const position = positionBySymbol[symbol];
-    const current = position?.market_value ?? 0;
+    const current = signedPositionValue(position);
+    if (position && !managedSymbols.has(symbol)) {
+      safety_reasons.push({ symbol, reason: "unmanaged_existing_position" });
+      continue;
+    }
     const difference = target - current;
     if (Math.abs(difference) < 25) continue;
-    if (difference > 0) {
-      if (!assets[symbol]?.tradable || !assets[symbol]?.fractionable) continue;
+    const asset = assets[symbol];
+    const baseOrder = {
+      symbol, type: "market", time_in_force: "day", extended_hours: false,
+    };
+
+    // Crossing zero is deliberately two-phase.  This avoids accidentally
+    // submitting an oversized order that both closes and opens a short/long.
+    if (current > 0 && target < 0) {
+      const quantity = Math.abs(cleanNumber(position?.qty));
+      if (quantity > 0) proposed.push({ ...baseOrder, qty: String(quantity), side: "sell",
+        client_order_id: orderId(orderBucket, symbol, "flatten-long") });
+      continue;
+    }
+    if (current < 0 && target > 0) {
+      const quantity = Math.abs(cleanNumber(position?.qty));
+      if (quantity > 0) proposed.push({ ...baseOrder, qty: String(quantity), side: "buy",
+        client_order_id: orderId(orderBucket, symbol, "cover-short") });
+      continue;
+    }
+
+    if (current < 0) {
+      // Increasing an existing short requires borrow eligibility; reducing it
+      // is always a cover and therefore remains permitted after borrow loss.
+      if (Math.abs(target) > Math.abs(current) && !shortBorrowable(asset)) {
+        safety_reasons.push({ symbol, reason: "short_borrow_unavailable" });
+        continue;
+      }
+      const increasingShort = Math.abs(target) > Math.abs(current);
+      const quantity = !increasingShort && target === 0
+        ? Math.abs(cleanNumber(position?.qty))
+        : wholeSharesForNotional(difference, position);
+      if (quantity > 0) proposed.push({ ...baseOrder, qty: String(quantity),
+        side: increasingShort ? "sell" : "buy",
+        _opens_short: increasingShort,
+        client_order_id: orderId(orderBucket, symbol, increasingShort ? "short-increase" : "cover") });
+    } else if (difference > 0) {
+      if (!asset?.tradable || !asset?.fractionable) {
+        safety_reasons.push({ symbol, reason: "asset_not_fractionable_for_long" });
+        continue;
+      }
       proposed.push({
-        symbol,
+        ...baseOrder,
         notional: String(Math.floor(difference * 100) / 100),
         side: "buy",
-        type: "market",
-        time_in_force: "day",
-        extended_hours: false,
         client_order_id: orderId(orderBucket, symbol, "buy"),
       });
-    } else if (managedSymbols.has(symbol) && position?.qty > 0 && current > 0) {
-      const fraction = Math.min(Math.abs(difference) / current, 1);
-      const quantity = Math.floor(position.qty * fraction * 1e6) / 1e6;
+    } else if (current > 0) {
+      const fraction = Math.min(Math.abs(difference) / Math.abs(current), 1);
+      const quantity = Math.floor(Math.abs(position.qty) * fraction * 1e6) / 1e6;
       if (quantity > 0) proposed.push({
-        symbol,
+        ...baseOrder,
         qty: String(quantity),
         side: "sell",
-        type: "market",
-        time_in_force: "day",
-        extended_hours: false,
         client_order_id: orderId(orderBucket, symbol, "sell"),
       });
+    } else {
+      if (!shortBorrowable(asset)) {
+        safety_reasons.push({ symbol, reason: "short_borrow_unavailable" });
+        continue;
+      }
+      const quantity = wholeSharesForNotional(difference, { current_price: evaluations[
+        active.find((strategy) => strategy.asset === symbol)?.id
+      ]?.latest_price });
+      if (quantity > 0) proposed.push({ ...baseOrder, qty: String(quantity), side: "sell",
+        _opens_short: true,
+        client_order_id: orderId(orderBucket, symbol, "short") });
     }
   }
 
   const tradingEnabled = env.ALPACA_TRADING_ENABLED === "true";
+  const shortTradingEnabled = env.ALPACA_SHORT_TRADING_ENABLED === "true";
   const canTrade = tradingEnabled && overview.clock.is_open
+    && String(overview.account.status || "").toUpperCase() === "ACTIVE"
     && !overview.account.trading_blocked && !overview.account.account_blocked;
   const submitted = [];
   const order_errors = [];
   if (canTrade) {
     for (const order of proposed) {
+      if (order._opens_short && !shortTradingEnabled) {
+        safety_reasons.push({ symbol: order.symbol, reason: "short_trading_disabled" });
+        continue;
+      }
       try {
-        submitted.push(await submitOrder(env, order));
+        const { _opens_short, ...submitPayload } = order;
+        submitted.push(await submitOrder(env, submitPayload));
       } catch (error) {
         order_errors.push({ symbol: order.symbol, message: error instanceof Error ? error.message : "Order failed" });
       }
@@ -311,11 +394,13 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
     ...overview,
     feed: env.ALPACA_DATA_FEED || "iex",
     trading_enabled: tradingEnabled,
+    short_trading_enabled: shortTradingEnabled,
     can_trade_now: canTrade,
     evaluations,
-    proposed_orders: proposed.map((order) => ({ ...order, notional: cleanNumber(order.notional), qty: cleanNumber(order.qty) })),
+    proposed_orders: proposed.map(({ _opens_short, ...order }) => ({ ...order, notional: cleanNumber(order.notional), qty: cleanNumber(order.qty) })),
     submitted_orders: submitted,
     order_errors,
+    safety_reasons,
     scheduled_bucket: scheduledBucket,
   };
 }

@@ -1,0 +1,6 @@
+fastapi==0.115.12
+pydantic==2.10.6
+uvicorn[standard]==0.34.2
+backtrader==1.9.78.123
+pytest==8.3.5
+httpx==0.28.1
