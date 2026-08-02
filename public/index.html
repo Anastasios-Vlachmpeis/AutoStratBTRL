@@ -184,6 +184,36 @@
       <footer><span>AXIOM v0.1 / DETERMINISTIC SEED <b id="seed-value">—</b></span><span>RESEARCH & PAPER SIMULATION ONLY — NOT INVESTMENT ADVICE</span></footer>
     </div>
   </div>
+  <div class="operation-overlay" id="operation-overlay" role="dialog" aria-modal="true" aria-labelledby="operation-title" tabindex="-1" hidden>
+    <section class="operation-terminal" id="operation-terminal">
+      <div class="operation-scanline" aria-hidden="true"></div>
+      <header class="operation-header">
+        <span id="operation-code">PROCESS / IDLE</span>
+        <span class="operation-status"><i></i><span id="operation-state">RUNNING</span></span>
+      </header>
+      <div class="operation-grid">
+        <div class="operation-visual" aria-hidden="true">
+          <i class="operation-ring ring-one"></i>
+          <i class="operation-ring ring-two"></i>
+          <i class="operation-ring ring-three"></i>
+          <span class="operation-particle particle-one"></span>
+          <span class="operation-particle particle-two"></span>
+          <span class="operation-particle particle-three"></span>
+          <strong class="operation-glyph" id="operation-glyph">DNA</strong>
+        </div>
+        <div class="operation-copy">
+          <span class="section-kicker" id="operation-kicker">STRATEGY SYNTHESIS</span>
+          <h2 id="operation-title">Generating strategy DNA</h2>
+          <p id="operation-description">Constructing new research units from first principles.</p>
+          <div class="operation-steps" id="operation-steps"></div>
+        </div>
+      </div>
+      <footer class="operation-footer">
+        <div><span id="operation-current-step">INITIALIZING</span><strong id="operation-progress-label">0%</strong></div>
+        <span class="operation-progress"><i id="operation-progress"></i></span>
+      </footer>
+    </section>
+  </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/app.js"></script>
 </body>

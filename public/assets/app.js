@@ -580,12 +580,157 @@ async function action(path, payload, successMessage) {
   } catch (_) { /* api already surfaced the error */ }
 }
 
+const operationConfigs = {
+  generate: {
+    button: "#generate-button",
+    code: "PROCESS / GENESIS",
+    kicker: "STRATEGY SYNTHESIS",
+    title: "Generating strategy DNA",
+    glyph: "DNA",
+    description: (detail) => `Mapping ${detail} across the permitted parameter space.`,
+    steps: ["Seed first-principle archetypes", "Mutate parameter genomes", "Check structural constraints", "Register research cohort"],
+    duration: 2400,
+  },
+  review: {
+    button: "#review-button",
+    code: "PROCESS / SUPERVISOR",
+    kicker: "SELF-SUPERVISION CYCLE",
+    title: "Reviewing strategy evidence",
+    glyph: "SCAN",
+    description: (detail) => `Auditing ${detail} against development regimes and release policy.`,
+    steps: ["Replay regime backtests", "Measure robustness and drawdown", "Compare supervisor gates", "Issue promote, rework, or drop decisions"],
+    duration: 2700,
+  },
+  validate: {
+    button: "#validate-button",
+    code: "PROCESS / HOLDOUT",
+    kicker: "UNSEEN DATA VALIDATION",
+    title: "Opening sealed holdout data",
+    glyph: "LOCK",
+    description: (detail) => `Validating ${detail} without exposing the final quarter to generation or supervision.`,
+    steps: ["Freeze learned parameters", "Unlock untouched final 25%", "Replay out-of-sample signals", "Apply final release gates"],
+    duration: 2800,
+  },
+};
+
+const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+let operationBusy = false;
+
+function setOperationStep(session, index) {
+  const steps = $$("#operation-steps .operation-step");
+  const bounded = Math.min(index, steps.length - 1);
+  steps.forEach((step, stepIndex) => {
+    step.classList.toggle("done", stepIndex < bounded);
+    step.classList.toggle("active", stepIndex === bounded);
+    step.querySelector("small").textContent = stepIndex < bounded ? "DONE" : stepIndex === bounded ? "RUN" : "WAIT";
+  });
+  const denominator = Math.max(steps.length - 1, 1);
+  const progress = Math.round(12 + bounded / denominator * 70);
+  $("#operation-current-step").textContent = session.config.steps[bounded].toUpperCase();
+  $("#operation-progress").style.width = `${progress}%`;
+  $("#operation-progress-label").textContent = `${progress}%`;
+  session.step = bounded;
+}
+
+function beginOperation(kind, detail) {
+  const config = operationConfigs[kind];
+  const overlay = $("#operation-overlay");
+  const terminal = $("#operation-terminal");
+  const button = $(config.button);
+  overlay.dataset.phase = kind;
+  terminal.className = "operation-terminal";
+  $("#operation-code").textContent = config.code;
+  $("#operation-state").textContent = "RUNNING";
+  $("#operation-kicker").textContent = config.kicker;
+  $("#operation-title").textContent = config.title;
+  $("#operation-glyph").textContent = config.glyph;
+  $("#operation-description").textContent = config.description(detail);
+  $("#operation-steps").innerHTML = config.steps.map((step) => `<div class="operation-step"><i></i><span>${escapeHtml(step)}</span><small>WAIT</small></div>`).join("");
+  $("#operation-progress").style.width = "4%";
+  $("#operation-progress-label").textContent = "4%";
+  button.setAttribute("aria-busy", "true");
+  document.body.classList.add(`operation-${kind}`);
+  overlay.hidden = false;
+  requestAnimationFrame(() => overlay.classList.add("visible"));
+  overlay.focus({ preventScroll: true });
+  const session = { kind, config, overlay, terminal, button, step: 0, timer: null };
+  setOperationStep(session, 0);
+  const interval = Math.max(480, Math.round(config.duration / (config.steps.length + 1)));
+  session.timer = setInterval(() => {
+    if (session.step < config.steps.length - 1) setOperationStep(session, session.step + 1);
+  }, interval);
+  return session;
+}
+
+async function finishOperation(session, succeeded) {
+  clearInterval(session.timer);
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (succeeded) {
+    $$("#operation-steps .operation-step").forEach((step) => {
+      step.classList.remove("active");
+      step.classList.add("done");
+      step.querySelector("small").textContent = "DONE";
+    });
+    session.terminal.classList.add("complete");
+    $("#operation-state").textContent = "COMPLETE";
+    $("#operation-current-step").textContent = "PROCESS COMPLETE";
+    $("#operation-progress").style.width = "100%";
+    $("#operation-progress-label").textContent = "100%";
+    await wait(reducedMotion ? 80 : 520);
+  } else {
+    session.terminal.classList.add("failed");
+    $("#operation-state").textContent = "HALTED";
+    $("#operation-current-step").textContent = "PROCESS HALTED";
+    $("#operation-progress").style.width = "100%";
+    $("#operation-progress-label").textContent = "ERROR";
+    $("#operation-description").textContent = "The operation stopped safely. Review the error message and try again.";
+    await wait(reducedMotion ? 120 : 850);
+  }
+  session.overlay.classList.remove("visible");
+  await wait(reducedMotion ? 10 : 230);
+  session.overlay.hidden = true;
+  document.body.classList.remove(`operation-${session.kind}`);
+  session.button.removeAttribute("aria-busy");
+  session.button.focus({ preventScroll: true });
+}
+
+function triggerOperationReveal(kind) {
+  const revealClasses = ["reveal-generate", "reveal-review", "reveal-validate"];
+  document.body.classList.remove(...revealClasses);
+  void document.body.offsetWidth;
+  document.body.classList.add(`reveal-${kind}`);
+  setTimeout(() => document.body.classList.remove(`reveal-${kind}`), 1300);
+}
+
+async function animatedAction(kind, path, payload, successMessage, detail) {
+  if (operationBusy) return;
+  operationBusy = true;
+  const session = beginOperation(kind, detail);
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  try {
+    await Promise.all([api(path, payload), wait(reducedMotion ? 180 : session.config.duration)]);
+    await finishOperation(session, true);
+    triggerOperationReveal(kind);
+    showToast(successMessage);
+  } catch (_) {
+    await finishOperation(session, false);
+  } finally {
+    operationBusy = false;
+  }
+}
+
 $("#generate-button").addEventListener("click", () => {
   const count = Number($("#cohort-size").value);
-  action("/api/generate", { count }, `${count} new strategy DNA${count === 1 ? "" : "s"} seeded.`);
+  animatedAction("generate", "/api/generate", { count }, `${count} new strategy DNA${count === 1 ? "" : "s"} seeded.`, `${count} NEW GENOME${count === 1 ? "" : "S"}`);
 });
-$("#review-button").addEventListener("click", () => action("/api/review", {}, "Supervisor review cycle complete."));
-$("#validate-button").addEventListener("click", () => action("/api/validate", {}, "Untouched holdout validation complete."));
+$("#review-button").addEventListener("click", () => {
+  const count = state.strategies.filter((strategy) => ["generated", "rework"].includes(strategy.state)).length;
+  animatedAction("review", "/api/review", {}, "Supervisor review cycle complete.", `${count} CANDIDATE${count === 1 ? "" : "S"}`);
+});
+$("#validate-button").addEventListener("click", () => {
+  const count = state.strategies.filter((strategy) => strategy.state === "validation").length;
+  animatedAction("validate", "/api/validate", {}, "Untouched holdout validation complete.", `${count} STRATEG${count === 1 ? "Y" : "IES"}`);
+});
 $("#advance-button").addEventListener("click", () => action("/api/advance", { periods: 1 }, "Paper market advanced by 21 sessions."));
 $("#sync-button").addEventListener("click", () => action("/api/alpaca/sync", {}, "Alpaca account and market data synchronized."));
 $("#portfolio-refresh-button").addEventListener("click", () => action("/api/alpaca/portfolio", {}, "Alpaca balances, positions, and orders refreshed read-only."));
