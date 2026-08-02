@@ -491,11 +491,63 @@ function renderRegimes(strategy) {
     $("#regime-content").innerHTML = `<div class="empty-state">Run the supervisor to expose regime fitness.</div>`;
     return;
   }
-  $("#regime-content").innerHTML = Object.entries(scores).map(([name, score]) => {
-    const distance = Math.min(Math.abs(score) * 48, 48);
-    const left = score >= 0 ? 50 : 50 - distance;
-    return `<div class="regime-row"><div class="regime-head"><span>${escapeHtml(name)}</span><span>${score >= 0 ? "+" : ""}${number(score, 2)}</span></div><div class="regime-track"><i class="${score < 0 ? "negative" : ""}" style="left:${left}%;width:${distance}%"></i></div></div>`;
+  const entries = Object.entries(scores).map(([name, score]) => [name, Number(score)]).filter(([, score]) => Number.isFinite(score));
+  if (entries.length !== 4) {
+    $("#regime-content").innerHTML = `<div class="empty-state">The 3D generalization map requires exactly four regime dimensions.</div>`;
+    return;
+  }
+  const center = { x: 210, y: 158 };
+  const vertices = [
+    { x: 210, y: 36 },
+    { x: 55, y: 184 },
+    { x: 365, y: 184 },
+    { x: 210, y: 270 },
+  ];
+  const labels = [
+    { x: 210, y: 14, anchor: "middle" },
+    { x: 40, y: 181, anchor: "end" },
+    { x: 380, y: 181, anchor: "start" },
+    { x: 210, y: 292, anchor: "middle" },
+  ];
+  const project = (vertex, level) => ({
+    x: center.x + (vertex.x - center.x) * level,
+    y: center.y + (vertex.y - center.y) * level,
+  });
+  const scorePoints = entries.map(([, score], index) => project(vertices[index], (Math.max(-1, Math.min(1, score)) + 1) / 2));
+  const neutralPoints = vertices.map((vertex) => project(vertex, .5));
+  const edgePairs = [[0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3]];
+  const faces = [[0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3]];
+  const lineSet = (points, className) => edgePairs.map(([from, to]) => `<line class="${className}" x1="${points[from].x}" y1="${points[from].y}" x2="${points[to].x}" y2="${points[to].y}"/>`).join("");
+  const axes = vertices.map((vertex) => `<line class="tetra-axis" x1="${center.x}" y1="${center.y}" x2="${vertex.x}" y2="${vertex.y}"/>`).join("");
+  const scoreFaces = faces.map((face, index) => {
+    const average = face.reduce((sum, vertexIndex) => sum + entries[vertexIndex][1], 0) / face.length;
+    const points = face.map((vertexIndex) => `${scorePoints[vertexIndex].x.toFixed(1)},${scorePoints[vertexIndex].y.toFixed(1)}`).join(" ");
+    return `<polygon class="tetra-face face-${index} ${average < 0 ? "negative" : ""}" points="${points}"/>`;
   }).join("");
+  const scoreEdges = lineSet(scorePoints, "tetra-score-edge");
+  const dots = scorePoints.map((point, index) => {
+    const [name, score] = entries[index];
+    return `<g class="tetra-node ${score < 0 ? "negative" : ""}"><circle class="tetra-node-halo" cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="8"/><circle cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="4"><title>${escapeHtml(name)}: ${score >= 0 ? "+" : ""}${number(score, 2)}</title></circle></g>`;
+  }).join("");
+  const vertexLabels = entries.map(([name, score], index) => `<text class="tetra-label" x="${labels[index].x}" y="${labels[index].y}" text-anchor="${labels[index].anchor}"><tspan>${escapeHtml(name)}</tspan><tspan class="tetra-value ${score < 0 ? "negative" : ""}" x="${labels[index].x}" dy="12">${score >= 0 ? "+" : ""}${number(score, 2)}</tspan></text>`).join("");
+  const values = entries.map(([, score]) => score);
+  const mean = values.reduce((sum, score) => sum + score, 0) / values.length;
+  const weakest = entries.reduce((lowest, entry) => entry[1] < lowest[1] ? entry : lowest, entries[0]);
+  const positive = values.filter((score) => score > 0).length;
+  $("#regime-content").innerHTML = `<div class="regime-tetra-shell">
+    <div class="tetra-caption"><span>4D REGIME TETRAHEDRON</span><small>CENTER −1 · MID 0 · EDGE +1</small></div>
+    <svg class="regime-tetra" viewBox="0 0 420 314" role="img" aria-label="Three-dimensional tetrahedral generalization chart">
+      <title>Four-dimensional strategy generalization projected as a three-dimensional tetrahedron.</title>
+      <g class="tetra-frame">${axes}${lineSet(vertices, "tetra-outer-edge")}${lineSet(neutralPoints, "tetra-neutral-edge")}<circle class="tetra-center" cx="${center.x}" cy="${center.y}" r="2"/></g>
+      <g class="tetra-score-shape">${scoreFaces}${scoreEdges}${dots}</g>
+      ${vertexLabels}
+    </svg>
+    <div class="tetra-summary">
+      <div><span>POSITIVE VERTICES</span><strong>${positive}/4</strong></div>
+      <div><span>MEAN EDGE</span><strong class="${mean < 0 ? "negative" : ""}">${mean >= 0 ? "+" : ""}${number(mean, 2)}</strong></div>
+      <div><span>WEAKEST</span><strong class="${weakest[1] < 0 ? "negative" : ""}">${escapeHtml(weakest[0])} ${weakest[1] >= 0 ? "+" : ""}${number(weakest[1], 2)}</strong></div>
+    </div>
+  </div>`;
 }
 
 function renderGates(strategy) {
