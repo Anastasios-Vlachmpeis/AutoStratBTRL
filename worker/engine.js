@@ -690,6 +690,28 @@ function monitorStrategy(state, strategy, newReturns) {
   }
 }
 
+export function applyAlpacaOverview(state, overview) {
+  const previous = state.alpaca ?? {};
+  state.alpaca = {
+    ...previous,
+    connected: true,
+    fetched_at: overview.fetched_at,
+    account: overview.account,
+    positions: overview.positions,
+    open_orders: overview.open_orders,
+    clock: overview.clock,
+    feed: previous.feed ?? "iex",
+    trading_enabled: previous.trading_enabled ?? false,
+    can_trade_now: Boolean(previous.trading_enabled && overview.clock?.is_open
+      && !overview.account?.trading_blocked && !overview.account?.account_blocked),
+    proposed_orders: previous.proposed_orders ?? [],
+    submitted_orders: previous.submitted_orders ?? [],
+    order_errors: previous.order_errors ?? [],
+    managed_symbols: previous.managed_symbols ?? [],
+  };
+  event(state, "ALPACA", "Alpaca portfolio refreshed", `${overview.positions.length} positions · ${overview.open_orders.length} open orders · read only`);
+}
+
 export function applyAlpacaCycle(state, cycle) {
   if (cycle.scheduled_bucket && state.alpaca?.last_cycle_bucket === cycle.scheduled_bucket) return false;
   const barTimes = Object.values(cycle.evaluations ?? {}).map((evaluation) => evaluation.bar_time).filter(Boolean);

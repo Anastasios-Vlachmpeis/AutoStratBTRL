@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   applyAlpacaCycle,
+  applyAlpacaOverview,
   advanceMarket,
   backtest,
   createDemoState,
@@ -227,4 +228,23 @@ test("Alpaca cycles are idempotent and record managed symbols", () => {
   assert.equal(applyAlpacaCycle(state, cycle), false);
   assert.ok(state.alpaca.managed_symbols.includes(active.asset));
   assert.equal(snapshot(state).summary.capital, 100000);
+});
+
+test("read-only Alpaca overview refresh preserves strategy ownership state", () => {
+  const state = createDemoState();
+  state.alpaca.managed_symbols = ["SPY"];
+  applyAlpacaOverview(state, {
+    connected: true,
+    fetched_at: "2026-08-03T16:00:00Z",
+    account: { equity: 100250, last_equity: 100000, cash: 80000, buying_power: 160000, portfolio_value: 100250 },
+    positions: [{ symbol: "SPY", qty: 2, market_value: 1000, unrealized_pl: 25, unrealized_plpc: 0.025 }],
+    open_orders: [{ id: "manual-1", client_order_id: "manual-1", symbol: "QQQ", status: "new" }],
+    clock: { is_open: true },
+  });
+  assert.equal(state.alpaca.connected, true);
+  assert.equal(state.alpaca.positions[0].symbol, "SPY");
+  assert.equal(state.alpaca.open_orders[0].symbol, "QQQ");
+  assert.deepEqual(state.alpaca.managed_symbols, ["SPY"]);
+  assert.equal(snapshot(state).summary.capital, 100250);
+  assert.ok(state.events.some((item) => item.title === "Alpaca portfolio refreshed"));
 });

@@ -18,6 +18,7 @@
         <button class="rail-button active" data-view="overview" aria-label="Foundry overview"><span class="rail-icon">⌘</span><span>Foundry</span></button>
         <button class="rail-button" data-view="testing" aria-label="Backtest queue"><span class="rail-icon">⌁</span><span>Tests</span></button>
         <button class="rail-button" data-view="released" aria-label="Released strategies"><span class="rail-icon">◇</span><span>Market</span></button>
+        <button class="rail-button" data-view="portfolio" aria-label="Alpaca portfolio"><span class="rail-icon">$</span><span>Account</span></button>
         <button class="rail-button" data-view="lineage" aria-label="Strategy lineage"><span class="rail-icon">⑂</span><span>Lineage</span></button>
       </nav>
       <div class="rail-foot"><span class="pulse-dot"></span><span>SIM<br>ONLINE</span></div>
@@ -53,7 +54,7 @@
           </div>
         </section>
 
-        <section class="pipeline" aria-label="Strategy release pipeline">
+        <section class="pipeline" id="release-pipeline" aria-label="Strategy release pipeline">
           <article class="pipeline-step">
             <div class="step-index">01</div><div><span>GENERATED</span><strong id="count-generated">0</strong></div>
             <small>fresh DNA</small>
@@ -80,7 +81,33 @@
           </article>
         </section>
 
-        <section class="main-grid">
+        <section class="portfolio-dashboard" id="portfolio-dashboard" hidden aria-label="Alpaca portfolio monitor">
+          <article class="panel portfolio-summary-panel">
+            <div class="panel-header">
+              <div><span class="section-kicker">ALPACA PAPER ACCOUNT</span><h2>Portfolio monitor</h2><div class="selected-meta" id="portfolio-updated"></div></div>
+              <div class="panel-actions"><span class="status-badge" id="portfolio-market-status">DISCONNECTED</span><button class="button compact" id="portfolio-refresh-button">Refresh account</button></div>
+            </div>
+            <div class="portfolio-alert" id="portfolio-alert"></div>
+            <div class="account-metric-grid" id="account-metric-grid"></div>
+          </article>
+
+          <div class="portfolio-grid">
+            <article class="panel positions-panel">
+              <div class="panel-header simple"><div><span class="section-kicker">OPEN POSITIONS</span><h2>Current holdings</h2></div><span class="mono" id="position-count">0 POSITIONS</span></div>
+              <div class="table-scroll"><table class="portfolio-table"><thead><tr><th>Symbol</th><th>Attribution</th><th>Side / qty</th><th>Average entry</th><th>Current</th><th>Market value</th><th>Unrealized P/L</th></tr></thead><tbody id="position-table"></tbody></table></div>
+              <div class="empty-state" id="positions-empty">Connect Alpaca to load positions.</div>
+            </article>
+
+            <article class="panel orders-panel">
+              <div class="panel-header simple"><div><span class="section-kicker">OPEN ORDERS</span><h2>Working paper orders</h2></div><span class="mono" id="order-count">0 ORDERS</span></div>
+              <div class="table-scroll"><table class="portfolio-table"><thead><tr><th>Symbol</th><th>Source</th><th>Side / type</th><th>Quantity</th><th>Filled</th><th>Status</th><th>Submitted</th></tr></thead><tbody id="order-table"></tbody></table></div>
+              <div class="empty-state" id="orders-empty">Connect Alpaca to load open orders.</div>
+            </article>
+          </div>
+          <p class="portfolio-footnote">Position attribution is conservative: Alpaca combines all shares of the same symbol, so a symbol touched by both you and Axiom is marked mixed.</p>
+        </section>
+
+        <section class="main-grid" id="strategy-overview">
           <article class="panel performance-panel">
             <div class="panel-header">
               <div>
@@ -109,7 +136,7 @@
           </aside>
         </section>
 
-        <section class="panel roster-panel">
+        <section class="panel roster-panel" id="strategy-roster">
           <div class="panel-header roster-heading">
             <div>
               <span class="section-kicker">STRATEGY ROSTER</span>
@@ -126,7 +153,7 @@
           <div class="empty-state" id="empty-state" hidden>No strategies match this desk.</div>
         </section>
 
-        <section class="detail-grid">
+        <section class="detail-grid" id="strategy-detail">
           <article class="panel dna-panel">
             <div class="panel-header simple"><div><span class="section-kicker">STRATEGY DNA</span><h2>Blueprint & lineage</h2></div><span class="mono" id="selected-id">—</span></div>
             <div id="dna-content" class="dna-content"></div>

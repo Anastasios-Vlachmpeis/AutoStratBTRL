@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import {
   applyAlpacaCycle,
+  applyAlpacaOverview,
   advanceMarket,
   createDemoState,
   generateBatch,
@@ -12,7 +13,8 @@ import {
   validateCandidates,
   validateCandidatesWithBars,
 } from "./engine.js";
-import { buildPaperCycle, getResearchBars } from "./alpaca.js";
+import { buildPaperCycle, getAccountOverview, getResearchBars } from "./alpaca.js";
+import { isAuthorized } from "./auth.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = "axiom-global-supervisor";
@@ -23,11 +25,6 @@ function json(payload, status = 200) {
 
 function labStub(env) {
   return env.AXIOM_LAB.get(env.AXIOM_LAB.idFromName(SINGLETON_NAME));
-}
-
-function authorized(request, env) {
-  if (!env.ADMIN_TOKEN) return true;
-  return request.headers.get("authorization") === `Bearer ${env.ADMIN_TOKEN}`;
 }
 
 async function stateFrom(stub) {
@@ -43,6 +40,15 @@ async function synchronizeAlpaca(env, stub, bucket, orderBucket = bucket) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify(cycle),
+  }));
+}
+
+async function refreshAlpacaPortfolio(env, stub) {
+  const overview = await getAccountOverview(env);
+  return stub.fetch(new Request("https://axiom.internal/internal/alpaca-overview", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(overview),
   }));
 }
 
@@ -141,6 +147,11 @@ export class AxiomLab extends DurableObject {
         const changed = applyAlpacaCycle(state, cycle);
         return changed ? this.save(state) : json(snapshot(state));
       }
+      if (request.method === "POST" && url.pathname === "/internal/alpaca-overview") {
+        const overview = await request.json();
+        applyAlpacaOverview(state, overview);
+        return this.save(state);
+      }
       if (request.method === "POST" && url.pathname === "/internal/scheduled") {
         const scheduledBucket = request.headers.get("x-axiom-scheduled-bucket");
         if (!scheduledBucket) return json({ error: "Missing schedule bucket" }, 400);
@@ -161,7 +172,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
-      if (request.method !== "GET" && !authorized(request, env)) {
+      if (!isAuthorized(request, env)) {
         return json({ error: "Admin token required" }, 401);
       }
       const stub = labStub(env);
@@ -169,6 +180,9 @@ export default {
         if (request.method === "POST" && url.pathname === "/api/alpaca/sync") {
           const hour = new Date().toISOString().slice(0, 13);
           return await synchronizeAlpaca(env, stub, `manual-${Date.now()}`, hour);
+        }
+        if (request.method === "POST" && url.pathname === "/api/alpaca/portfolio") {
+          return await refreshAlpacaPortfolio(env, stub);
         }
         if (request.method === "POST" && url.pathname === "/api/review") {
           return await reviewWithAlpaca(env, stub);

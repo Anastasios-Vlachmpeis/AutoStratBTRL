@@ -37,7 +37,7 @@ Replace the placeholders in `.dev.vars` with a long random admin token and your 
 npm run dev:cloudflare
 ```
 
-Open the URL printed by Wrangler, normally `http://127.0.0.1:8787`. The dashboard asks for the token on the first state-changing action and keeps it only in that browser tab's session storage.
+Open the URL printed by Wrangler, normally `http://127.0.0.1:8787`. The dashboard asks for the token before loading private API state and keeps it only in that browser tab's session storage.
 
 Test the scheduler locally:
 
@@ -69,7 +69,7 @@ Required secrets:
 
 The same Alpaca paper key pair authenticates paper-account and market-data requests. No additional data key is needed for the default IEX feed.
 
-`ADMIN_TOKEN` is never stored in `wrangler.jsonc` or the repository. Without the secret, mutation endpoints are intentionally open for local/demo use. Read-only strategy state remains public; use Cloudflare Access in front of the Worker if the entire terminal must be private.
+`ADMIN_TOKEN` is never stored in `wrangler.jsonc` or the repository. When configured, it protects both read and write API requests, including account balances and positions. Without the secret, the API is intentionally open for local/demo use. Cloudflare Access can add full identity-based protection in front of the Worker.
 
 ## Alpaca paper connection
 
@@ -81,6 +81,8 @@ The Cloudflare Worker connects only to:
 The first integration supports four US equity ETFs: `SPY`, `QQQ`, `IWM`, and `TLT`. It uses three years of daily IEX bars for supervisor reviews and 45 days of hourly IEX bars for monitoring. IEX is Alpaca's free single-exchange feed; it is not the full consolidated SIP market feed.
 
 Press **Sync Alpaca** to verify the credentials and load account equity, positions, market status, and current bars. Scheduled hourly runs perform the same synchronization automatically.
+
+The **Account** desk displays equity, cash, buying power, daily P/L, open positions, and working paper orders. Its **Refresh account** button is read-only: it never evaluates strategies or submits orders, even when automated paper trading is enabled. Positions are marked `AXIOM / MIXED` only when Axiom has previously bought that symbol; Alpaca aggregates manual and automated shares, so exact share-level attribution is not implied.
 
 Automated orders are disabled by default:
 

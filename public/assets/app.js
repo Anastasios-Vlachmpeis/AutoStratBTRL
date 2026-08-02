@@ -20,6 +20,13 @@ const pct = (value, digits = 1) => value == null ? "—" : `${(value * 100).toFi
 const signedPct = (value) => value == null ? "—" : `${value >= 0 ? "+" : ""}${(value * 100).toFixed(1)}%`;
 const number = (value, digits = 2) => value == null ? "—" : Number(value).toFixed(digits);
 const money = (value) => new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", notation: "compact", maximumFractionDigits: 2 }).format(value);
+const usd = (value) => value == null ? "—" : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(value);
+
+function localTime(value) {
+  if (!value) return "Never";
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? "Unknown" : date.toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
+}
 
 function showToast(message, error = false) {
   const toast = $("#toast");
@@ -33,14 +40,14 @@ async function api(path, body = null, allowAuthRetry = true) {
   document.body.classList.add("loading");
   try {
     const headers = body ? { "Content-Type": "application/json" } : {};
-    if (body && adminToken) headers.Authorization = `Bearer ${adminToken}`;
+    if (adminToken) headers.Authorization = `Bearer ${adminToken}`;
     const response = await fetch(path, {
       method: body ? "POST" : "GET",
       headers,
       body: body ? JSON.stringify(body) : null
     });
     const result = await response.json();
-    if (response.status === 401 && body && allowAuthRetry) {
+    if (response.status === 401 && allowAuthRetry) {
       const supplied = window.prompt("Enter the Cloudflare ADMIN_TOKEN for this deployment:");
       if (!supplied) throw new Error("Admin token required");
       adminToken = supplied.trim();
@@ -97,6 +104,88 @@ function renderSummary() {
   $("#count-released").textContent = String(state.summary.released).padStart(2, "0");
   $("#count-dropped").textContent = String(state.summary.dropped).padStart(2, "0");
   $("#average-score").textContent = state.strategies.length ? number(state.summary.average_score, 1) : "—";
+}
+
+function renderView() {
+  const portfolio = activeView === "portfolio";
+  $("#portfolio-dashboard").hidden = !portfolio;
+  $("#release-pipeline").hidden = portfolio;
+  $("#strategy-overview").hidden = portfolio;
+  $("#strategy-roster").hidden = portfolio;
+  $("#strategy-detail").hidden = portfolio;
+}
+
+function renderPortfolio() {
+  const alpaca = state.alpaca;
+  const connected = Boolean(alpaca?.connected);
+  const refresh = $("#portfolio-refresh-button");
+  refresh.disabled = !("alpaca" in state);
+  const market = $("#portfolio-market-status");
+  const positions = connected ? alpaca.positions ?? [] : [];
+  const orders = connected ? alpaca.open_orders ?? [] : [];
+  const managed = new Set(alpaca?.managed_symbols ?? []);
+  const account = alpaca?.account ?? {};
+  const dayPnl = connected ? Number(account.equity ?? 0) - Number(account.last_equity ?? 0) : null;
+  const dayPnlPct = connected && Number(account.last_equity) ? dayPnl / Number(account.last_equity) : null;
+  const fetchedAt = connected ? new Date(alpaca.fetched_at).getTime() : 0;
+  const stale = connected && (!Number.isFinite(fetchedAt) || Date.now() - fetchedAt > 2 * 60 * 60 * 1000);
+
+  market.textContent = connected ? alpaca.clock?.is_open ? "MARKET OPEN" : "MARKET CLOSED" : "DISCONNECTED";
+  market.className = `status-badge ${connected ? alpaca.clock?.is_open ? "healthy" : "watch" : ""}`;
+  $("#portfolio-updated").innerHTML = connected
+    ? `<span>UPDATED ${escapeHtml(localTime(alpaca.fetched_at))}</span><span>${escapeHtml(String(alpaca.feed || "iex").toUpperCase())} FEED</span>`
+    : `<span>${"alpaca" in state ? "Press Refresh account to connect" : "Cloudflare deployment required"}</span>`;
+
+  const alert = $("#portfolio-alert");
+  if (!connected) {
+    alert.className = "portfolio-alert visible";
+    alert.textContent = "No Alpaca account snapshot is loaded. Configure the paper API secrets, then press Refresh account.";
+  } else if (account.account_blocked || account.trading_blocked) {
+    alert.className = "portfolio-alert visible danger";
+    alert.textContent = "Alpaca reports that this paper account is blocked from trading. Monitoring remains available.";
+  } else if (stale) {
+    alert.className = "portfolio-alert visible warning";
+    alert.textContent = "This account snapshot is more than two hours old. Refresh it before relying on the figures below.";
+  } else {
+    alert.className = "portfolio-alert";
+    alert.textContent = "";
+  }
+
+  $("#account-metric-grid").innerHTML = [
+    metric("ACCOUNT EQUITY", connected ? usd(account.equity) : "—"),
+    metric("DAY P/L", connected ? `${usd(dayPnl)}${dayPnlPct == null ? "" : ` · ${signedPct(dayPnlPct)}`}` : "—", dayPnl > 0 ? "positive" : dayPnl < 0 ? "negative" : ""),
+    metric("CASH", connected ? usd(account.cash) : "—"),
+    metric("BUYING POWER", connected ? usd(account.buying_power) : "—"),
+    metric("PORTFOLIO VALUE", connected ? usd(account.portfolio_value) : "—"),
+    metric("DAY TRADES", connected ? number(account.daytrade_count, 0) : "—"),
+  ].join("");
+
+  $("#position-count").textContent = `${positions.length} POSITION${positions.length === 1 ? "" : "S"}`;
+  $("#position-table").innerHTML = positions.map((position) => {
+    const attributed = managed.has(position.symbol);
+    const pnl = Number(position.unrealized_pl ?? 0);
+    return `<tr><td class="symbol-cell"><strong>${escapeHtml(position.symbol)}</strong><span>${escapeHtml(position.asset_class || "asset")}</span></td>
+      <td><span class="ownership-badge ${attributed ? "axiom" : "manual"}">${attributed ? "AXIOM / MIXED" : "MANUAL / UNKNOWN"}</span></td>
+      <td>${escapeHtml(String(position.side || "long").toUpperCase())}<span class="cell-sub">${escapeHtml(number(position.qty, 6))} units</span></td>
+      <td>${usd(position.avg_entry_price)}</td><td>${usd(position.current_price)}</td><td>${usd(position.market_value)}</td>
+      <td class="${pnl > 0 ? "positive" : pnl < 0 ? "negative" : ""}"><strong>${usd(pnl)}</strong><span class="cell-sub">${signedPct(position.unrealized_plpc)}</span></td></tr>`;
+  }).join("");
+  const positionsEmpty = $("#positions-empty");
+  positionsEmpty.hidden = positions.length > 0;
+  positionsEmpty.textContent = connected ? "No open positions in the Alpaca paper account." : "Connect Alpaca to load positions.";
+
+  $("#order-count").textContent = `${orders.length} ORDER${orders.length === 1 ? "" : "S"}`;
+  $("#order-table").innerHTML = orders.map((order) => {
+    const axiom = String(order.client_order_id || "").startsWith("axiom-");
+    const amount = Number(order.notional) > 0 ? usd(order.notional) : `${number(order.qty, 6)} units`;
+    return `<tr><td class="symbol-cell"><strong>${escapeHtml(order.symbol)}</strong><span>${escapeHtml(order.client_order_id || order.id || "")}</span></td>
+      <td><span class="ownership-badge ${axiom ? "axiom" : "manual"}">${axiom ? "AXIOM" : "MANUAL"}</span></td>
+      <td>${escapeHtml(String(order.side || "").toUpperCase())}<span class="cell-sub">${escapeHtml(String(order.type || "").toUpperCase())}</span></td>
+      <td>${escapeHtml(amount)}</td><td>${escapeHtml(number(order.filled_qty, 6))}</td><td>${escapeHtml(String(order.status || "").toUpperCase())}</td><td>${escapeHtml(localTime(order.submitted_at))}</td></tr>`;
+  }).join("");
+  const ordersEmpty = $("#orders-empty");
+  ordersEmpty.hidden = orders.length > 0;
+  ordersEmpty.textContent = connected ? "No open paper orders." : "Connect Alpaca to load open orders.";
 }
 
 function renderChart(strategy) {
@@ -225,7 +314,7 @@ function renderAudit() {
 function renderTable() {
   const strategies = filteredStrategies();
   const titles = { overview: "All research units", testing: "Generation & rework queue", released: "Released market book", lineage: "Reproduction lineage" };
-  $("#roster-title").textContent = titles[activeView];
+  $("#roster-title").textContent = titles[activeView] || titles.overview;
   $("#empty-state").hidden = strategies.length > 0;
   $("#strategy-table").innerHTML = strategies.map((strategy) => {
     const m = strategy.metrics;
@@ -244,7 +333,9 @@ function renderTable() {
 
 function render() {
   ensureSelection();
+  renderView();
   renderSummary();
+  renderPortfolio();
   renderSelected();
   renderAudit();
   renderTable();
@@ -265,6 +356,7 @@ $("#review-button").addEventListener("click", () => action("/api/review", {}, "S
 $("#validate-button").addEventListener("click", () => action("/api/validate", {}, "Untouched holdout validation complete."));
 $("#advance-button").addEventListener("click", () => action("/api/advance", { periods: 1 }, "Paper market advanced by 21 sessions."));
 $("#sync-button").addEventListener("click", () => action("/api/alpaca/sync", {}, "Alpaca account and market data synchronized."));
+$("#portfolio-refresh-button").addEventListener("click", () => action("/api/alpaca/portfolio", {}, "Alpaca balances, positions, and orders refreshed read-only."));
 $("#reproduce-button").addEventListener("click", async () => {
   const parent = getSelected();
   if (!parent) return;
@@ -284,7 +376,7 @@ $("#reset-button").addEventListener("click", () => action("/api/reset", {}, "Str
 $$(".rail-button").forEach((button) => button.addEventListener("click", () => {
   activeView = button.dataset.view;
   $$(".rail-button").forEach((item) => item.classList.toggle("active", item === button));
-  ensureSelection(); renderTable(); renderSelected();
+  render();
 }));
 
 api("/api/state").catch(() => {});
