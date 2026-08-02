@@ -260,7 +260,7 @@ footer b { color: var(--muted); font-weight: 400; }
 .operation-step i { width: 8px; height: 8px; border: 1px solid var(--line-bright); transform: rotate(45deg); transition: .2s; }
 .operation-step small { opacity: 0; color: var(--operation-accent); font: inherit; }
 .operation-step.active { color: var(--ink); transform: translateX(3px); }.operation-step.active i { border-color: var(--operation-accent); background: var(--operation-accent); box-shadow: 0 0 10px color-mix(in srgb, var(--operation-accent) 55%, transparent); animation: operation-blink .8s steps(2, end) infinite; }.operation-step.active small { opacity: 1; }
-.operation-step.done { color: var(--muted); }.operation-step.done i { border-color: var(--operation-accent); background: transparent; }.operation-step.done small { opacity: 1; color: var(--dim); }
+.operation-step.done { color: var(--muted); }.operation-step.done i { border-color: var(--operation-accent); background: var(--operation-accent); box-shadow: 0 0 7px color-mix(in srgb, var(--operation-accent) 22%, transparent); opacity: .62; }.operation-step.done small { opacity: 1; color: var(--dim); }
 .operation-footer { position: relative; z-index: 2; display: block; min-height: 69px; padding: 15px 18px 17px; border-top: 1px solid var(--line); background: rgba(8,11,9,.45); }
 .operation-footer > div { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 9px; color: var(--dim); font: 8px var(--mono); letter-spacing: .1em; }
 .operation-footer strong { color: var(--operation-accent); font-weight: 400; }

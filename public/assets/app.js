@@ -1073,13 +1073,15 @@ function renderOperationCurves(session, result) {
     path.style.strokeDasharray = String(length);
     path.style.strokeDashoffset = String(length);
     path.style.animationDelay = `${index * 65}ms`;
-  });
-  $$("#operation-equity-chart .operation-equity-end").forEach((point, index) => {
-    point.style.animationDelay = `${780 + index * 65}ms`;
+    path.addEventListener("animationend", () => {
+      path.classList.remove("drawing");
+      path.style.strokeDasharray = "none";
+      path.style.strokeDashoffset = "0";
+      chart.querySelector(`.operation-equity-end[data-curve-index="${index}"]`)?.classList.add("drawing");
+    }, { once: true });
   });
   if (!reducedMotion) requestAnimationFrame(() => {
-    $$("#operation-equity-chart .operation-equity-path, #operation-equity-chart .operation-equity-end")
-      .forEach((element) => element.classList.add("drawing"));
+    $$("#operation-equity-chart .operation-equity-path").forEach((path) => path.classList.add("drawing"));
   });
   return visible.length;
 }
