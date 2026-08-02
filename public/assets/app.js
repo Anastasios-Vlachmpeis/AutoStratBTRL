@@ -4,9 +4,35 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 let state = null;
 let selectedId = null;
 let activeView = "portfolio";
-let marketOverview = true;
+let deskOverview = true;
 let toastTimer = null;
 let adminToken = sessionStorage.getItem("axiom-admin-token") || "";
+
+const multiStrategyViews = new Set(["overview", "testing", "released", "lineage"]);
+const activeFilters = { overview: "all", testing: "all", released: "all" };
+const filterConfigs = {
+  overview: [
+    { id: "all", label: "All" },
+    { id: "generated", label: "Generated", states: ["generated"] },
+    { id: "rework", label: "Rework", states: ["rework"] },
+    { id: "validation", label: "Validation", states: ["validation"] },
+    { id: "market", label: "Market", states: ["released", "healthy", "watch", "adjusted"] },
+    { id: "retired", label: "Retired", states: ["dropped", "superseded"] },
+  ],
+  testing: [
+    { id: "all", label: "All" },
+    { id: "generated", label: "Generated", states: ["generated"] },
+    { id: "rework", label: "Rework", states: ["rework"] },
+    { id: "validation", label: "Validation", states: ["validation"] },
+  ],
+  released: [
+    { id: "all", label: "All" },
+    { id: "released", label: "New", states: ["released"] },
+    { id: "healthy", label: "Healthy", states: ["healthy"] },
+    { id: "watch", label: "Watch", states: ["watch"] },
+    { id: "adjusted", label: "Adjusted", states: ["adjusted"] },
+  ],
+};
 
 const statusLabels = {
   generated: "Generated", rework: "Rework", validation: "Validation", released: "Released", healthy: "Healthy",
@@ -67,12 +93,20 @@ async function api(path, body = null, allowAuthRetry = true) {
   }
 }
 
-function filteredStrategies() {
+function strategiesForView(view = activeView) {
   if (!state) return [];
-  if (activeView === "testing") return state.strategies.filter((item) => ["generated", "rework", "validation"].includes(item.state));
-  if (activeView === "released") return state.strategies.filter((item) => ["released", "healthy", "watch", "adjusted"].includes(item.state));
-  if (activeView === "lineage") return state.strategies.filter((item) => item.parent || item.generation > 1);
+  if (view === "testing") return state.strategies.filter((item) => ["generated", "rework", "validation"].includes(item.state));
+  if (view === "released") return state.strategies.filter((item) => ["released", "healthy", "watch", "adjusted"].includes(item.state));
+  if (view === "lineage") return state.strategies.filter((item) => item.parent || item.generation > 1);
   return state.strategies;
+}
+
+function filteredStrategies() {
+  const strategies = strategiesForView();
+  const config = filterConfigs[activeView];
+  if (!config) return strategies;
+  const selectedFilter = config.find((filter) => filter.id === activeFilters[activeView]) || config[0];
+  return selectedFilter.states ? strategies.filter((strategy) => selectedFilter.states.includes(strategy.state)) : strategies;
 }
 
 function getSelected() {
@@ -81,7 +115,11 @@ function getSelected() {
 
 function ensureSelection() {
   const visible = filteredStrategies();
-  if (activeView === "released" && marketOverview) {
+  if (multiStrategyViews.has(activeView) && deskOverview) {
+    selectedId = null;
+    return;
+  }
+  if (multiStrategyViews.has(activeView) && !visible.length) {
     selectedId = null;
     return;
   }
@@ -285,13 +323,13 @@ function renderChart(strategy) {
   $("#chart-delta").textContent = strategy?.metrics ? `${signedPct(strategy.metrics.return)} net` : "Awaiting evidence";
 }
 
-function focusMarketStrategy(strategyId) {
-  marketOverview = false;
+function focusStrategy(strategyId) {
+  deskOverview = false;
   selectedId = strategyId;
   render();
 }
 
-function renderMarketChart(strategies) {
+function renderCombinedChart(strategies, chartTitle) {
   const svg = $("#equity-chart");
   const palette = ["#a8f05a", "#70a7ee", "#a28bdd", "#e9b655", "#ee736a", "#70d7c7", "#d99fe8", "#c7d36f"];
   const curves = strategies.map((strategy, index) => ({
@@ -299,14 +337,14 @@ function renderMarketChart(strategies) {
     color: palette[index % palette.length],
     values: (strategy.metrics?.curve ?? []).map(Number).filter(Number.isFinite),
   })).filter((item) => item.values.length >= 2);
-  $("#chart-title").textContent = "ALL RELEASED EQUITY CURVES";
+  $("#chart-title").textContent = chartTitle;
   $("#chart-delta").textContent = `${curves.length} CURVE${curves.length === 1 ? "" : "S"}`;
   const legend = $("#market-chart-legend");
   legend.hidden = curves.length === 0;
   legend.innerHTML = curves.map(({ strategy, color }) => `<button type="button" data-strategy-id="${escapeHtml(strategy.id)}"><i style="background:${color}"></i><span>${escapeHtml(strategy.name)}</span><small>${escapeHtml(strategy.asset)}</small></button>`).join("");
-  $$("#market-chart-legend button").forEach((button) => button.addEventListener("click", () => focusMarketStrategy(button.dataset.strategyId)));
+  $$("#market-chart-legend button").forEach((button) => button.addEventListener("click", () => focusStrategy(button.dataset.strategyId)));
   if (!curves.length) {
-    svg.innerHTML = '<text class="market-chart-empty" x="450" y="128" text-anchor="middle">NO RELEASED STRATEGY CURVES YET</text>';
+    svg.innerHTML = '<text class="market-chart-empty" x="450" y="128" text-anchor="middle">NO STRATEGY CURVES IN THIS FILTER YET</text>';
     return;
   }
   const width = 900, height = 255, left = 18, right = 64, top = 14, bottom = 30;
@@ -333,18 +371,25 @@ function metric(label, value, className = "") {
   return `<div class="metric"><span>${label}</span><strong class="${className}">${value}</strong></div>`;
 }
 
-function renderMarketOverview() {
+function renderDeskOverview() {
   const strategies = filteredStrategies();
+  const desks = {
+    overview: { name: "Foundry strategy book", empty: "No strategies in the foundry", chart: "ALL FOUNDRY EQUITY CURVES", noun: "research strategy" },
+    testing: { name: "Testing strategy queue", empty: "No strategies in testing", chart: "ALL TEST EQUITY CURVES", noun: "testing strategy" },
+    released: { name: "Released strategy book", empty: "No released strategies", chart: "ALL RELEASED EQUITY CURVES", noun: "released strategy" },
+    lineage: { name: "Reproduction lineage", empty: "No reproduced strategies", chart: "ALL LINEAGE EQUITY CURVES", noun: "lineage strategy" },
+  };
+  const desk = desks[activeView] || desks.overview;
   const metrics = strategies.map((strategy) => strategy.metrics).filter(Boolean);
   const validations = strategies.map((strategy) => strategy.validation).filter(Boolean);
   const average = (values) => values.length ? values.reduce((sum, value) => sum + value, 0) / values.length : null;
-  $("#selected-name").textContent = strategies.length ? "Released strategy book" : "No released strategies";
+  $("#selected-name").textContent = strategies.length ? desk.name : desk.empty;
   $("#selected-meta").innerHTML = strategies.length
-    ? `<span>${strategies.length} ACTIVE STRATEG${strategies.length === 1 ? "Y" : "IES"}</span><span>CLICK A CURVE OR ROW TO FOCUS</span>`
-    : "<span>Complete supervision and validation to populate this view</span>";
+    ? `<span>${strategies.length} STRATEG${strategies.length === 1 ? "Y" : "IES"}</span><span>CLICK A CURVE OR ROW TO FOCUS</span>`
+    : "<span>Choose another filter or generate new strategies</span>";
   const status = $("#selected-status");
-  status.textContent = strategies.length ? "Book" : "Empty";
-  status.className = `status-badge ${strategies.length ? "released" : ""}`;
+  status.textContent = strategies.length ? "All" : "Empty";
+  status.className = `status-badge ${activeView === "released" && strategies.length ? "released" : ""}`;
   $("#show-all-curves-button").hidden = true;
   $("#reproduce-button").disabled = true;
   $("#selected-id").textContent = "ALL";
@@ -360,15 +405,15 @@ function renderMarketOverview() {
     metric("AVG UNSEEN SHARPE", averageUnseen == null ? "—" : number(averageUnseen), averageUnseen >= .30 ? "positive" : ""),
     metric("WORST MAX DRAWDOWN", worstDrawdown == null ? "—" : pct(worstDrawdown), worstDrawdown > .2 ? "negative" : ""),
   ].join("");
-  renderMarketChart(strategies);
-  $("#dna-content").innerHTML = '<div class="empty-state">Select a released strategy to inspect its DNA and lineage.</div>';
-  $("#regime-content").innerHTML = '<div class="empty-state">Select a released strategy to inspect its regime fitness.</div>';
-  $("#gate-content").innerHTML = '<div class="empty-state">Select a released strategy to inspect its release gates.</div>';
+  renderCombinedChart(strategies, desk.chart);
+  $("#dna-content").innerHTML = `<div class="empty-state">Select a ${desk.noun} to inspect its DNA and lineage.</div>`;
+  $("#regime-content").innerHTML = `<div class="empty-state">Select a ${desk.noun} to inspect its regime fitness.</div>`;
+  $("#gate-content").innerHTML = `<div class="empty-state">Select a ${desk.noun} to inspect its release gates.</div>`;
 }
 
 function renderSelected() {
-  if (activeView === "released" && marketOverview) {
-    renderMarketOverview();
+  if (multiStrategyViews.has(activeView) && deskOverview) {
+    renderDeskOverview();
     return;
   }
   const strategy = getSelected();
@@ -401,7 +446,7 @@ function renderSelected() {
   $("#selected-id").textContent = strategy.id;
   const allowed = ["released", "healthy", "watch", "adjusted"].includes(strategy.state);
   $("#reproduce-button").disabled = !allowed;
-  $("#show-all-curves-button").hidden = activeView !== "released";
+  $("#show-all-curves-button").hidden = !multiStrategyViews.has(activeView);
   $("#metric-row").innerHTML = [
     metric("SUPERVISOR SCORE", metrics ? number(metrics.score, 1) : "PENDING", metrics?.score >= 61 ? "positive" : ""),
     metric("ANNUALIZED", metrics ? signedPct(metrics.annualized) : "—", metrics?.annualized >= 0 ? "positive" : "negative"),
@@ -467,11 +512,39 @@ function renderAudit() {
     : '<div class="empty-state">No supervisor decisions yet.</div>';
 }
 
+function renderStrategyFilters() {
+  const container = $("#strategy-filters");
+  const config = filterConfigs[activeView];
+  if (!config) {
+    container.hidden = true;
+    container.innerHTML = "";
+    return;
+  }
+  const strategies = strategiesForView();
+  const current = activeFilters[activeView] || "all";
+  container.hidden = false;
+  container.innerHTML = config.map((filter) => {
+    const count = filter.states ? strategies.filter((strategy) => filter.states.includes(strategy.state)).length : strategies.length;
+    const active = filter.id === current;
+    return `<button type="button" class="strategy-filter ${active ? "active" : ""}" data-filter="${escapeHtml(filter.id)}" aria-pressed="${active}"><span>${escapeHtml(filter.label)}</span><small>${count}</small></button>`;
+  }).join("");
+  $$("#strategy-filters .strategy-filter").forEach((button) => button.addEventListener("click", () => {
+    activeFilters[activeView] = button.dataset.filter;
+    deskOverview = true;
+    selectedId = null;
+    render();
+  }));
+}
+
 function renderTable() {
   const strategies = filteredStrategies();
   const titles = { overview: "All research units", testing: "Generation & rework queue", released: "Released market book", lineage: "Reproduction lineage" };
   $("#roster-title").textContent = titles[activeView] || titles.overview;
+  renderStrategyFilters();
+  const scored = strategies.map((strategy) => strategy.metrics?.score).filter(Number.isFinite);
+  $("#average-score").textContent = scored.length ? number(scored.reduce((sum, score) => sum + score, 0) / scored.length, 1) : "—";
   $("#empty-state").hidden = strategies.length > 0;
+  $("#empty-state").textContent = strategiesForView().length ? "No strategies match this filter." : "No strategies match this desk.";
   $("#strategy-table").innerHTML = strategies.map((strategy) => {
     const m = strategy.metrics;
     return `<tr data-id="${escapeHtml(strategy.id)}" class="${strategy.id === selectedId ? "selected" : ""}">
@@ -482,7 +555,7 @@ function renderTable() {
       <td class="score-cell">${m ? number(m.score, 1) : "—"}${m ? `<div class="score-bar"><i style="width:${Math.min(m.score, 100)}%"></i></div>` : ""}</td><td class="row-arrow">›</td></tr>`;
   }).join("");
   $$("#strategy-table tr").forEach((row) => row.addEventListener("click", () => {
-    if (activeView === "released") focusMarketStrategy(row.dataset.id);
+    if (multiStrategyViews.has(activeView)) focusStrategy(row.dataset.id);
     else {
       selectedId = row.dataset.id;
       renderSelected(); renderTable();
@@ -517,7 +590,7 @@ $("#advance-button").addEventListener("click", () => action("/api/advance", { pe
 $("#sync-button").addEventListener("click", () => action("/api/alpaca/sync", {}, "Alpaca account and market data synchronized."));
 $("#portfolio-refresh-button").addEventListener("click", () => action("/api/alpaca/portfolio", {}, "Alpaca balances, positions, and orders refreshed read-only."));
 $("#show-all-curves-button").addEventListener("click", () => {
-  marketOverview = true;
+  deskOverview = true;
   selectedId = null;
   render();
 });
@@ -530,6 +603,7 @@ $("#reproduce-button").addEventListener("click", async () => {
     const child = state.strategies.find((item) => !before.has(item.id));
     if (child) selectedId = child.id;
     activeView = "lineage";
+    deskOverview = false;
     $$(".rail-button").forEach((button) => button.classList.toggle("active", button.dataset.view === activeView));
     render();
     showToast(`Child DNA created from ${parent.id}.`);
@@ -539,9 +613,10 @@ $("#reset-button").addEventListener("click", () => action("/api/reset", {}, "Str
 
 $$(".rail-button").forEach((button) => button.addEventListener("click", () => {
   activeView = button.dataset.view;
-  if (activeView === "released") {
-    marketOverview = true;
+  if (multiStrategyViews.has(activeView)) {
+    deskOverview = true;
     selectedId = null;
+    if (activeView in activeFilters) activeFilters[activeView] = "all";
   }
   $$(".rail-button").forEach((item) => item.classList.toggle("active", item === button));
   render();

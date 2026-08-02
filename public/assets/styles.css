@@ -111,6 +111,14 @@ main { min-width: 0; padding: 0 clamp(18px, 3vw, 44px) 36px; max-width: 1760px; 
 .benchmark-line { fill: none; stroke: var(--dim); stroke-width: 1; stroke-dasharray: 4 5; vector-effect: non-scaling-stroke; }
 .end-dot { fill: var(--green); stroke: var(--surface); stroke-width: 3; }
 .market-equity-line { fill: none; stroke-width: 1.8; opacity: .88; vector-effect: non-scaling-stroke; }.market-end-dot { stroke: var(--surface); stroke-width: 2; }.market-chart-empty { fill: var(--dim); font: 10px var(--mono); }
+.strategy-filter-strip { min-width: 0; display: flex; flex-wrap: wrap; gap: 5px; padding: 10px 20px; border-bottom: 1px solid var(--line); background: rgba(8,11,9,.18); }
+.strategy-filter { display: flex; align-items: center; gap: 7px; padding: 6px 8px; border: 1px solid var(--line); background: transparent; color: var(--muted); cursor: pointer; font: 8px var(--mono); text-transform: uppercase; }
+.strategy-filter small { min-width: 14px; padding: 2px 4px; background: var(--surface-2); color: var(--dim); font: inherit; text-align: center; }
+.strategy-filter:hover { border-color: var(--line-bright); color: var(--ink); }
+.strategy-filter.active { border-color: var(--green); background: var(--green-soft); color: var(--green); }
+.strategy-filter[data-filter="watch"].active, .strategy-filter[data-filter="adjusted"].active, .strategy-filter[data-filter="rework"].active { border-color: var(--amber); background: rgba(233,182,85,.06); color: var(--amber); }
+.strategy-filter[data-filter="validation"].active { border-color: var(--violet); background: rgba(162,139,221,.08); color: var(--violet); }
+.strategy-filter[data-filter="retired"].active { border-color: var(--red); background: rgba(238,115,106,.06); color: var(--red); }
 
 .portfolio-dashboard, .portfolio-grid, .portfolio-grid > .panel { min-width: 0; }
 .portfolio-dashboard { display: grid; gap: 16px; }
@@ -213,5 +221,6 @@ footer b { color: var(--muted); font-weight: 400; }
   .rail-button span:last-child { display: none; }.rail-nav { margin-left: 8px; }.top-status > div:first-child { display: none; }
   .pipeline-step { grid-template-columns: auto 1fr; }.pipeline-step small { display: none; }.metric-row { grid-template-columns: 1fr 1fr; }
   .command-actions .button { flex-basis: 100%; }.panel-header, .chart-wrap, .metric-row, .dna-content, .regime-content, .gate-content { padding-left: 14px; padding-right: 14px; }
+  .strategy-filter-strip { padding-left: 14px; padding-right: 14px; }
   .account-metric-grid { grid-template-columns: 1fr; }.account-metric-grid .metric { min-height: 68px; }
 }
