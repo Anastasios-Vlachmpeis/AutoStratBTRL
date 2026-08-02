@@ -815,8 +815,100 @@ const operationConfigs = {
   },
 };
 
+const operationCurvePalette = [
+  "#a8f05a", "#70a7ee", "#a28bdd", "#e9b655", "#ee736a", "#70d7c7",
+  "#d99fe8", "#c7d36f", "#f09a5a", "#73c8ee", "#c18bdd", "#8ee1a8",
+];
+
 const wait = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
 let operationBusy = false;
+
+function resetOperationCurveChart(kind, candidateCount) {
+  const chart = $("#operation-equity-chart");
+  const caption = $("#operation-curve-caption");
+  const usesCurves = ["review", "validate"].includes(kind);
+  chart.hidden = !usesCurves;
+  caption.hidden = !usesCurves;
+  if (!usesCurves) {
+    chart.innerHTML = "";
+    caption.textContent = "";
+    return;
+  }
+  const grid = Array.from({ length: 5 }, (_, index) => {
+    const y = 18 + index * 44;
+    return `<line class="operation-curve-grid" x1="12" y1="${y}" x2="350" y2="${y}"/>`;
+  }).join("");
+  chart.innerHTML = `${grid}<line class="operation-curve-baseline" x1="12" y1="106" x2="350" y2="106"/>
+    <text class="operation-curve-wait" x="181" y="111" text-anchor="middle">AWAITING BACKTEST OUTPUT</text>`;
+  caption.textContent = `0 / ${candidateCount} ACTUAL CURVES`;
+}
+
+function renderOperationCurves(session, result) {
+  if (!["review", "validate"].includes(session.kind)) return 0;
+  const chart = $("#operation-equity-chart");
+  const caption = $("#operation-curve-caption");
+  const candidateIds = new Set(session.strategyIds);
+  const curveFor = (strategy) => session.kind === "validate" ? strategy.validation?.curve : strategy.metrics?.curve;
+  const related = (result.strategies ?? []).filter((strategy) =>
+    (candidateIds.has(strategy.id) || (session.kind === "review" && candidateIds.has(strategy.parent)))
+    && (curveFor(strategy)?.length ?? 0) >= 2
+  );
+  const visible = related.slice(0, 12).map((strategy, index) => ({
+    strategy,
+    color: operationCurvePalette[index],
+    values: curveFor(strategy).map(Number).filter(Number.isFinite),
+  })).filter((item) => item.values.length >= 2);
+
+  const grid = Array.from({ length: 5 }, (_, index) => {
+    const y = 18 + index * 44;
+    return `<line class="operation-curve-grid" x1="12" y1="${y}" x2="350" y2="${y}"/>`;
+  }).join("");
+  if (!visible.length) {
+    chart.innerHTML = `${grid}<text class="operation-curve-wait" x="181" y="111" text-anchor="middle">NO EQUITY CURVES PRODUCED</text>`;
+    caption.textContent = `0 / ${related.length} ACTUAL CURVES`;
+    return 0;
+  }
+
+  const allValues = visible.flatMap((item) => item.values);
+  const rawMinimum = Math.min(...allValues);
+  const rawMaximum = Math.max(...allValues);
+  const padding = Math.max((rawMaximum - rawMinimum) * .10, .012);
+  const minimum = rawMinimum - padding;
+  const maximum = rawMaximum + padding;
+  const left = 12, right = 350, top = 18, bottom = 194;
+  const x = (index, length) => left + index / Math.max(length - 1, 1) * (right - left);
+  const y = (value) => top + (maximum - value) / Math.max(maximum - minimum, .001) * (bottom - top);
+  const paths = visible.map(({ strategy, color, values }, index) => {
+    const path = values.map((value, pointIndex) => `${pointIndex ? "L" : "M"}${x(pointIndex, values.length).toFixed(1)},${y(value).toFixed(1)}`).join(" ");
+    const endX = x(values.length - 1, values.length).toFixed(1);
+    const endY = y(values.at(-1)).toFixed(1);
+    return `<path class="operation-equity-path" data-curve-index="${index}" stroke="${color}" d="${path}"><title>${escapeHtml(strategy.name)} · ${escapeHtml(strategy.asset)}</title></path>
+      <circle class="operation-equity-end" data-curve-index="${index}" fill="${color}" cx="${endX}" cy="${endY}" r="2.8"/>`;
+  }).join("");
+  const baselineY = y(1);
+  chart.innerHTML = `${grid}${baselineY >= top && baselineY <= bottom ? `<line class="operation-curve-baseline" x1="${left}" y1="${baselineY.toFixed(1)}" x2="${right}" y2="${baselineY.toFixed(1)}"/>` : ""}${paths}
+    <text class="operation-curve-axis" x="12" y="211">START</text><text class="operation-curve-axis" x="350" y="211" text-anchor="end">LATEST</text>`;
+  caption.textContent = related.length > 12
+    ? `12 / ${related.length} ACTUAL CURVES SHOWN`
+    : `${visible.length} ACTUAL CURVE${visible.length === 1 ? "" : "S"}`;
+
+  const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  $$("#operation-equity-chart .operation-equity-path").forEach((path, index) => {
+    if (reducedMotion) return;
+    const length = path.getTotalLength();
+    path.style.strokeDasharray = String(length);
+    path.style.strokeDashoffset = String(length);
+    path.style.animationDelay = `${index * 65}ms`;
+  });
+  $$("#operation-equity-chart .operation-equity-end").forEach((point, index) => {
+    point.style.animationDelay = `${780 + index * 65}ms`;
+  });
+  if (!reducedMotion) requestAnimationFrame(() => {
+    $$("#operation-equity-chart .operation-equity-path, #operation-equity-chart .operation-equity-end")
+      .forEach((element) => element.classList.add("drawing"));
+  });
+  return visible.length;
+}
 
 function setOperationStep(session, index) {
   const steps = $$("#operation-steps .operation-step");
@@ -834,7 +926,7 @@ function setOperationStep(session, index) {
   session.step = bounded;
 }
 
-function beginOperation(kind, detail) {
+function beginOperation(kind, detail, strategyIds = []) {
   const config = operationConfigs[kind];
   const overlay = $("#operation-overlay");
   const terminal = $("#operation-terminal");
@@ -847,6 +939,7 @@ function beginOperation(kind, detail) {
   $("#operation-title").textContent = config.title;
   $("#operation-glyph").textContent = config.glyph;
   $("#operation-description").textContent = config.description(detail);
+  resetOperationCurveChart(kind, strategyIds.length);
   $("#operation-steps").innerHTML = config.steps.map((step) => `<div class="operation-step"><i></i><span>${escapeHtml(step)}</span><small>WAIT</small></div>`).join("");
   $("#operation-progress").style.width = "4%";
   $("#operation-progress-label").textContent = "4%";
@@ -855,7 +948,7 @@ function beginOperation(kind, detail) {
   overlay.hidden = false;
   requestAnimationFrame(() => overlay.classList.add("visible"));
   overlay.focus({ preventScroll: true });
-  const session = { kind, config, overlay, terminal, button, step: 0, timer: null };
+  const session = { kind, config, overlay, terminal, button, strategyIds: [...strategyIds], step: 0, timer: null };
   setOperationStep(session, 0);
   const interval = Math.max(480, Math.round(config.duration / (config.steps.length + 1)));
   session.timer = setInterval(() => {
@@ -904,13 +997,17 @@ function triggerOperationReveal(kind) {
   setTimeout(() => document.body.classList.remove(`reveal-${kind}`), 1300);
 }
 
-async function animatedAction(kind, path, payload, successMessage, detail) {
+async function animatedAction(kind, path, payload, successMessage, detail, strategyIds = []) {
   if (operationBusy) return;
   operationBusy = true;
-  const session = beginOperation(kind, detail);
+  const session = beginOperation(kind, detail, strategyIds);
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   try {
-    await Promise.all([api(path, payload), wait(reducedMotion ? 180 : session.config.duration)]);
+    const minimumDuration = wait(reducedMotion ? 180 : session.config.duration);
+    const result = await api(path, payload);
+    const curveCount = renderOperationCurves(session, result);
+    const curveDuration = curveCount ? wait(reducedMotion ? 20 : 1050 + Math.min(curveCount, 12) * 65) : Promise.resolve();
+    await Promise.all([minimumDuration, curveDuration]);
     await finishOperation(session, true);
     triggerOperationReveal(kind);
     showToast(successMessage);
@@ -926,12 +1023,14 @@ $("#generate-button").addEventListener("click", () => {
   animatedAction("generate", "/api/generate", { count }, `${count} new strategy DNA${count === 1 ? "" : "s"} seeded.`, `${count} NEW GENOME${count === 1 ? "" : "S"}`);
 });
 $("#review-button").addEventListener("click", () => {
-  const count = state.strategies.filter((strategy) => ["generated", "rework"].includes(strategy.state)).length;
-  animatedAction("review", "/api/review", {}, "Supervisor review cycle complete.", `${count} CANDIDATE${count === 1 ? "" : "S"}`);
+  const candidates = state.strategies.filter((strategy) => ["generated", "rework"].includes(strategy.state));
+  const count = candidates.length;
+  animatedAction("review", "/api/review", {}, "Supervisor review cycle complete.", `${count} CANDIDATE${count === 1 ? "" : "S"}`, candidates.map((strategy) => strategy.id));
 });
 $("#validate-button").addEventListener("click", () => {
-  const count = state.strategies.filter((strategy) => strategy.state === "validation").length;
-  animatedAction("validate", "/api/validate", {}, "Untouched holdout validation complete.", `${count} STRATEG${count === 1 ? "Y" : "IES"}`);
+  const candidates = state.strategies.filter((strategy) => strategy.state === "validation");
+  const count = candidates.length;
+  animatedAction("validate", "/api/validate", {}, "Untouched holdout validation complete.", `${count} STRATEG${count === 1 ? "Y" : "IES"}`, candidates.map((strategy) => strategy.id));
 });
 $("#advance-button").addEventListener("click", () => action("/api/advance", { periods: 1 }, "Paper market advanced by 21 sessions."));
 $("#sync-button").addEventListener("click", () => action("/api/alpaca/sync", {}, "Alpaca account and market data synchronized."));
