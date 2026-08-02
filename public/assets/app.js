@@ -3,7 +3,7 @@ const $$ = (selector) => [...document.querySelectorAll(selector)];
 
 let state = null;
 let selectedId = null;
-let activeView = "overview";
+let activeView = "portfolio";
 let toastTimer = null;
 let adminToken = sessionStorage.getItem("axiom-admin-token") || "";
 
@@ -108,11 +108,65 @@ function renderSummary() {
 
 function renderView() {
   const portfolio = activeView === "portfolio";
+  $("#foundry-controls").hidden = portfolio;
   $("#portfolio-dashboard").hidden = !portfolio;
   $("#release-pipeline").hidden = portfolio;
   $("#strategy-overview").hidden = portfolio;
   $("#strategy-roster").hidden = portfolio;
   $("#strategy-detail").hidden = portfolio;
+}
+
+function rollingSharpe(history) {
+  const returns = [];
+  const result = [];
+  for (let index = 1; index < history.length; index += 1) {
+    const previousWealth = 1 + Number(history[index - 1].profit_loss_pct);
+    const currentWealth = 1 + Number(history[index].profit_loss_pct);
+    if (!(previousWealth > 0) || !Number.isFinite(currentWealth)) continue;
+    returns.push(currentWealth / previousWealth - 1);
+    const window = returns.slice(-20);
+    if (window.length < 5) continue;
+    const average = window.reduce((sum, value) => sum + value, 0) / window.length;
+    const variance = window.reduce((sum, value) => sum + (value - average) ** 2, 0) / window.length;
+    const deviation = Math.sqrt(variance);
+    result.push({ timestamp: history[index].timestamp, value: deviation > 1e-9 ? average / deviation * Math.sqrt(252) : 0 });
+  }
+  return result;
+}
+
+function renderAccountSeries(svgId, points, { formatAxis, emptyText }) {
+  const svg = $(svgId);
+  const clean = points.filter((point) => Number.isFinite(point.value));
+  if (clean.length < 2) {
+    svg.innerHTML = `<text class="account-chart-empty" x="360" y="120" text-anchor="middle">${escapeHtml(emptyText)}</text>`;
+    return;
+  }
+  const width = 720, height = 240, left = 20, right = 74, top = 18, bottom = 31;
+  const values = clean.map((point) => point.value);
+  let minimum = Math.min(0, ...values), maximum = Math.max(0, ...values);
+  if (maximum - minimum < 0.0001) { maximum += 1; minimum -= 1; }
+  const padding = (maximum - minimum) * 0.08;
+  maximum += padding; minimum -= padding;
+  const x = (index) => left + index / (clean.length - 1) * (width - left - right);
+  const y = (value) => top + (maximum - value) / (maximum - minimum) * (height - top - bottom);
+  const path = clean.map((point, index) => `${index ? "L" : "M"}${x(index).toFixed(1)},${y(point.value).toFixed(1)}`).join(" ");
+  const area = `${path} L${x(clean.length - 1)},${height - bottom} L${left},${height - bottom} Z`;
+  const latest = clean.at(-1).value;
+  const gradientId = `${svg.id}-fill`;
+  let grid = "";
+  for (let index = 0; index < 4; index += 1) {
+    const lineY = top + index * (height - top - bottom) / 3;
+    const value = maximum - (maximum - minimum) * index / 3;
+    grid += `<line class="account-chart-gridline" x1="${left}" y1="${lineY}" x2="${width - right}" y2="${lineY}"/><text class="account-chart-axis" x="${width - right + 8}" y="${lineY + 3}">${escapeHtml(formatAxis(value))}</text>`;
+  }
+  const firstDate = new Date(clean[0].timestamp);
+  const lastDate = new Date(clean.at(-1).timestamp);
+  const dateLabel = (date) => Number.isNaN(date.getTime()) ? "—" : date.toLocaleDateString([], { month: "short", day: "numeric" }).toUpperCase();
+  svg.innerHTML = `<defs><linearGradient id="${gradientId}" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${latest >= 0 ? "#a8f05a" : "#ee736a"}" stop-opacity=".18"/><stop offset="1" stop-color="${latest >= 0 ? "#a8f05a" : "#ee736a"}" stop-opacity="0"/></linearGradient></defs>
+    ${grid}<line class="account-chart-zero" x1="${left}" y1="${y(0)}" x2="${width - right}" y2="${y(0)}"/>
+    <path class="account-chart-area" style="fill:url(#${gradientId})" d="${area}"/><path class="account-chart-line ${latest < 0 ? "negative" : ""}" d="${path}"/>
+    <circle class="account-chart-dot ${latest < 0 ? "negative" : ""}" cx="${x(clean.length - 1)}" cy="${y(latest)}" r="4"/>
+    <text class="account-chart-axis" x="${left}" y="${height - 8}">${dateLabel(firstDate)}</text><text class="account-chart-axis" x="${width - right}" y="${height - 8}" text-anchor="end">${dateLabel(lastDate)}</text>`;
 }
 
 function renderPortfolio() {
@@ -123,12 +177,24 @@ function renderPortfolio() {
   const market = $("#portfolio-market-status");
   const positions = connected ? alpaca.positions ?? [] : [];
   const orders = connected ? alpaca.open_orders ?? [] : [];
+  const history = connected ? alpaca.portfolio_history?.points ?? [] : [];
   const managed = new Set(alpaca?.managed_symbols ?? []);
   const account = alpaca?.account ?? {};
   const dayPnl = connected ? Number(account.equity ?? 0) - Number(account.last_equity ?? 0) : null;
   const dayPnlPct = connected && Number(account.last_equity) ? dayPnl / Number(account.last_equity) : null;
   const fetchedAt = connected ? new Date(alpaca.fetched_at).getTime() : 0;
   const stale = connected && (!Number.isFinite(fetchedAt) || Date.now() - fetchedAt > 2 * 60 * 60 * 1000);
+  const pnlSeries = history.map((point) => ({ timestamp: point.timestamp, value: Number(point.profit_loss) }));
+  const sharpeSeries = rollingSharpe(history);
+  const latestPnl = pnlSeries.filter((point) => Number.isFinite(point.value)).at(-1)?.value;
+  const latestSharpe = sharpeSeries.at(-1)?.value;
+
+  $("#account-pnl-value").textContent = connected && latestPnl != null ? usd(latestPnl) : "—";
+  $("#account-pnl-value").className = latestPnl > 0 ? "positive" : latestPnl < 0 ? "negative" : "";
+  $("#account-sharpe-value").textContent = connected && latestSharpe != null ? number(latestSharpe, 2) : "—";
+  $("#account-sharpe-value").className = latestSharpe > 0 ? "positive" : latestSharpe < 0 ? "negative" : "";
+  renderAccountSeries("#account-pnl-chart", pnlSeries, { formatAxis: (value) => money(value), emptyText: "Refresh account to load Alpaca P/L history" });
+  renderAccountSeries("#account-sharpe-chart", sharpeSeries, { formatAxis: (value) => number(value, 1), emptyText: "At least six daily observations are required" });
 
   market.textContent = connected ? alpaca.clock?.is_open ? "MARKET OPEN" : "MARKET CLOSED" : "DISCONNECTED";
   market.className = `status-badge ${connected ? alpaca.clock?.is_open ? "healthy" : "watch" : ""}`;

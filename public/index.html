@@ -15,10 +15,10 @@
     <aside class="rail" aria-label="Primary navigation">
       <a class="mark" href="#" aria-label="Axiom home"><span>AX</span></a>
       <nav class="rail-nav">
-        <button class="rail-button active" data-view="overview" aria-label="Foundry overview"><span class="rail-icon">⌘</span><span>Foundry</span></button>
+        <button class="rail-button" data-view="overview" aria-label="Foundry overview"><span class="rail-icon">⌘</span><span>Foundry</span></button>
         <button class="rail-button" data-view="testing" aria-label="Backtest queue"><span class="rail-icon">⌁</span><span>Tests</span></button>
         <button class="rail-button" data-view="released" aria-label="Released strategies"><span class="rail-icon">◇</span><span>Market</span></button>
-        <button class="rail-button" data-view="portfolio" aria-label="Alpaca portfolio"><span class="rail-icon">$</span><span>Account</span></button>
+        <button class="rail-button active" data-view="portfolio" aria-label="Alpaca portfolio"><span class="rail-icon">$</span><span>Account</span></button>
         <button class="rail-button" data-view="lineage" aria-label="Strategy lineage"><span class="rail-icon">⑂</span><span>Lineage</span></button>
       </nav>
       <div class="rail-foot"><span class="pulse-dot"></span><span>SIM<br>ONLINE</span></div>
@@ -40,7 +40,7 @@
       </header>
 
       <main>
-        <section class="command-strip" aria-label="Foundry controls">
+        <section class="command-strip" id="foundry-controls" hidden aria-label="Foundry controls">
           <div>
             <span class="section-kicker">SELF-SUPERVISING PIPELINE</span>
           </div>
@@ -54,7 +54,7 @@
           </div>
         </section>
 
-        <section class="pipeline" id="release-pipeline" aria-label="Strategy release pipeline">
+        <section class="pipeline" id="release-pipeline" hidden aria-label="Strategy release pipeline">
           <article class="pipeline-step">
             <div class="step-index">01</div><div><span>GENERATED</span><strong id="count-generated">0</strong></div>
             <small>fresh DNA</small>
@@ -81,13 +81,23 @@
           </article>
         </section>
 
-        <section class="portfolio-dashboard" id="portfolio-dashboard" hidden aria-label="Alpaca portfolio monitor">
+        <section class="portfolio-dashboard" id="portfolio-dashboard" aria-label="Alpaca portfolio monitor">
           <article class="panel portfolio-summary-panel">
             <div class="panel-header">
               <div><span class="section-kicker">ALPACA PAPER ACCOUNT</span><h2>Portfolio monitor</h2><div class="selected-meta" id="portfolio-updated"></div></div>
               <div class="panel-actions"><span class="status-badge" id="portfolio-market-status">DISCONNECTED</span><button class="button compact" id="portfolio-refresh-button">Refresh account</button></div>
             </div>
             <div class="portfolio-alert" id="portfolio-alert"></div>
+            <div class="account-chart-grid">
+              <article class="account-chart-card">
+                <div class="account-chart-head"><div><span>ACCOUNT P/L</span><strong id="account-pnl-value">—</strong></div><small>3 MONTHS · DAILY</small></div>
+                <svg id="account-pnl-chart" viewBox="0 0 720 240" role="img" aria-label="Alpaca account profit and loss history"></svg>
+              </article>
+              <article class="account-chart-card">
+                <div class="account-chart-head"><div><span>ROLLING SHARPE</span><strong id="account-sharpe-value">—</strong></div><small>20-SESSION WINDOW</small></div>
+                <svg id="account-sharpe-chart" viewBox="0 0 720 240" role="img" aria-label="Alpaca account rolling Sharpe ratio"></svg>
+              </article>
+            </div>
             <div class="account-metric-grid" id="account-metric-grid"></div>
           </article>
 
@@ -107,7 +117,7 @@
           <p class="portfolio-footnote">Position attribution is conservative: Alpaca combines all shares of the same symbol, so a symbol touched by both you and Axiom is marked mixed.</p>
         </section>
 
-        <section class="main-grid" id="strategy-overview">
+        <section class="main-grid" id="strategy-overview" hidden>
           <article class="panel performance-panel">
             <div class="panel-header">
               <div>
@@ -136,7 +146,7 @@
           </aside>
         </section>
 
-        <section class="panel roster-panel" id="strategy-roster">
+        <section class="panel roster-panel" id="strategy-roster" hidden>
           <div class="panel-header roster-heading">
             <div>
               <span class="section-kicker">STRATEGY ROSTER</span>
@@ -153,7 +163,7 @@
           <div class="empty-state" id="empty-state" hidden>No strategies match this desk.</div>
         </section>
 
-        <section class="detail-grid" id="strategy-detail">
+        <section class="detail-grid" id="strategy-detail" hidden>
           <article class="panel dna-panel">
             <div class="panel-header simple"><div><span class="section-kicker">STRATEGY DNA</span><h2>Blueprint & lineage</h2></div><span class="mono" id="selected-id">—</span></div>
             <div id="dna-content" class="dna-content"></div>

@@ -239,11 +239,13 @@ test("read-only Alpaca overview refresh preserves strategy ownership state", () 
     account: { equity: 100250, last_equity: 100000, cash: 80000, buying_power: 160000, portfolio_value: 100250 },
     positions: [{ symbol: "SPY", qty: 2, market_value: 1000, unrealized_pl: 25, unrealized_plpc: 0.025 }],
     open_orders: [{ id: "manual-1", client_order_id: "manual-1", symbol: "QQQ", status: "new" }],
+    portfolio_history: { period: "3M", timeframe: "1D", points: [{ timestamp: "2026-08-01T00:00:00Z", equity: 100250, profit_loss: 250, profit_loss_pct: 0.0025 }] },
     clock: { is_open: true },
   });
   assert.equal(state.alpaca.connected, true);
   assert.equal(state.alpaca.positions[0].symbol, "SPY");
   assert.equal(state.alpaca.open_orders[0].symbol, "QQQ");
+  assert.equal(state.alpaca.portfolio_history.points[0].profit_loss, 250);
   assert.deepEqual(state.alpaca.managed_symbols, ["SPY"]);
   assert.equal(snapshot(state).summary.capital, 100250);
   assert.ok(state.events.some((item) => item.title === "Alpaca portfolio refreshed"));

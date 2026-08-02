@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildPaperCycle, getAccountOverview, getResearchBars } from "./alpaca.js";
+import { buildPaperCycle, getAccountOverview, getPortfolioHistory, getResearchBars } from "./alpaca.js";
 
 const credentials = {
   ALPACA_API_KEY: "paper-key",
@@ -12,7 +12,19 @@ const credentials = {
   ALPACA_MAX_PORTFOLIO_PCT: "0.20",
 };
 
-function fixtureFetch({ existingOrder = null, positions = [], orders = [] } = {}) {
+function fixtureFetch({
+  existingOrder = null,
+  positions = [],
+  orders = [],
+  portfolioHistory = {
+    timestamp: [1785456000, 1785542400, 1785628800],
+    equity: [100000, 100250, 100425.5],
+    profit_loss: [0, 250, 425.5],
+    profit_loss_pct: [0, 0.0025, 0.004255],
+    base_value: 100000,
+    base_value_asof: "2026-07-31T00:00:00Z",
+  },
+} = {}) {
   const submitted = [];
   const mock = async (input, init = {}) => {
     const url = new URL(String(input));
@@ -31,6 +43,7 @@ function fixtureFetch({ existingOrder = null, positions = [], orders = [] } = {}
       is_open: true, timestamp: "2026-08-03T15:00:00Z",
       next_open: "2026-08-04T13:30:00Z", next_close: "2026-08-03T20:00:00Z",
     });
+    if (url.pathname === "/v2/account/portfolio/history") return Response.json(portfolioHistory);
     if (url.pathname === "/v2/stocks/bars") {
       const symbols = url.searchParams.get("symbols").split(",");
       const bars = Object.fromEntries(symbols.map((symbol) => [symbol, Array.from({ length: 260 }, (_, index) => ({
@@ -61,6 +74,26 @@ test("account overview is sanitized and credentials stay in headers", async () =
   assert.equal(overview.account.equity, 100000);
   assert.equal(overview.account.trading_blocked, false);
   assert.deepEqual(overview.positions, []);
+  assert.equal(overview.portfolio_history.points.length, 3);
+});
+
+test("portfolio history requests three months of daily data and sanitizes aligned points", async () => {
+  globalThis.fetch = fixtureFetch({
+    portfolioHistory: {
+      timestamp: [1785456000, "invalid", 1785628800],
+      equity: [100000, 100100, 100425.5],
+      profit_loss: [0, 100, 425.5],
+      profit_loss_pct: [0, 0.001, 0.004255],
+      base_value: "100000",
+    },
+  });
+  const history = await getPortfolioHistory(credentials);
+  assert.equal(history.period, "3M");
+  assert.equal(history.timeframe, "1D");
+  assert.equal(history.base_value, 100000);
+  assert.equal(history.points.length, 2);
+  assert.equal(history.points.at(-1).profit_loss, 425.5);
+  assert.match(history.points[0].timestamp, /^2026-/);
 });
 
 test("account overview returns sanitized positions and open orders without trading", async () => {

@@ -82,7 +82,7 @@ The first integration supports four US equity ETFs: `SPY`, `QQQ`, `IWM`, and `TL
 
 Press **Sync Alpaca** to verify the credentials and load account equity, positions, market status, and current bars. Scheduled hourly runs perform the same synchronization automatically.
 
-The **Account** desk displays equity, cash, buying power, daily P/L, open positions, and working paper orders. Its **Refresh account** button is read-only: it never evaluates strategies or submits orders, even when automated paper trading is enabled. Positions are marked `AXIOM / MIXED` only when Axiom has previously bought that symbol; Alpaca aggregates manual and automated shares, so exact share-level attribution is not implied.
+The **Account** desk is the default landing page. It displays Alpaca's three-month daily P/L history, a locally calculated 20-session rolling Sharpe chart, equity, cash, buying power, daily P/L, open positions, and working paper orders. Sharpe uses the daily portfolio-return series with a zero risk-free rate and annualizes by `sqrt(252)`. Its **Refresh account** button is read-only: it never evaluates strategies or submits orders, even when automated paper trading is enabled. Positions are marked `AXIOM / MIXED` only when Axiom has previously bought that symbol; Alpaca aggregates manual and automated shares, so exact share-level attribution is not implied.
 
 Automated orders are disabled by default:
 

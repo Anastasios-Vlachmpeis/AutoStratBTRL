@@ -85,12 +85,48 @@ function sanitizeOrder(order) {
   };
 }
 
+function sanitizePortfolioHistory(history) {
+  const timestamps = Array.isArray(history.timestamp) ? history.timestamp : [];
+  const equities = Array.isArray(history.equity) ? history.equity : [];
+  const profitLoss = Array.isArray(history.profit_loss) ? history.profit_loss : [];
+  const profitLossPct = Array.isArray(history.profit_loss_pct) ? history.profit_loss_pct : [];
+  const baseValue = cleanNumber(history.base_value);
+  const points = timestamps.map((timestamp, index) => {
+    const rawEquity = equities[index];
+    const numericTimestamp = Number(timestamp);
+    const parsedTimestamp = Number.isFinite(numericTimestamp)
+      ? new Date(numericTimestamp > 1e12 ? numericTimestamp : numericTimestamp * 1000)
+      : new Date(timestamp);
+    if (rawEquity == null || !Number.isFinite(Number(rawEquity)) || Number.isNaN(parsedTimestamp.getTime())) return null;
+    const equity = cleanNumber(rawEquity);
+    const pnl = profitLoss[index] == null ? equity - baseValue : cleanNumber(profitLoss[index]);
+    const pnlPct = profitLossPct[index] == null
+      ? (baseValue > 0 ? equity / baseValue - 1 : 0)
+      : cleanNumber(profitLossPct[index]);
+    return { timestamp: parsedTimestamp.toISOString(), equity, profit_loss: pnl, profit_loss_pct: pnlPct };
+  }).filter(Boolean);
+  return {
+    period: "3M",
+    timeframe: "1D",
+    base_value: baseValue,
+    base_value_asof: history.base_value_asof ?? null,
+    points,
+  };
+}
+
+export async function getPortfolioHistory(env) {
+  const query = new URLSearchParams({ period: "3M", timeframe: "1D" });
+  const history = await alpacaRequest(env, PAPER_BASE, `/v2/account/portfolio/history?${query}`);
+  return sanitizePortfolioHistory(history);
+}
+
 export async function getAccountOverview(env) {
-  const [account, positions, orders, clock] = await Promise.all([
+  const [account, positions, orders, clock, portfolioHistory] = await Promise.all([
     alpacaRequest(env, PAPER_BASE, "/v2/account"),
     alpacaRequest(env, PAPER_BASE, "/v2/positions"),
     alpacaRequest(env, PAPER_BASE, "/v2/orders?status=open&limit=100&direction=desc"),
     alpacaRequest(env, PAPER_BASE, "/v2/clock"),
+    getPortfolioHistory(env),
   ]);
   return {
     connected: true,
@@ -98,6 +134,7 @@ export async function getAccountOverview(env) {
     account: sanitizeAccount(account),
     positions: positions.map(sanitizePosition),
     open_orders: orders.map(sanitizeOrder),
+    portfolio_history: portfolioHistory,
     clock: {
       is_open: Boolean(clock.is_open),
       timestamp: clock.timestamp,
