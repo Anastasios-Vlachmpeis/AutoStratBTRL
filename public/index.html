@@ -19,7 +19,7 @@
         <button class="rail-button" data-view="overview" aria-label="Foundry overview"><span class="rail-icon">⌘</span><span>Foundry</span></button>
         <button class="rail-button" data-view="testing" aria-label="Backtest queue"><span class="rail-icon">⌁</span><span>Tests</span></button>
         <button class="rail-button" data-view="released" aria-label="Released strategies"><span class="rail-icon">◇</span><span>Market</span></button>
-        <button class="rail-button" data-view="lineage" aria-label="Strategy lineage"><span class="rail-icon">⑂</span><span>Lineage</span></button>
+        <button class="rail-button" data-view="logs" aria-label="Supervisor decision logs"><span class="rail-icon">≡</span><span>Logs</span></button>
       </nav>
       <div class="rail-foot"><span class="pulse-dot"></span><span>SIM<br>ONLINE</span></div>
     </aside>
@@ -139,14 +139,16 @@
               <svg id="equity-chart" viewBox="0 0 900 255" role="img" aria-label="Strategy equity curve chart"></svg>
             </div>
           </article>
+        </section>
 
-          <aside class="panel audit-panel">
-            <div class="panel-header simple">
-              <div><span class="section-kicker">SUPERVISOR TAPE</span><h2>Decision log</h2></div>
-              <span class="live-marker"><i></i>LIVE</span>
+        <section class="logs-dashboard" id="logs-dashboard" hidden aria-label="Supervisor decision logs">
+          <article class="panel logs-panel">
+            <div class="panel-header">
+              <div><span class="section-kicker">SUPERVISOR TAPE</span><h2>System decision log</h2><div class="selected-meta"><span>GENERATION</span><span>REVIEW</span><span>VALIDATION</span><span>MARKET</span></div></div>
+              <div class="logs-header-meta"><strong id="log-count">0</strong><small>RECENT EVENTS</small><span class="live-marker"><i></i>LIVE</span></div>
             </div>
             <div class="audit-feed" id="audit-feed" aria-live="polite"></div>
-          </aside>
+          </article>
         </section>
 
         <section class="panel roster-panel" id="strategy-roster" hidden>

@@ -9,7 +9,7 @@ let curveLegendVisible = false;
 let toastTimer = null;
 let adminToken = sessionStorage.getItem("axiom-admin-token") || "";
 
-const multiStrategyViews = new Set(["overview", "testing", "released", "lineage"]);
+const multiStrategyViews = new Set(["overview", "testing", "released"]);
 const activeFilters = { overview: "all", testing: "all", released: "all" };
 const filterConfigs = {
   overview: [
@@ -98,7 +98,6 @@ function strategiesForView(view = activeView) {
   if (!state) return [];
   if (view === "testing") return state.strategies.filter((item) => ["generated", "rework", "validation"].includes(item.state));
   if (view === "released") return state.strategies.filter((item) => ["released", "healthy", "watch", "adjusted"].includes(item.state));
-  if (view === "lineage") return state.strategies.filter((item) => item.parent || item.generation > 1);
   return state.strategies;
 }
 
@@ -152,12 +151,15 @@ function renderSummary() {
 
 function renderView() {
   const portfolio = activeView === "portfolio";
-  $("#foundry-controls").hidden = portfolio;
+  const logs = activeView === "logs";
+  const strategyWorkspace = !portfolio && !logs;
+  $("#foundry-controls").hidden = !strategyWorkspace;
   $("#portfolio-dashboard").hidden = !portfolio;
-  $("#release-pipeline").hidden = portfolio;
-  $("#strategy-overview").hidden = portfolio;
-  $("#strategy-roster").hidden = portfolio;
-  $("#strategy-detail").hidden = portfolio;
+  $("#logs-dashboard").hidden = !logs;
+  $("#release-pipeline").hidden = !strategyWorkspace;
+  $("#strategy-overview").hidden = !strategyWorkspace;
+  $("#strategy-roster").hidden = !strategyWorkspace;
+  $("#strategy-detail").hidden = !strategyWorkspace;
 }
 
 function rollingSharpe(history) {
@@ -384,7 +386,6 @@ function renderDeskOverview() {
     overview: { name: "Foundry strategy book", empty: "No strategies in the foundry", chart: "ALL FOUNDRY EQUITY CURVES", noun: "research strategy" },
     testing: { name: "Testing strategy queue", empty: "No strategies in testing", chart: "ALL TEST EQUITY CURVES", noun: "testing strategy" },
     released: { name: "Released strategy book", empty: "No released strategies", chart: "ALL RELEASED EQUITY CURVES", noun: "released strategy" },
-    lineage: { name: "Reproduction lineage", empty: "No reproduced strategies", chart: "ALL LINEAGE EQUITY CURVES", noun: "lineage strategy" },
   };
   const desk = desks[activeView] || desks.overview;
   const metrics = strategies.map((strategy) => strategy.metrics).filter(Boolean);
@@ -708,6 +709,7 @@ function renderRegimes(strategy) {
 }
 
 function renderAudit() {
+  $("#log-count").textContent = String(state.events.length);
   $("#audit-feed").innerHTML = state.events.length
     ? state.events.map((event) => `<article class="audit-item"><span class="audit-time">${escapeHtml(event.time)}</span><div class="audit-copy"><strong><i class="event-dot ${escapeHtml(event.kind)}"></i>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.detail)}</p></div></article>`).join("")
     : '<div class="empty-state">No supervisor decisions yet.</div>';
@@ -740,7 +742,7 @@ function renderStrategyFilters() {
 
 function renderTable() {
   const strategies = filteredStrategies();
-  const titles = { overview: "All research units", testing: "Generation & rework queue", released: "Released market book", lineage: "Reproduction lineage" };
+  const titles = { overview: "All research units", testing: "Generation & rework queue", released: "Released market book" };
   $("#roster-title").textContent = titles[activeView] || titles.overview;
   renderStrategyFilters();
   const scored = strategies.map((strategy) => strategy.metrics?.score).filter(Number.isFinite);
@@ -1239,7 +1241,8 @@ $("#reproduce-button").addEventListener("click", async () => {
     await api("/api/reproduce", { id: parent.id });
     const child = state.strategies.find((item) => !before.has(item.id));
     if (child) selectedId = child.id;
-    activeView = "lineage";
+    activeView = "overview";
+    activeFilters.overview = "all";
     deskOverview = false;
     $$(".rail-button").forEach((button) => button.classList.toggle("active", button.dataset.view === activeView));
     render();
