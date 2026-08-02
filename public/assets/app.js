@@ -9,7 +9,7 @@ let adminToken = sessionStorage.getItem("axiom-admin-token") || "";
 
 const statusLabels = {
   generated: "Generated", rework: "Rework", validation: "Validation", released: "Released", healthy: "Healthy",
-  watch: "Watch", adjusted: "Adjusted", dropped: "Dropped"
+  watch: "Watch", adjusted: "Adjusted", dropped: "Dropped", superseded: "Superseded"
 };
 
 const escapeHtml = (value) => String(value ?? "").replace(/[&<>'"]/g, (char) => ({
@@ -149,7 +149,8 @@ function renderSelected() {
   }
   const metrics = strategy.metrics;
   $("#selected-name").textContent = strategy.name;
-  $("#selected-meta").innerHTML = `<span>${escapeHtml(strategy.archetype)}</span><span>${escapeHtml(strategy.asset)}</span><span>GEN ${strategy.generation}</span>`;
+  const attempt = strategy.rework?.attempt ? `<span>REWORK ${strategy.rework.attempt}/${strategy.rework.max_attempts || 3}</span>` : "";
+  $("#selected-meta").innerHTML = `<span>${escapeHtml(strategy.archetype)}</span><span>${escapeHtml(strategy.asset)}</span><span>GEN ${strategy.generation}</span>${attempt}`;
   const status = $("#selected-status");
   status.textContent = statusLabels[strategy.state] || strategy.state;
   status.className = `status-badge ${strategy.state}`;
@@ -181,7 +182,10 @@ function renderDNA(strategy) {
     const formatted = key === "position_size" ? pct(value, 0) : value;
     return `<div class="param"><span>${escapeHtml(labelParam(key))}</span><strong>${escapeHtml(formatted)}</strong></div>`;
   }).join("");
-  $("#dna-content").innerHTML = `<div class="dna-lineage">${lineage}</div><div class="param-grid">${params}</div>`;
+  const rework = strategy.rework?.attempt
+    ? `<div class="rework-note"><span>REWORK ${strategy.rework.attempt}/${strategy.rework.max_attempts || 3}</span><strong>${escapeHtml(strategy.rework.diagnosis || "Development improvement pass")}</strong>${strategy.rework.change ? `<small>${escapeHtml(labelParam(strategy.rework.change.parameter))}: ${escapeHtml(strategy.rework.change.from)} → ${escapeHtml(strategy.rework.change.to)}</small>` : ""}</div>`
+    : "";
+  $("#dna-content").innerHTML = `<div class="dna-lineage">${lineage}</div>${rework}<div class="param-grid">${params}</div>`;
 }
 
 function renderRegimes(strategy) {
@@ -226,7 +230,7 @@ function renderTable() {
   $("#strategy-table").innerHTML = strategies.map((strategy) => {
     const m = strategy.metrics;
     return `<tr data-id="${escapeHtml(strategy.id)}" class="${strategy.id === selectedId ? "selected" : ""}">
-      <td class="unit-cell"><strong>${escapeHtml(strategy.name)}</strong><span>${escapeHtml(strategy.id)}${strategy.parent ? ` · CHILD OF ${escapeHtml(strategy.parent)}` : ""}</span></td>
+      <td class="unit-cell"><strong>${escapeHtml(strategy.name)}</strong><span>${escapeHtml(strategy.id)}${strategy.parent ? ` · CHILD OF ${escapeHtml(strategy.parent)}` : ""}${strategy.rework?.attempt ? ` · TRY ${strategy.rework.attempt}/${strategy.rework.max_attempts || 3}` : ""}</span></td>
       <td class="archetype-cell"><strong>${escapeHtml(strategy.archetype)}</strong><span>${escapeHtml(strategy.asset)}</span></td>
       <td><span class="status-badge ${strategy.state}">${escapeHtml(statusLabels[strategy.state] || strategy.state)}</span></td>
       <td>${strategy.backtests ? `${Math.min(strategy.backtests, 3)} dev${strategy.validation ? " · 1 unseen" : ""}` : "not tested"}</td><td>${m ? number(m.sharpe) : "—"}</td><td>${m ? pct(m.drawdown) : "—"}</td>

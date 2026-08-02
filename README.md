@@ -114,9 +114,9 @@ Cloudflare and local Python states are intentionally separate. Resetting or runn
 ## Lifecycle
 
 1. **Seed cohort** creates new strategy DNA across momentum, mean-reversion, breakout, and volatility-filter archetypes.
-2. **Run supervisor** evaluates each waiting strategy on the first 75% of its chronological research data. The final quarter is excluded from every development calculation.
+2. **Run supervisor** evaluates each waiting strategy on the first 75% of its chronological research data. The final quarter is excluded from every development calculation. Strategies in rework are diagnosed from development evidence, archived, and replaced by a traceable child with exactly one adjusted parameter.
 3. Strong candidates enter **Validation**. Parameters are frozen, then **Validate holdout** runs one final backtest on the untouched 25%.
-4. Validation releases strategies only when unseen return, Sharpe, trade count, drawdown, robustness, and degradation gates pass. Failures return to rework or are dropped.
+4. Validation releases strategies only when unseen return, Sharpe, trade count, drawdown, robustness, and degradation gates pass. Soft failures can trigger a new rework child, but holdout values never select its mutation. After three unsuccessful rework attempts, the lineage is dropped.
 5. Hourly Alpaca monitoring moves released strategies through healthy, watch, adjusted, and retired states.
 6. **Reproduce DNA** makes a traceable, mutated child from a released strategy; the child must pass both supervision and validation.
 

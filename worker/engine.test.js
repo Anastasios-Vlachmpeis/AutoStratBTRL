@@ -10,11 +10,25 @@ import {
   marketSeries,
   migrateState,
   reproduce,
+  reworkCandidates,
   reviewCandidates,
   reviewCandidatesWithBars,
   snapshot,
   validateCandidates,
 } from "./engine.js";
+
+function addReworkStrategy(state, attempt = 0) {
+  generateBatch(state, 1);
+  const strategy = state.strategies[0];
+  strategy.state = "rework";
+  strategy.metrics = {
+    score: 57, annualized: 0.05, sharpe: 0.48, drawdown: 0.19, trades: 28,
+    profit_factor: 1.01, positive_regimes: 3, robustness: 0.62,
+  };
+  strategy.validation = { sharpe: -4, return: -0.8, drawdown: 0.9 };
+  strategy.rework = { attempt, max_attempts: 3, diagnosis: "queued", source_stage: "validation", change: null, history: [] };
+  return strategy;
+}
 
 function addReleasedStrategy(state) {
   generateBatch(state, 1);
@@ -56,6 +70,54 @@ test("reproduction preserves lineage and mutates DNA", () => {
   assert.equal(child.generation, parent.generation + 1);
   assert.notDeepEqual(child.params, parent.params);
   assert.equal(child.state, "generated");
+});
+
+test("rework archives the parent and creates one audited DNA change", () => {
+  const state = createDemoState();
+  const parent = addReworkStrategy(state);
+  const originalParams = structuredClone(parent.params);
+  const [child] = reworkCandidates(state);
+  assert.equal(parent.state, "superseded");
+  assert.equal(child.parent, parent.id);
+  assert.equal(child.state, "generated");
+  assert.equal(child.rework.attempt, 1);
+  assert.equal(child.rework.history.length, 1);
+  assert.equal(child.validation, null);
+  assert.equal(child.backtests, 0);
+  const changed = Object.keys(child.params).filter((key) => child.params[key] !== originalParams[key]);
+  assert.deepEqual(changed, [child.rework.change.parameter]);
+  assert.ok(state.events.some((item) => item.detail.includes("attempt 1/3")));
+});
+
+test("rework mutation cannot inspect holdout results", () => {
+  const first = createDemoState();
+  const parent = addReworkStrategy(first);
+  const second = structuredClone(first);
+  second.strategies[0].validation = { sharpe: 20, return: 5, drawdown: 0 };
+  reworkCandidates(first);
+  reworkCandidates(second);
+  assert.deepEqual(first.strategies[0].params, second.strategies[0].params);
+  assert.deepEqual(first.strategies[0].rework.history[0].development, second.strategies[0].rework.history[0].development);
+  assert.equal(parent.state, "superseded");
+});
+
+test("rework lineage is dropped after three attempts", () => {
+  const state = createDemoState();
+  const parent = addReworkStrategy(state, 3);
+  assert.deepEqual(reworkCandidates(state), []);
+  assert.equal(parent.state, "dropped");
+  assert.ok(state.events.some((item) => item.title.includes("rework exhausted")));
+});
+
+test("supervisor automatically evaluates a fresh rework child", () => {
+  const state = createDemoState();
+  const parent = addReworkStrategy(state);
+  reviewCandidates(state);
+  const child = state.strategies.find((item) => item.parent === parent.id);
+  assert.equal(parent.state, "superseded");
+  assert.ok(child);
+  assert.equal(child.backtests, 3);
+  assert.notEqual(child.state, "generated");
 });
 
 test("no-signal backtests stay finite", () => {
@@ -128,9 +190,20 @@ test("legacy preloaded state is migrated to an empty workspace", () => {
   addReleasedStrategy(state);
   state.schemaVersion = 2;
   const migrated = migrateState(state);
-  assert.equal(migrated.schemaVersion, 3);
+  assert.equal(migrated.schemaVersion, 4);
   assert.deepEqual(migrated.strategies, []);
   assert.deepEqual(migrated.events, []);
+});
+
+test("schema 3 migration preserves user strategies and adds rework metadata", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  delete state.strategies[0].rework;
+  state.schemaVersion = 3;
+  const migrated = migrateState(state);
+  assert.equal(migrated.schemaVersion, 4);
+  assert.equal(migrated.strategies.length, 1);
+  assert.equal(migrated.strategies[0].rework.attempt, 0);
 });
 
 test("Alpaca cycles are idempotent and record managed symbols", () => {

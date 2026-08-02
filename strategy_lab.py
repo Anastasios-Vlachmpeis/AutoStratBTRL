@@ -218,14 +218,14 @@ class StrategyLab:
             return {"lookback": rng.randint(12, 38), "buffer": round(rng.uniform(0.0005, 0.006), 4), "position_size": size}
         return {"lookback": rng.randint(9, 24), "vol_ceiling": round(rng.uniform(0.16, 0.42), 2), "threshold": round(rng.uniform(0.004, 0.018), 3), "position_size": size}
 
-    def _new_strategy(self, parent: dict[str, Any] | None = None) -> dict[str, Any]:
+    def _new_strategy(self, parent: dict[str, Any] | None = None, mutate_parent: bool = True) -> dict[str, Any]:
         strategy_id = f"AX-{self.cycle:02d}-{self.next_id:03d}"
         rng = random.Random(self.seed + self.next_id * 103 + self.cycle)
         self.next_id += 1
         archetype = parent["archetype"] if parent else ARCHETYPES[rng.randrange(len(ARCHETYPES))]
         asset = parent["asset"] if parent else ASSETS[rng.randrange(len(ASSETS))]
         params = deepcopy(parent["params"]) if parent else self._params(archetype, rng)
-        if parent:
+        if parent and mutate_parent:
             mutable = [key for key in params if key != "position_size"]
             key = mutable[rng.randrange(len(mutable))]
             if isinstance(params[key], int):
@@ -238,6 +238,11 @@ class StrategyLab:
             "id": strategy_id, "name": name, "archetype": archetype, "asset": asset,
             "params": params, "state": "generated", "generation": 1 if not parent else parent["generation"] + 1,
             "parent": parent["id"] if parent else None, "backtests": 0, "metrics": None, "validation": None,
+            "rework": {
+                "attempt": (parent or {}).get("rework", {}).get("attempt", 0), "max_attempts": 3,
+                "diagnosis": None, "source_stage": None, "change": None,
+                "history": deepcopy((parent or {}).get("rework", {}).get("history", [])),
+            },
             "monitor": {"returns": [], "streak": 0, "adjustments": 0, "sharpe": None, "drawdown": None, "ratio": None},
         }
 
@@ -263,14 +268,100 @@ class StrategyLab:
             return "dropped", f"hard gate failed · DD {metrics['drawdown'] * 100:.1f}% · {metrics['trades']:.0f} trades"
         return "rework", f"evidence incomplete · score {metrics['score']:.1f} · robustness {metrics['robustness']:.2f}"
 
+    @staticmethod
+    def _diagnose_development(strategy: dict[str, Any]) -> dict[str, Any]:
+        metrics = strategy.get("metrics") or {}
+        if metrics.get("drawdown", 0) > 0.18:
+            return {"text": "development drawdown is too close to the risk limit", "key": "position_size", "factor": 0.80}
+        if metrics.get("trades", 0) < 18:
+            key = "entry_z" if strategy["archetype"] == "Mean reversion" else "buffer" if strategy["archetype"] == "Breakout" else "threshold"
+            return {"text": "development produced too few independent trades", "key": key, "factor": 0.82}
+        if metrics.get("positive_regimes", 0) < 3 or metrics.get("robustness", 0) < 0.60:
+            key = "slow" if strategy["archetype"] == "Momentum" else "lookback"
+            return {"text": "development performance is not broad enough across regimes", "key": key}
+        key = "entry_z" if strategy["archetype"] == "Mean reversion" else "buffer" if strategy["archetype"] == "Breakout" else "threshold" if strategy["archetype"] == "Momentum" else "lookback"
+        return {"text": "development edge is below the promotion threshold", "key": key, "factor": 0.88}
+
+    def _queue_rework(self, strategy: dict[str, Any], source_stage: str, reason: str) -> None:
+        prior = strategy.get("rework") or {"attempt": 0, "history": []}
+        diagnosis = self._diagnose_development(strategy)["text"] if source_stage in {"development", "validation"} else reason
+        strategy["rework"] = {
+            **prior, "max_attempts": 3, "diagnosis": diagnosis,
+            "source_stage": source_stage, "change": None,
+        }
+        strategy["state"] = "rework"
+
+    def _mutate_development_dna(self, parent: dict[str, Any]) -> dict[str, Any]:
+        attempt = parent.get("rework", {}).get("attempt", 0) + 1
+        diagnosis = self._diagnose_development(parent)
+        child = self._new_strategy(parent, mutate_parent=False)
+        before = child["params"][diagnosis["key"]]
+        numeric_id = int(parent["id"].split("-")[-1])
+        factor = diagnosis.get("factor", 0.84 if (numeric_id + attempt) % 2 == 0 else 1.16)
+        if isinstance(before, int):
+            after = max(3, round(before * factor))
+            if diagnosis["key"] == "slow":
+                after = max(child["params"]["fast"] + 3, after)
+        else:
+            after = round(before * factor, 4)
+            after = round(clamp(after, 0.20, 1.0), 2) if diagnosis["key"] == "position_size" else max(0.0001, after)
+        if after == before:
+            after = before + 1 if isinstance(before, int) else round(before * 0.9, 4)
+        child["params"][diagnosis["key"]] = after
+        change = {"parameter": diagnosis["key"], "from": before, "to": after}
+        development = None if not parent.get("metrics") else {
+            key: parent["metrics"].get(key) for key in ("score", "sharpe", "drawdown", "trades", "robustness")
+        }
+        history = deepcopy(parent.get("rework", {}).get("history", [])) + [{
+            "attempt": attempt, "parent_id": parent["id"], "diagnosis": diagnosis["text"],
+            "source_stage": parent.get("rework", {}).get("source_stage", "development"),
+            "change": change, "development": development, "cycle": self.cycle,
+        }]
+        child["rework"] = {
+            "attempt": attempt, "max_attempts": 3, "diagnosis": diagnosis["text"],
+            "source_stage": parent.get("rework", {}).get("source_stage", "development"),
+            "change": change, "history": history,
+        }
+        parent["state"] = "superseded"
+        parent.setdefault("rework", {})["diagnosis"] = diagnosis["text"]
+        self._event("REWORK", f"{parent['name']} → {child['name']}", f"{diagnosis['text']} · attempt {attempt}/3 · {diagnosis['key']} {before} → {after}")
+        return child
+
+    def rework_candidates(self) -> list[dict[str, Any]]:
+        with self._lock:
+            created: list[dict[str, Any]] = []
+            for parent in [item for item in self.strategies if item["state"] == "rework"]:
+                if parent.get("rework", {}).get("source_stage") in {"capacity", "data"}:
+                    continue
+                if parent.get("rework", {}).get("attempt", 0) >= 3:
+                    parent["state"] = "dropped"
+                    self._event("DROP", f"{parent['name']} rework exhausted", "3 traceable improvement attempts completed without promotion.")
+                    continue
+                created.append(self._mutate_development_dna(parent))
+            self.strategies = created + self.strategies
+            return created
+
+    def _finalize_validation_pool(self, pool: list[dict[str, Any]]) -> None:
+        unique = {strategy["id"]: strategy for strategy in pool}
+        ranked = sorted(unique.values(), key=lambda item: item["metrics"]["score"], reverse=True)
+        for strategy in ranked[:3]:
+            was_waiting = strategy["state"] == "rework"
+            strategy["state"] = "validation"
+            if was_waiting:
+                self._event("PROMOTE", f"{strategy['name']} → validation", "Validation capacity opened; frozen DNA moved forward without retuning.")
+        for strategy in ranked[3:]:
+            self._queue_rework(strategy, "capacity", "waiting for an available validation slot; DNA remains frozen")
+            self._event("REWORK", f"{strategy['name']} held", "Validation cap reached; frozen DNA retained without retuning.")
+
     def review_candidates(self, bootstrap: bool = False) -> None:
         with self._lock:
-            candidates = [item for item in self.strategies if item["state"] in ("generated", "rework")]
-            if not candidates:
+            self.rework_candidates()
+            candidates = [item for item in self.strategies if item["state"] == "generated" or (item["state"] == "rework" and item.get("rework", {}).get("source_stage") == "data")]
+            validation_pool = [item for item in self.strategies if item["state"] == "rework" and item.get("rework", {}).get("source_stage") == "capacity"]
+            if not candidates and not validation_pool:
                 if not bootstrap:
                     self._event("REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.")
                 return
-            validation_pool: list[dict[str, Any]] = []
             for strategy in candidates:
                 asset_index = ASSETS.index(strategy["asset"])
                 results = []
@@ -283,10 +374,10 @@ class StrategyLab:
                 strategy["state"] = state
                 if state == "validation":
                     validation_pool.append(strategy)
+                elif state == "rework":
+                    self._queue_rework(strategy, "development", reason)
                 self._event("PROMOTE" if state == "validation" else "DROP" if state == "dropped" else "REWORK", f"{strategy['name']} → {state}", reason)
-            for strategy in sorted(validation_pool, key=lambda item: item["metrics"]["score"], reverse=True)[3:]:
-                strategy["state"] = "rework"
-                self._event("REWORK", f"{strategy['name']} held", "Release cap reached; retained for the next evidence cycle.")
+            self._finalize_validation_pool(validation_pool)
             self.market_clock += 8
 
     def _validation_verdict(self, strategy: dict[str, Any], result: dict[str, Any]) -> tuple[str, str]:
@@ -332,6 +423,8 @@ class StrategyLab:
                 strategy["validation"] = result
                 state, reason = self._validation_verdict(strategy, result)
                 strategy["state"] = state
+                if state == "rework":
+                    self._queue_rework(strategy, "validation", reason)
                 self._event("RELEASE" if state == "released" else "DROP" if state == "dropped" else "REWORK", f"{strategy['name']} → {state}", reason)
             self.market_clock += 5
 

@@ -79,7 +79,7 @@ export class AxiomLab extends DurableObject {
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const existing = await ctx.storage.get("state");
       if (!existing) await ctx.storage.put("state", createDemoState());
-      else if ((existing.schemaVersion ?? 1) < 3) await ctx.storage.put("state", migrateState(existing));
+      else if ((existing.schemaVersion ?? 1) < 4) await ctx.storage.put("state", migrateState(existing));
     });
   }
 

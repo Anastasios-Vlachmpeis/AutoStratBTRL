@@ -255,7 +255,20 @@ function parameters(archetype, rng) {
   return { lookback: rng.integer(9, 24), vol_ceiling: round(rng.between(0.16, 0.42), 2), threshold: round(rng.between(0.004, 0.018), 3), position_size: size };
 }
 
-function newStrategy(state, parent = null) {
+const MAX_REWORK_ATTEMPTS = 3;
+
+function emptyRework(attempt = 0, history = []) {
+  return {
+    attempt,
+    max_attempts: MAX_REWORK_ATTEMPTS,
+    diagnosis: null,
+    source_stage: null,
+    change: null,
+    history: clone(history),
+  };
+}
+
+function newStrategy(state, parent = null, mutateParent = true) {
   const strategyId = `AX-${String(state.cycle).padStart(2, "0")}-${String(state.nextId).padStart(3, "0")}`;
   const rng = new SeededRandom(state.seed + state.nextId * 103 + state.cycle);
   state.nextId += 1;
@@ -263,7 +276,7 @@ function newStrategy(state, parent = null) {
   const asset = parent ? parent.asset : rng.pick(ASSETS);
   const params = parent ? clone(parent.params) : parameters(archetype, rng);
 
-  if (parent) {
+  if (parent && mutateParent) {
     const mutable = Object.keys(params).filter((key) => key !== "position_size");
     const key = rng.pick(mutable);
     params[key] = Number.isInteger(params[key])
@@ -284,6 +297,7 @@ function newStrategy(state, parent = null) {
     backtests: 0,
     metrics: null,
     validation: null,
+    rework: emptyRework(parent?.rework?.attempt ?? 0, parent?.rework?.history ?? []),
     monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
   };
 }
@@ -306,13 +320,130 @@ function decision(metrics) {
   return ["rework", `evidence incomplete · score ${metrics.score.toFixed(1)} · robustness ${metrics.robustness.toFixed(2)}`];
 }
 
+function diagnoseDevelopment(strategy) {
+  const metrics = strategy.metrics ?? {};
+  if ((metrics.drawdown ?? 0) > 0.18) {
+    return { code: "risk", text: "development drawdown is too close to the risk limit", key: "position_size", factor: 0.80 };
+  }
+  if ((metrics.trades ?? 0) < 18) {
+    const key = strategy.archetype === "Mean reversion" ? "entry_z"
+      : strategy.archetype === "Breakout" ? "buffer" : "threshold";
+    return { code: "frequency", text: "development produced too few independent trades", key, factor: 0.82 };
+  }
+  if ((metrics.positive_regimes ?? 0) < 3 || (metrics.robustness ?? 0) < 0.60) {
+    const key = strategy.archetype === "Momentum" ? "slow" : "lookback";
+    return { code: "robustness", text: "development performance is not broad enough across regimes", key };
+  }
+  const key = strategy.archetype === "Mean reversion" ? "entry_z"
+    : strategy.archetype === "Breakout" ? "buffer"
+      : strategy.archetype === "Momentum" ? "threshold" : "lookback";
+  return { code: "edge", text: "development edge is below the promotion threshold", key, factor: 0.88 };
+}
+
+function queueRework(strategy, sourceStage, reason) {
+  const prior = strategy.rework ?? emptyRework();
+  const diagnosis = ["development", "validation"].includes(sourceStage)
+    ? diagnoseDevelopment(strategy).text
+    : reason;
+  strategy.rework = {
+    ...prior,
+    max_attempts: MAX_REWORK_ATTEMPTS,
+    diagnosis,
+    source_stage: sourceStage,
+    change: null,
+  };
+  strategy.state = "rework";
+}
+
+function mutateDevelopmentDNA(state, parent) {
+  const attempt = (parent.rework?.attempt ?? 0) + 1;
+  const diagnosis = diagnoseDevelopment(parent);
+  const child = newStrategy(state, parent, false);
+  const before = child.params[diagnosis.key];
+  const numericId = Number(parent.id.split("-").at(-1));
+  const factor = diagnosis.factor ?? ((numericId + attempt) % 2 === 0 ? 0.84 : 1.16);
+  let after;
+  if (Number.isInteger(before)) {
+    after = Math.max(3, Math.round(before * factor));
+    if (diagnosis.key === "slow") after = Math.max(child.params.fast + 3, after);
+  } else {
+    after = round(before * factor, 4);
+    if (diagnosis.key === "position_size") after = round(clamp(after, 0.20, 1), 2);
+    else after = Math.max(0.0001, after);
+  }
+  if (after === before) after = Number.isInteger(before) ? before + 1 : round(before * 0.9, 4);
+  child.params[diagnosis.key] = after;
+  const change = { parameter: diagnosis.key, from: before, to: after };
+  const history = [
+    ...(parent.rework?.history ?? []),
+    {
+      attempt,
+      parent_id: parent.id,
+      diagnosis: diagnosis.text,
+      source_stage: parent.rework?.source_stage ?? "development",
+      change,
+      development: parent.metrics ? {
+        score: parent.metrics.score,
+        sharpe: parent.metrics.sharpe,
+        drawdown: parent.metrics.drawdown,
+        trades: parent.metrics.trades,
+        robustness: parent.metrics.robustness,
+      } : null,
+      cycle: state.cycle,
+    },
+  ];
+  child.rework = {
+    attempt,
+    max_attempts: MAX_REWORK_ATTEMPTS,
+    diagnosis: diagnosis.text,
+    source_stage: parent.rework?.source_stage ?? "development",
+    change,
+    history,
+  };
+  parent.state = "superseded";
+  parent.rework = { ...(parent.rework ?? emptyRework()), diagnosis: diagnosis.text };
+  event(state, "REWORK", `${parent.name} → ${child.name}`, `${diagnosis.text} · attempt ${attempt}/${MAX_REWORK_ATTEMPTS} · ${diagnosis.key} ${before} → ${after}`);
+  return child;
+}
+
+export function reworkCandidates(state) {
+  const created = [];
+  const waiting = state.strategies.filter((item) => item.state === "rework");
+  for (const parent of waiting) {
+    if (["capacity", "data"].includes(parent.rework?.source_stage)) continue;
+    if ((parent.rework?.attempt ?? 0) >= MAX_REWORK_ATTEMPTS) {
+      parent.state = "dropped";
+      event(state, "DROP", `${parent.name} rework exhausted`, `${MAX_REWORK_ATTEMPTS} traceable improvement attempts completed without promotion.`);
+      continue;
+    }
+    created.push(mutateDevelopmentDNA(state, parent));
+  }
+  state.strategies = [...created, ...state.strategies];
+  return created;
+}
+
+function finalizeValidationPool(state, pool) {
+  const unique = [...new Map(pool.map((strategy) => [strategy.id, strategy])).values()]
+    .sort((left, right) => right.metrics.score - left.metrics.score);
+  unique.slice(0, 3).forEach((strategy) => {
+    const wasWaiting = strategy.state === "rework";
+    strategy.state = "validation";
+    if (wasWaiting) event(state, "PROMOTE", `${strategy.name} → validation`, "Validation capacity opened; frozen DNA moved forward without retuning.");
+  });
+  unique.slice(3).forEach((strategy) => {
+    queueRework(strategy, "capacity", "waiting for an available validation slot; DNA remains frozen");
+    event(state, "REWORK", `${strategy.name} held`, "Validation cap reached; frozen DNA retained without retuning.");
+  });
+}
+
 export function reviewCandidates(state, bootstrap = false) {
-  const candidates = state.strategies.filter((item) => ["generated", "rework"].includes(item.state));
-  if (!candidates.length) {
+  reworkCandidates(state);
+  const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
+  const validationPool = state.strategies.filter((item) => item.state === "rework" && item.rework?.source_stage === "capacity");
+  if (!candidates.length && !validationPool.length) {
     if (!bootstrap) event(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
     return;
   }
-  const validationPool = [];
   for (const strategy of candidates) {
     const assetIndex = ASSETS.indexOf(strategy.asset);
     const numericId = Number(strategy.id.split("-").at(-1));
@@ -325,12 +456,10 @@ export function reviewCandidates(state, bootstrap = false) {
     const [nextState, reason] = decision(strategy.metrics);
     strategy.state = nextState;
     if (nextState === "validation") validationPool.push(strategy);
+    else if (nextState === "rework") queueRework(strategy, "development", reason);
     event(state, nextState === "validation" ? "PROMOTE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, reason);
   }
-  validationPool.sort((left, right) => right.metrics.score - left.metrics.score).slice(3).forEach((strategy) => {
-    strategy.state = "rework";
-    event(state, "REWORK", `${strategy.name} held`, "Release cap reached; retained for the next evidence cycle.");
-  });
+  finalizeValidationPool(state, validationPool);
   state.marketClock += 8;
 }
 
@@ -349,16 +478,17 @@ function marketRegimes(prices) {
 }
 
 export function reviewCandidatesWithBars(state, barsBySymbol) {
-  const candidates = state.strategies.filter((item) => ["generated", "rework"].includes(item.state));
-  if (!candidates.length) {
+  reworkCandidates(state);
+  const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
+  const validationPool = state.strategies.filter((item) => item.state === "rework" && item.rework?.source_stage === "capacity");
+  if (!candidates.length && !validationPool.length) {
     event(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
     return;
   }
-  const validationPool = [];
   for (const strategy of candidates) {
     const allPrices = (barsBySymbol[strategy.asset] ?? []).map((bar) => Number(bar.c)).filter((value) => Number.isFinite(value) && value > 0);
     if (allPrices.length < 400) {
-      strategy.state = "rework";
+      queueRework(strategy, "data", `waiting for sufficient Alpaca history (${allPrices.length}/400 bars)`);
       event(state, "REWORK", `${strategy.name} waiting for data`, `Only ${allPrices.length} Alpaca daily bars were available.`);
       continue;
     }
@@ -376,12 +506,10 @@ export function reviewCandidatesWithBars(state, barsBySymbol) {
     const [nextState, reason] = decision(strategy.metrics);
     strategy.state = nextState;
     if (nextState === "validation") validationPool.push(strategy);
+    else if (nextState === "rework") queueRework(strategy, "development", reason);
     event(state, nextState === "validation" ? "PROMOTE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, `${reason} · development data only`);
   }
-  validationPool.sort((left, right) => right.metrics.score - left.metrics.score).slice(3).forEach((strategy) => {
-    strategy.state = "rework";
-    event(state, "REWORK", `${strategy.name} held`, "Release cap reached; retained for the next evidence cycle.");
-  });
+  finalizeValidationPool(state, validationPool);
   state.marketClock += 8;
 }
 
@@ -433,6 +561,7 @@ export function validateCandidates(state, bootstrap = false) {
     strategy.validation = result;
     const [nextState, reason] = validationVerdict(strategy, result);
     strategy.state = nextState;
+    if (nextState === "rework") queueRework(strategy, "validation", reason);
     event(state, nextState === "released" ? "RELEASE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, reason);
   }
   state.marketClock += 5;
@@ -449,8 +578,7 @@ export function validateCandidatesWithBars(state, barsBySymbol) {
     const validationStart = Math.floor(allPrices.length * 0.75);
     const holdout = allPrices.slice(validationStart);
     if (holdout.length < 100) {
-      strategy.state = "rework";
-      event(state, "REWORK", `${strategy.name} validation deferred`, `Only ${holdout.length} untouched bars were available.`);
+      event(state, "VALIDATE", `${strategy.name} validation deferred`, `Only ${holdout.length} untouched bars were available; frozen DNA remains in validation.`);
       continue;
     }
     const result = backtest(strategy, holdout, marketRegimes(holdout));
@@ -458,6 +586,7 @@ export function validateCandidatesWithBars(state, barsBySymbol) {
     strategy.validation = result;
     const [nextState, reason] = validationVerdict(strategy, result);
     strategy.state = nextState;
+    if (nextState === "rework") queueRework(strategy, "validation", reason);
     event(state, nextState === "released" ? "RELEASE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, `${reason} · untouched final 25%`);
   }
   state.marketClock += 5;
@@ -609,7 +738,7 @@ export function applyAlpacaCycle(state, cycle) {
 
 export function createDemoState() {
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     seed: 20260801,
     cycle: 0,
     marketClock: 0,
@@ -622,8 +751,16 @@ export function createDemoState() {
 }
 
 export function migrateState(state) {
-  if ((state.schemaVersion ?? 1) >= 3) return state;
-  return createDemoState();
+  const version = state.schemaVersion ?? 1;
+  if (version < 3) return createDemoState();
+  if (version >= 4) return state;
+  const migrated = clone(state);
+  migrated.schemaVersion = 4;
+  migrated.strategies = (migrated.strategies ?? []).map((strategy) => ({
+    ...strategy,
+    rework: strategy.rework ?? emptyRework(),
+  }));
+  return migrated;
 }
 
 export function snapshot(state) {
@@ -640,7 +777,7 @@ export function snapshot(state) {
       cycle: state.cycle,
       clock: state.marketClock,
       environment: state.alpaca?.connected ? "ALPACA PAPER" : "PAPER SIM",
-      schema_version: state.schemaVersion ?? 3,
+      schema_version: state.schemaVersion ?? 4,
       seed: state.seed,
       last_scheduled_bucket: state.lastScheduledBucket,
     },
