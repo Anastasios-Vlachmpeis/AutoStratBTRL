@@ -477,7 +477,7 @@ function labelParam(key) {
 
 const dnaParameterBounds = {
   fast: [5, 14], slow: [17, 52], threshold: [.001, .018], lookback: [9, 38],
-  entry_z: [.75, 1.75], exit_z: [0, 1], buffer: [.0005, .006], vol_ceiling: [.16, .42],
+  entry_z: [.75, 1.75], exit_z: [0, 1], buffer: [.0005, .006], vol_ceiling: [.16, .42], position_size: [.2, 1],
 };
 
 function normalizeDNAParameter(key, value) {
@@ -826,14 +826,22 @@ let operationBusy = false;
 function resetOperationCurveChart(kind, candidateCount) {
   const chart = $("#operation-equity-chart");
   const caption = $("#operation-curve-caption");
-  const usesCurves = ["review", "validate"].includes(kind);
-  chart.hidden = !usesCurves;
-  caption.hidden = !usesCurves;
-  if (!usesCurves) {
-    chart.innerHTML = "";
-    caption.textContent = "";
+  chart.hidden = false;
+  caption.hidden = false;
+  chart.classList.remove("dragging");
+  chart.onpointerdown = null;
+  chart.onpointermove = null;
+  chart.onpointerup = null;
+  chart.onpointercancel = null;
+  chart.ondblclick = null;
+  if (kind === "generate") {
+    chart.dataset.visual = "dna";
+    chart.innerHTML = `<path class="operation-dna-await-grid" d="M58 145 L190 106 L303 148 L171 187 Z M58 145 L58 45 M58 145 L190 106 M58 145 L171 187 M58 120 L190 81 M58 95 L190 56 M58 70 L190 31"/>
+      <text class="operation-curve-wait" x="181" y="211" text-anchor="middle">ASSEMBLING ACTUAL DNA LANDSCAPE</text>`;
+    caption.textContent = "WAITING FOR GENERATED DNA";
     return;
   }
+  chart.dataset.visual = "equity";
   const grid = Array.from({ length: 5 }, (_, index) => {
     const y = 18 + index * 44;
     return `<line class="operation-curve-grid" x1="12" y1="${y}" x2="350" y2="${y}"/>`;
@@ -841,6 +849,170 @@ function resetOperationCurveChart(kind, candidateCount) {
   chart.innerHTML = `${grid}<line class="operation-curve-baseline" x1="12" y1="106" x2="350" y2="106"/>
     <text class="operation-curve-wait" x="181" y="111" text-anchor="middle">AWAITING BACKTEST OUTPUT</text>`;
   caption.textContent = `0 / ${candidateCount} ACTUAL CURVES`;
+}
+
+function landscapeParameterKeys(strategy) {
+  const keys = Object.keys(strategy.params ?? {}).filter((key) => key !== "position_size").slice(0, 3);
+  if (keys.length < 3 && "position_size" in (strategy.params ?? {})) keys.push("position_size");
+  return keys.slice(0, 3);
+}
+
+function formatLandscapeParameter(key, value) {
+  return key === "position_size" ? pct(Number(value), 0) : formatDNAParameter(key, value);
+}
+
+function landscapeSurfaceColor(level) {
+  const hue = 225 - Math.max(0, Math.min(1, level)) * 190;
+  return `hsl(${hue.toFixed(0)} 84% 57%)`;
+}
+
+function renderDNALandscapeFrame(session, result, strategy, index, total, animate = true) {
+  const chart = $("#operation-equity-chart");
+  const caption = $("#operation-curve-caption");
+  const keys = landscapeParameterKeys(strategy);
+  if (keys.length < 3) {
+    chart.innerHTML = '<text class="operation-curve-wait" x="181" y="111" text-anchor="middle">THREE DNA VARIABLES REQUIRED</text>';
+    return;
+  }
+  const comparablePool = (result.strategies ?? []).filter((item) =>
+    item.archetype === strategy.archetype
+    && keys.every((key) => Number.isFinite(Number(item.params?.[key])))
+  );
+  const comparable = [strategy, ...comparablePool.filter((item) => item.id !== strategy.id)].slice(0, 48);
+  const controls = comparable.map((item) => ({
+    strategy: item,
+    x: normalizeDNAParameter(keys[0], item.params[keys[0]]),
+    y: normalizeDNAParameter(keys[1], item.params[keys[1]]),
+    z: normalizeDNAParameter(keys[2], item.params[keys[2]]),
+  }));
+  const target = {
+    x: normalizeDNAParameter(keys[0], strategy.params[keys[0]]),
+    y: normalizeDNAParameter(keys[1], strategy.params[keys[1]]),
+    z: normalizeDNAParameter(keys[2], strategy.params[keys[2]]),
+  };
+  const surfaceAt = (x, y) => {
+    const exact = controls.find((point) => (point.x - x) ** 2 + (point.y - y) ** 2 < .000001);
+    if (exact) return exact.z;
+    let weighted = 0, weights = 0;
+    controls.forEach((point) => {
+      const distance = (point.x - x) ** 2 + (point.y - y) ** 2;
+      const weight = 1 / (distance + .012) ** 1.35;
+      weighted += point.z * weight;
+      weights += weight;
+    });
+    return weights ? weighted / weights : target.z;
+  };
+  const azimuth = (session.dnaAzimuth ?? -40) * Math.PI / 180;
+  const project = ({ x, y, z }) => {
+    const dx = x - .5, dy = y - .5;
+    const horizontal = dx * Math.cos(azimuth) - dy * Math.sin(azimuth);
+    const depth = dx * Math.sin(azimuth) + dy * Math.cos(azimuth);
+    return { x: 180 + horizontal * 170, y: 141 + depth * 56 - z * 104, depth };
+  };
+  const points = (values) => values.map((value) => {
+    const point = project(value);
+    return `${point.x.toFixed(1)},${point.y.toFixed(1)}`;
+  }).join(" ");
+  const resolution = 10;
+  const cells = [];
+  for (let row = 0; row < resolution; row += 1) {
+    for (let column = 0; column < resolution; column += 1) {
+      const x0 = column / resolution, x1 = (column + 1) / resolution;
+      const y0 = row / resolution, y1 = (row + 1) / resolution;
+      const world = [
+        { x: x0, y: y0, z: surfaceAt(x0, y0) }, { x: x1, y: y0, z: surfaceAt(x1, y0) },
+        { x: x1, y: y1, z: surfaceAt(x1, y1) }, { x: x0, y: y1, z: surfaceAt(x0, y1) },
+      ];
+      const level = world.reduce((sum, point) => sum + point.z, 0) / world.length;
+      const depth = world.reduce((sum, point) => sum + project(point).depth, 0) / world.length;
+      const delay = Math.round((row + column) * 9);
+      cells.push({ world, level, depth, delay, x0, x1, y0, y1 });
+    }
+  }
+  const floor = cells.map((cell) => `<polygon class="operation-dna-floor-cell" fill="${landscapeSurfaceColor(cell.level)}" points="${points([
+    { x: cell.x0, y: cell.y0, z: 0 }, { x: cell.x1, y: cell.y0, z: 0 },
+    { x: cell.x1, y: cell.y1, z: 0 }, { x: cell.x0, y: cell.y1, z: 0 },
+  ])}"/>`).join("");
+  const surface = cells.sort((left, right) => left.depth - right.depth).map((cell) => `<polygon class="operation-dna-surface-cell${animate ? "" : " instant"}" style="animation-delay:${cell.delay}ms" fill="${landscapeSurfaceColor(cell.level)}" points="${points(cell.world)}"/>`).join("");
+  const baseGrid = Array.from({ length: 6 }, (_, gridIndex) => {
+    const level = gridIndex / 5;
+    const xLine = [project({ x: level, y: 0, z: 0 }), project({ x: level, y: 1, z: 0 })];
+    const yLine = [project({ x: 0, y: level, z: 0 }), project({ x: 1, y: level, z: 0 })];
+    return `<line class="operation-dna-grid" x1="${xLine[0].x.toFixed(1)}" y1="${xLine[0].y.toFixed(1)}" x2="${xLine[1].x.toFixed(1)}" y2="${xLine[1].y.toFixed(1)}"/><line class="operation-dna-grid" x1="${yLine[0].x.toFixed(1)}" y1="${yLine[0].y.toFixed(1)}" x2="${yLine[1].x.toFixed(1)}" y2="${yLine[1].y.toFixed(1)}"/>`;
+  }).join("");
+  const origin = project({ x: 0, y: 0, z: 0 });
+  const xEnd = project({ x: 1.12, y: 0, z: 0 });
+  const yEnd = project({ x: 0, y: 1.12, z: 0 });
+  const zEnd = project({ x: 0, y: 0, z: 1.08 });
+  const axis = (end, axisIndex) => `<line class="operation-dna-axis axis-${axisIndex}" x1="${origin.x.toFixed(1)}" y1="${origin.y.toFixed(1)}" x2="${end.x.toFixed(1)}" y2="${end.y.toFixed(1)}"/>`;
+  const walls = `<polygon class="operation-dna-wall" points="${points([{ x: 0, y: 0, z: 0 }, { x: 1, y: 0, z: 0 }, { x: 1, y: 0, z: 1 }, { x: 0, y: 0, z: 1 }])}"/><polygon class="operation-dna-wall" points="${points([{ x: 0, y: 0, z: 0 }, { x: 0, y: 1, z: 0 }, { x: 0, y: 1, z: 1 }, { x: 0, y: 0, z: 1 }])}"/>`;
+  const controlDots = controls.slice(0, 24).map((control) => {
+    const point = project(control);
+    return `<circle class="operation-dna-control" cx="${point.x.toFixed(1)}" cy="${point.y.toFixed(1)}" r="1.8"><title>${escapeHtml(control.strategy.name)}</title></circle>`;
+  }).join("");
+  const marker = project(target);
+  const markerFloor = project({ ...target, z: 0 });
+  const instant = animate ? "" : " instant";
+  chart.innerHTML = `${walls}${floor}${baseGrid}${surface}${controlDots}
+    ${axis(xEnd, 0)}${axis(yEnd, 1)}${axis(zEnd, 2)}
+    <line class="operation-dna-marker-stem${instant}" x1="${markerFloor.x.toFixed(1)}" y1="${markerFloor.y.toFixed(1)}" x2="${marker.x.toFixed(1)}" y2="${marker.y.toFixed(1)}"/>
+    <circle class="operation-dna-marker-halo${instant}" cx="${marker.x.toFixed(1)}" cy="${marker.y.toFixed(1)}" r="9"/><circle class="operation-dna-marker${instant}" cx="${marker.x.toFixed(1)}" cy="${marker.y.toFixed(1)}" r="4"><title>${escapeHtml(strategy.name)}</title></circle>
+    <text class="operation-dna-axis-label axis-0" x="${(xEnd.x + 4).toFixed(1)}" y="${(xEnd.y + 5).toFixed(1)}">${escapeHtml(labelParam(keys[0]).toUpperCase())}</text>
+    <text class="operation-dna-axis-label axis-1" x="${(yEnd.x + 4).toFixed(1)}" y="${(yEnd.y + 5).toFixed(1)}">${escapeHtml(labelParam(keys[1]).toUpperCase())}</text>
+    <text class="operation-dna-axis-label axis-2" x="${(zEnd.x + 4).toFixed(1)}" y="${(zEnd.y - 3).toFixed(1)}">${escapeHtml(labelParam(keys[2]).toUpperCase())}</text>`;
+  caption.textContent = `${index + 1} / ${total} · ${strategy.name} · ${strategy.archetype}`;
+  $("#operation-description").textContent = `${strategy.asset} · ${keys.map((key) => `${labelParam(key)} ${formatLandscapeParameter(key, strategy.params[key])}`).join(" · ")}`;
+}
+
+function renderOperationDNA(session, result) {
+  if (session.kind !== "generate") return 0;
+  const previousIds = new Set(session.strategyIds);
+  const generated = (result.strategies ?? []).filter((strategy) => !previousIds.has(strategy.id)).slice(0, 12);
+  const chart = $("#operation-equity-chart");
+  if (!generated.length) {
+    chart.innerHTML = '<text class="operation-curve-wait" x="181" y="111" text-anchor="middle">NO NEW DNA PRODUCED</text>';
+    $("#operation-curve-caption").textContent = "0 ACTUAL STRATEGIES";
+    return 0;
+  }
+  session.dnaAzimuth = -40;
+  session.dnaIndex = 0;
+  const show = (index, animate = true) => {
+    session.dnaIndex = index;
+    renderDNALandscapeFrame(session, result, generated[index], index, generated.length, animate);
+  };
+  show(0);
+  if (generated.length > 1) {
+    session.dnaTimer = setInterval(() => {
+      if (session.dnaIndex >= generated.length - 1) {
+        clearInterval(session.dnaTimer);
+        session.dnaTimer = null;
+        return;
+      }
+      show(session.dnaIndex + 1);
+    }, 520);
+  }
+  let dragging = false, previousX = 0;
+  chart.onpointerdown = (event) => {
+    dragging = true;
+    previousX = event.clientX;
+    chart.classList.add("dragging");
+    chart.setPointerCapture(event.pointerId);
+  };
+  chart.onpointermove = (event) => {
+    if (!dragging) return;
+    session.dnaAzimuth += (event.clientX - previousX) * .55;
+    previousX = event.clientX;
+    show(session.dnaIndex, false);
+  };
+  const stop = (event) => {
+    dragging = false;
+    chart.classList.remove("dragging");
+    if (chart.hasPointerCapture(event.pointerId)) chart.releasePointerCapture(event.pointerId);
+  };
+  chart.onpointerup = stop;
+  chart.onpointercancel = stop;
+  chart.ondblclick = () => { session.dnaAzimuth = -40; show(session.dnaIndex, false); };
+  return generated.length;
 }
 
 function renderOperationCurves(session, result) {
@@ -959,6 +1131,7 @@ function beginOperation(kind, detail, strategyIds = []) {
 
 async function finishOperation(session, succeeded) {
   clearInterval(session.timer);
+  if (session.dnaTimer) clearInterval(session.dnaTimer);
   const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   if (succeeded) {
     $$("#operation-steps .operation-step").forEach((step) => {
@@ -984,6 +1157,12 @@ async function finishOperation(session, succeeded) {
   session.overlay.classList.remove("visible");
   await wait(reducedMotion ? 10 : 230);
   session.overlay.hidden = true;
+  const operationChart = $("#operation-equity-chart");
+  operationChart.onpointerdown = null;
+  operationChart.onpointermove = null;
+  operationChart.onpointerup = null;
+  operationChart.onpointercancel = null;
+  operationChart.ondblclick = null;
   document.body.classList.remove(`operation-${session.kind}`);
   session.button.removeAttribute("aria-busy");
   session.button.focus({ preventScroll: true });
@@ -1005,9 +1184,11 @@ async function animatedAction(kind, path, payload, successMessage, detail, strat
   try {
     const minimumDuration = wait(reducedMotion ? 180 : session.config.duration);
     const result = await api(path, payload);
-    const curveCount = renderOperationCurves(session, result);
-    const curveDuration = curveCount ? wait(reducedMotion ? 20 : 1050 + Math.min(curveCount, 12) * 65) : Promise.resolve();
-    await Promise.all([minimumDuration, curveDuration]);
+    const visualCount = session.kind === "generate" ? renderOperationDNA(session, result) : renderOperationCurves(session, result);
+    const visualDuration = visualCount
+      ? wait(reducedMotion ? 20 : session.kind === "generate" ? 700 + visualCount * 520 : 1050 + Math.min(visualCount, 12) * 65)
+      : Promise.resolve();
+    await Promise.all([minimumDuration, visualDuration]);
     await finishOperation(session, true);
     triggerOperationReveal(kind);
     showToast(successMessage);
@@ -1020,7 +1201,8 @@ async function animatedAction(kind, path, payload, successMessage, detail, strat
 
 $("#generate-button").addEventListener("click", () => {
   const count = Number($("#cohort-size").value);
-  animatedAction("generate", "/api/generate", { count }, `${count} new strategy DNA${count === 1 ? "" : "s"} seeded.`, `${count} NEW GENOME${count === 1 ? "" : "S"}`);
+  const existingIds = state.strategies.map((strategy) => strategy.id);
+  animatedAction("generate", "/api/generate", { count }, `${count} new strategy DNA${count === 1 ? "" : "s"} seeded.`, `${count} NEW GENOME${count === 1 ? "" : "S"}`, existingIds);
 });
 $("#review-button").addEventListener("click", () => {
   const candidates = state.strategies.filter((strategy) => ["generated", "rework"].includes(strategy.state));
