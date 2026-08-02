@@ -283,6 +283,7 @@ function newStrategy(state, parent = null) {
     parent: parent?.id ?? null,
     backtests: 0,
     metrics: null,
+    validation: null,
     monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
   };
 }
@@ -300,7 +301,7 @@ function decision(metrics) {
   const release = metrics.score >= 61 && metrics.sharpe >= 0.55 && metrics.annualized >= 0.04
     && metrics.drawdown <= 0.20 && metrics.profit_factor >= 1.02
     && metrics.trades >= 18 && metrics.positive_regimes >= 3;
-  if (release) return ["released", `score ${metrics.score.toFixed(1)} · Sharpe ${metrics.sharpe.toFixed(2)} · ${metrics.positive_regimes}/4 regimes`];
+  if (release) return ["validation", `score ${metrics.score.toFixed(1)} · Sharpe ${metrics.sharpe.toFixed(2)} · ${metrics.positive_regimes}/4 regimes`];
   if (hardFail || metrics.score < 48) return ["dropped", `hard gate failed · DD ${(metrics.drawdown * 100).toFixed(1)}% · ${metrics.trades.toFixed(0)} trades`];
   return ["rework", `evidence incomplete · score ${metrics.score.toFixed(1)} · robustness ${metrics.robustness.toFixed(2)}`];
 }
@@ -311,7 +312,7 @@ export function reviewCandidates(state, bootstrap = false) {
     if (!bootstrap) event(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
     return;
   }
-  const releasePool = [];
+  const validationPool = [];
   for (const strategy of candidates) {
     const assetIndex = ASSETS.indexOf(strategy.asset);
     const numericId = Number(strategy.id.split("-").at(-1));
@@ -323,10 +324,10 @@ export function reviewCandidates(state, bootstrap = false) {
     strategy.metrics = aggregateResults(results);
     const [nextState, reason] = decision(strategy.metrics);
     strategy.state = nextState;
-    if (nextState === "released") releasePool.push(strategy);
-    event(state, nextState === "released" ? "PROMOTE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, reason);
+    if (nextState === "validation") validationPool.push(strategy);
+    event(state, nextState === "validation" ? "PROMOTE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, reason);
   }
-  releasePool.sort((left, right) => right.metrics.score - left.metrics.score).slice(3).forEach((strategy) => {
+  validationPool.sort((left, right) => right.metrics.score - left.metrics.score).slice(3).forEach((strategy) => {
     strategy.state = "rework";
     event(state, "REWORK", `${strategy.name} held`, "Release cap reached; retained for the next evidence cycle.");
   });
@@ -353,33 +354,113 @@ export function reviewCandidatesWithBars(state, barsBySymbol) {
     event(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
     return;
   }
-  const releasePool = [];
+  const validationPool = [];
   for (const strategy of candidates) {
     const allPrices = (barsBySymbol[strategy.asset] ?? []).map((bar) => Number(bar.c)).filter((value) => Number.isFinite(value) && value > 0);
-    if (allPrices.length < 180) {
+    if (allPrices.length < 400) {
       strategy.state = "rework";
       event(state, "REWORK", `${strategy.name} waiting for data`, `Only ${allPrices.length} Alpaca daily bars were available.`);
       continue;
     }
     const prices = allPrices.slice(-600);
-    const windowSize = Math.max(160, Math.floor(prices.length * 0.65));
-    const ends = [Math.floor(prices.length * 0.80), Math.floor(prices.length * 0.90), prices.length];
+    const developmentEnd = Math.floor(prices.length * 0.75);
+    const development = prices.slice(0, developmentEnd);
+    const windowSize = Math.max(140, Math.floor(development.length * 0.68));
+    const ends = [Math.floor(development.length * 0.80), Math.floor(development.length * 0.90), development.length];
     const results = ends.map((end) => {
-      const windowPrices = prices.slice(Math.max(0, end - windowSize), end);
+      const windowPrices = development.slice(Math.max(0, end - windowSize), end);
       return backtest(strategy, windowPrices, marketRegimes(windowPrices));
     });
     strategy.backtests += results.length;
     strategy.metrics = aggregateResults(results);
     const [nextState, reason] = decision(strategy.metrics);
     strategy.state = nextState;
-    if (nextState === "released") releasePool.push(strategy);
-    event(state, nextState === "released" ? "PROMOTE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, `${reason} · Alpaca IEX data`);
+    if (nextState === "validation") validationPool.push(strategy);
+    event(state, nextState === "validation" ? "PROMOTE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, `${reason} · development data only`);
   }
-  releasePool.sort((left, right) => right.metrics.score - left.metrics.score).slice(3).forEach((strategy) => {
+  validationPool.sort((left, right) => right.metrics.score - left.metrics.score).slice(3).forEach((strategy) => {
     strategy.state = "rework";
     event(state, "REWORK", `${strategy.name} held`, "Release cap reached; retained for the next evidence cycle.");
   });
   state.marketClock += 8;
+}
+
+function validationVerdict(strategy, result) {
+  const development = strategy.metrics;
+  const sharpeRetention = result.sharpe / Math.max(development.sharpe, 0.30);
+  result.score = round(clamp(
+    50
+      + 20 * clamp(result.sharpe / 2, -1, 1)
+      + 15 * clamp(result.return / 0.10, -1, 1)
+      + 10 * clamp((0.15 - result.drawdown) / 0.15, -1, 1)
+      + 5 * clamp(result.profit_factor - 1, -1, 1),
+    0, 100,
+  ), 1);
+  result.robustness = round(clamp(
+    0.50 + 0.25 * clamp(sharpeRetention, -1, 1) + 0.15 * clamp((0.15 - result.drawdown) / 0.15, -1, 1),
+    0, 1,
+  ), 3);
+  result.sharpe_retention = round(sharpeRetention, 3);
+  result.overfit_warning = sharpeRetention < 0.40 || result.drawdown > development.drawdown * 1.50;
+
+  const hardFailure = result.return <= 0 || result.sharpe <= 0 || result.profit_factor < 0.90
+    || result.drawdown > 0.20 || result.trades < 4;
+  const requiredTrades = Math.max(4, Math.ceil(development.trades * 0.20));
+  const requiredSharpe = Math.max(0.30, development.sharpe * 0.35);
+  const requiredProfitFactor = 0.90;
+  const drawdownLimit = Math.min(0.20, Math.max(0.12, development.drawdown * 1.50, development.drawdown + 0.025));
+  const passes = !hardFailure && !result.overfit_warning
+    && result.trades >= requiredTrades && result.sharpe >= requiredSharpe
+    && result.profit_factor >= requiredProfitFactor && result.drawdown <= drawdownLimit
+    && result.score >= development.score * 0.55 && result.robustness >= 0.45;
+  if (passes) return ["released", `unseen Sharpe ${result.sharpe.toFixed(2)} · ${(result.return * 100).toFixed(1)}% return · ${result.trades} trades`];
+  if (hardFailure) return ["dropped", `unseen data failed hard gate · Sharpe ${result.sharpe.toFixed(2)} · DD ${(result.drawdown * 100).toFixed(1)}%`];
+  return ["rework", `unseen evidence did not generalize · Sharpe retention ${(sharpeRetention * 100).toFixed(0)}%`];
+}
+
+export function validateCandidates(state, bootstrap = false) {
+  const candidates = state.strategies.filter((item) => item.state === "validation");
+  if (!candidates.length) {
+    if (!bootstrap) event(state, "VALIDATE", "No strategies awaiting validation", "Supervisor approval is required before holdout testing.");
+    return;
+  }
+  for (const strategy of candidates) {
+    const assetIndex = ASSETS.indexOf(strategy.asset);
+    const numericId = Number(strategy.id.split("-").at(-1));
+    const unseen = marketSeries(state.seed + 10007 + numericId, 420, assetIndex);
+    const result = backtest(strategy, unseen.prices, unseen.labels);
+    strategy.backtests += 1;
+    strategy.validation = result;
+    const [nextState, reason] = validationVerdict(strategy, result);
+    strategy.state = nextState;
+    event(state, nextState === "released" ? "RELEASE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, reason);
+  }
+  state.marketClock += 5;
+}
+
+export function validateCandidatesWithBars(state, barsBySymbol) {
+  const candidates = state.strategies.filter((item) => item.state === "validation");
+  if (!candidates.length) {
+    event(state, "VALIDATE", "No strategies awaiting validation", "Supervisor approval is required before holdout testing.");
+    return;
+  }
+  for (const strategy of candidates) {
+    const allPrices = (barsBySymbol[strategy.asset] ?? []).map((bar) => Number(bar.c)).filter((value) => Number.isFinite(value) && value > 0).slice(-600);
+    const validationStart = Math.floor(allPrices.length * 0.75);
+    const holdout = allPrices.slice(validationStart);
+    if (holdout.length < 100) {
+      strategy.state = "rework";
+      event(state, "REWORK", `${strategy.name} validation deferred`, `Only ${holdout.length} untouched bars were available.`);
+      continue;
+    }
+    const result = backtest(strategy, holdout, marketRegimes(holdout));
+    strategy.backtests += 1;
+    strategy.validation = result;
+    const [nextState, reason] = validationVerdict(strategy, result);
+    strategy.state = nextState;
+    event(state, nextState === "released" ? "RELEASE" : nextState === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${nextState}`, `${reason} · untouched final 25%`);
+  }
+  state.marketClock += 5;
 }
 
 export function reproduce(state, strategyId) {
@@ -528,6 +609,7 @@ export function applyAlpacaCycle(state, cycle) {
 
 export function createDemoState() {
   const state = {
+    schemaVersion: 2,
     seed: 20260801,
     cycle: 14,
     marketClock: 126,
@@ -539,8 +621,24 @@ export function createDemoState() {
   };
   generateBatch(state, 8, true);
   reviewCandidates(state, true);
+  validateCandidates(state, true);
   advanceMarket(state, 2, true);
   event(state, "SYSTEM", "Foundry restored", "Durable paper environment is online.");
+  return state;
+}
+
+export function migrateState(state) {
+  if ((state.schemaVersion ?? 1) >= 2) return state;
+  let moved = 0;
+  for (const strategy of state.strategies ?? []) {
+    if (strategy.validation === undefined) strategy.validation = null;
+    if (ACTIVE_STATES.has(strategy.state) && !strategy.validation) {
+      strategy.state = "validation";
+      moved += 1;
+    }
+  }
+  state.schemaVersion = 2;
+  if (moved) event(state, "VALIDATE", "Validation gate migration applied", `${moved} previously released strategies now require untouched-data validation.`);
   return state;
 }
 
@@ -558,12 +656,14 @@ export function snapshot(state) {
       cycle: state.cycle,
       clock: state.marketClock,
       environment: state.alpaca?.connected ? "ALPACA PAPER" : "PAPER SIM",
+      schema_version: state.schemaVersion ?? 2,
       seed: state.seed,
       last_scheduled_bucket: state.lastScheduledBucket,
     },
     summary: {
       generated: strategies.filter((item) => item.state === "generated").length,
       testing: strategies.filter((item) => item.state === "rework").length,
+      validation: strategies.filter((item) => item.state === "validation").length,
       released: released.length,
       dropped: strategies.filter((item) => item.state === "dropped").length,
       average_score: round(averageScore, 1),
@@ -572,6 +672,9 @@ export function snapshot(state) {
     strategies,
     events: clone(state.events),
     alpaca: clone(state.alpaca ?? { connected: false }),
-    policy: { release_score: 61, min_sharpe: 0.55, max_drawdown: 0.20, monitor_window: 21 },
+    policy: {
+      release_score: 61, min_sharpe: 0.55, max_drawdown: 0.20,
+      validation_min_sharpe: 0.30, validation_max_drawdown: 0.20, monitor_window: 21,
+    },
   };
 }

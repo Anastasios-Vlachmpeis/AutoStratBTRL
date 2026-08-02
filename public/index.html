@@ -47,6 +47,7 @@
           <div class="command-actions">
             <button class="button secondary" id="generate-button"><span>＋</span> Seed cohort</button>
             <button class="button secondary" id="review-button"><span>⌁</span> Run supervisor</button>
+            <button class="button secondary" id="validate-button"><span>◈</span> Validate holdout</button>
             <button class="button secondary" id="advance-button"><span>▷</span> Advance simulation</button>
             <button class="button primary" id="sync-button"><span>↯</span> Sync Alpaca</button>
           </div>
@@ -64,12 +65,17 @@
           </article>
           <div class="pipeline-link"><span></span></div>
           <article class="pipeline-step">
-            <div class="step-index green">03</div><div><span>IN MARKET</span><strong id="count-released">0</strong></div>
+            <div class="step-index violet">03</div><div><span>VALIDATION</span><strong id="count-validation">0</strong></div>
+            <small>unseen 25%</small>
+          </article>
+          <div class="pipeline-link"><span></span></div>
+          <article class="pipeline-step">
+            <div class="step-index green">04</div><div><span>IN MARKET</span><strong id="count-released">0</strong></div>
             <small>paper live</small>
           </article>
           <div class="pipeline-link"><span></span></div>
           <article class="pipeline-step">
-            <div class="step-index muted">04</div><div><span>RETIRED</span><strong id="count-dropped">0</strong></div>
+            <div class="step-index muted">05</div><div><span>RETIRED</span><strong id="count-dropped">0</strong></div>
             <small>evidence failed</small>
           </article>
         </section>

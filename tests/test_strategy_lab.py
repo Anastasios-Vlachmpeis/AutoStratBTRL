@@ -10,7 +10,7 @@ class StrategyLabTests(unittest.TestCase):
         second = StrategyLab().snapshot()
         self.assertEqual(first, second)
         self.assertGreaterEqual(first["summary"]["released"], 1)
-        self.assertTrue(all(item["backtests"] == 3 for item in first["strategies"]))
+        self.assertTrue(all(item["backtests"] >= 3 for item in first["strategies"]))
 
     def test_generated_cohort_waits_for_review(self):
         lab = StrategyLab()
@@ -54,6 +54,16 @@ class StrategyLabTests(unittest.TestCase):
         for item in active_before:
             self.assertGreaterEqual(len(by_id[item["id"]]["monitor"]["returns"]), 21)
             self.assertIsNotNone(by_id[item["id"]]["monitor"]["sharpe"])
+
+    def test_supervisor_approval_requires_validation_before_release(self):
+        lab = StrategyLab()
+        lab.generate_batch(12)
+        lab.review_candidates()
+        approved = [item for item in lab.snapshot()["strategies"] if item["state"] == "validation"]
+        self.assertTrue(approved)
+        self.assertTrue(all(item["validation"] is None for item in approved))
+        lab.validate_candidates()
+        self.assertFalse(any(item["state"] == "validation" for item in lab.snapshot()["strategies"]))
 
 
 if __name__ == "__main__":

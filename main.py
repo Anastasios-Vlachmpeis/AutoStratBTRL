@@ -69,6 +69,8 @@ class AxiomHandler(BaseHTTPRequestHandler):
                 self.lab.generate_batch(max(1, min(int(payload.get("count", 6)), 12)))
             elif route == "/api/review":
                 self.lab.review_candidates()
+            elif route == "/api/validate":
+                self.lab.validate_candidates()
             elif route == "/api/advance":
                 self.lab.advance_market(max(1, min(int(payload.get("periods", 1)), 4)))
             elif route == "/api/reproduce":

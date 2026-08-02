@@ -4,10 +4,13 @@ import {
   advanceMarket,
   createDemoState,
   generateBatch,
+  migrateState,
   reproduce,
   reviewCandidates,
   reviewCandidatesWithBars,
   snapshot,
+  validateCandidates,
+  validateCandidatesWithBars,
 } from "./engine.js";
 import { buildPaperCycle, getResearchBars } from "./alpaca.js";
 
@@ -56,6 +59,19 @@ async function reviewWithAlpaca(env, stub) {
   }));
 }
 
+async function validateWithAlpaca(env, stub) {
+  const appState = await stateFrom(stub);
+  const symbols = [...new Set(appState.strategies
+    .filter((strategy) => strategy.state === "validation")
+    .map((strategy) => strategy.asset))];
+  const bars = await getResearchBars(env, symbols);
+  return stub.fetch(new Request("https://axiom.internal/internal/validate-live", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bars }),
+  }));
+}
+
 export class AxiomLab extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
@@ -63,6 +79,7 @@ export class AxiomLab extends DurableObject {
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const existing = await ctx.storage.get("state");
       if (!existing) await ctx.storage.put("state", createDemoState());
+      else if ((existing.schemaVersion ?? 1) < 2) await ctx.storage.put("state", migrateState(existing));
     });
   }
 
@@ -92,6 +109,10 @@ export class AxiomLab extends DurableObject {
         reviewCandidates(state);
         return this.save(state);
       }
+      if (request.method === "POST" && url.pathname === "/api/validate") {
+        validateCandidates(state);
+        return this.save(state);
+      }
       if (request.method === "POST" && url.pathname === "/api/advance") {
         const body = await request.json();
         advanceMarket(state, Math.max(1, Math.min(Number(body.periods ?? 1), 4)));
@@ -108,6 +129,11 @@ export class AxiomLab extends DurableObject {
       if (request.method === "POST" && url.pathname === "/internal/review-live") {
         const body = await request.json();
         reviewCandidatesWithBars(state, body.bars ?? {});
+        return this.save(state);
+      }
+      if (request.method === "POST" && url.pathname === "/internal/validate-live") {
+        const body = await request.json();
+        validateCandidatesWithBars(state, body.bars ?? {});
         return this.save(state);
       }
       if (request.method === "POST" && url.pathname === "/internal/alpaca-cycle") {
@@ -146,6 +172,9 @@ export default {
         }
         if (request.method === "POST" && url.pathname === "/api/review") {
           return await reviewWithAlpaca(env, stub);
+        }
+        if (request.method === "POST" && url.pathname === "/api/validate") {
+          return await validateWithAlpaca(env, stub);
         }
         return stub.fetch(request);
       } catch (error) {

@@ -114,12 +114,13 @@ Cloudflare and local Python states are intentionally separate. Resetting or runn
 ## Lifecycle
 
 1. **Seed cohort** creates new strategy DNA across momentum, mean-reversion, breakout, and volatility-filter archetypes.
-2. **Run supervisor** evaluates every waiting strategy across three deterministic, four-regime backtests.
-3. Candidates are released, sent to rework, or dropped through explicit score, Sharpe, drawdown, trade-count, and regime gates.
-4. **Advance 21 sessions** runs a paper-monitor window. Weak strategies enter watch, have risk reduced after repeated weakness, and are retired if degradation persists.
-5. **Reproduce DNA** makes a traceable, mutated child from a released strategy.
+2. **Run supervisor** evaluates each waiting strategy on the first 75% of its chronological research data. The final quarter is excluded from every development calculation.
+3. Strong candidates enter **Validation**. Parameters are frozen, then **Validate holdout** runs one final backtest on the untouched 25%.
+4. Validation releases strategies only when unseen return, Sharpe, trade count, drawdown, robustness, and degradation gates pass. Failures return to rework or are dropped.
+5. Hourly Alpaca monitoring moves released strategies through healthy, watch, adjusted, and retired states.
+6. **Reproduce DNA** makes a traceable, mutated child from a released strategy; the child must pass both supervision and validation.
 
-All prices and monitoring returns are synthetic. There is no live-broker integration or real order routing.
+The local Python server uses deterministic synthetic data. The Cloudflare Worker uses Alpaca IEX market data and can route guarded paper orders only when explicitly enabled. It never connects to Alpaca's live-money endpoint.
 
 ## Tests
 

@@ -8,7 +8,7 @@ let toastTimer = null;
 let adminToken = sessionStorage.getItem("axiom-admin-token") || "";
 
 const statusLabels = {
-  generated: "Generated", rework: "Rework", released: "Released", healthy: "Healthy",
+  generated: "Generated", rework: "Rework", validation: "Validation", released: "Released", healthy: "Healthy",
   watch: "Watch", adjusted: "Adjusted", dropped: "Dropped"
 };
 
@@ -61,7 +61,7 @@ async function api(path, body = null, allowAuthRetry = true) {
 
 function filteredStrategies() {
   if (!state) return [];
-  if (activeView === "testing") return state.strategies.filter((item) => ["generated", "rework"].includes(item.state));
+  if (activeView === "testing") return state.strategies.filter((item) => ["generated", "rework", "validation"].includes(item.state));
   if (activeView === "released") return state.strategies.filter((item) => ["released", "healthy", "watch", "adjusted"].includes(item.state));
   if (activeView === "lineage") return state.strategies.filter((item) => item.parent || item.generation > 1);
   return state.strategies;
@@ -89,6 +89,7 @@ function renderSummary() {
   $("#seed-value").textContent = state.meta.seed;
   $("#count-generated").textContent = String(state.summary.generated).padStart(2, "0");
   $("#count-testing").textContent = String(state.summary.testing).padStart(2, "0");
+  $("#count-validation").textContent = String(state.summary.validation || 0).padStart(2, "0");
   $("#count-released").textContent = String(state.summary.released).padStart(2, "0");
   $("#count-dropped").textContent = String(state.summary.dropped).padStart(2, "0");
   $("#average-score").textContent = number(state.summary.average_score, 1);
@@ -137,9 +138,9 @@ function renderSelected() {
   $("#metric-row").innerHTML = [
     metric("SUPERVISOR SCORE", metrics ? number(metrics.score, 1) : "PENDING", metrics?.score >= 61 ? "positive" : ""),
     metric("ANNUALIZED", metrics ? signedPct(metrics.annualized) : "—", metrics?.annualized >= 0 ? "positive" : "negative"),
-    metric("SHARPE", metrics ? number(metrics.sharpe) : "—", metrics?.sharpe >= .55 ? "positive" : ""),
+    metric("DEV SHARPE", metrics ? number(metrics.sharpe) : "—", metrics?.sharpe >= .55 ? "positive" : ""),
+    metric("UNSEEN SHARPE", strategy.validation ? number(strategy.validation.sharpe) : "PENDING", strategy.validation?.sharpe >= .30 ? "positive" : ""),
     metric("MAX DRAWDOWN", metrics ? pct(metrics.drawdown) : "—", metrics?.drawdown > .2 ? "negative" : ""),
-    metric("ROBUSTNESS", metrics ? number(metrics.robustness) : "—")
   ].join("");
   renderChart(strategy);
   renderDNA(strategy);
@@ -179,9 +180,10 @@ function renderGates(strategy) {
   const m = strategy.metrics;
   const gates = [
     ["Supervisor score", state.policy.release_score, m?.score, (v, t) => v >= t, (v) => number(v, 1)],
-    ["Sharpe ratio", state.policy.min_sharpe, m?.sharpe, (v, t) => v >= t, (v) => number(v, 2)],
-    ["Maximum drawdown", state.policy.max_drawdown, m?.drawdown, (v, t) => v <= t, (v) => pct(v)],
-    ["Positive regimes", 3, m?.positive_regimes, (v, t) => v >= t, (v) => `${v} / 4`]
+    ["Development Sharpe", state.policy.min_sharpe, m?.sharpe, (v, t) => v >= t, (v) => number(v, 2)],
+    ["Unseen return", 0, strategy.validation?.return, (v, t) => v > t, (v) => signedPct(v)],
+    ["Unseen Sharpe", state.policy.validation_min_sharpe || .30, strategy.validation?.sharpe, (v, t) => v >= t, (v) => number(v, 2)],
+    ["Unseen drawdown", state.policy.validation_max_drawdown || .20, strategy.validation?.drawdown, (v, t) => v <= t, (v) => pct(v)]
   ];
   $("#gate-content").innerHTML = gates.map(([label, threshold, value, test, format]) => {
     const known = value != null, pass = known && test(value, threshold);
@@ -204,7 +206,7 @@ function renderTable() {
       <td class="unit-cell"><strong>${escapeHtml(strategy.name)}</strong><span>${escapeHtml(strategy.id)}${strategy.parent ? ` · CHILD OF ${escapeHtml(strategy.parent)}` : ""}</span></td>
       <td class="archetype-cell"><strong>${escapeHtml(strategy.archetype)}</strong><span>${escapeHtml(strategy.asset)}</span></td>
       <td><span class="status-badge ${strategy.state}">${escapeHtml(statusLabels[strategy.state] || strategy.state)}</span></td>
-      <td>${strategy.backtests ? `${strategy.backtests} backtests` : "not tested"}</td><td>${m ? number(m.sharpe) : "—"}</td><td>${m ? pct(m.drawdown) : "—"}</td>
+      <td>${strategy.backtests ? `${Math.min(strategy.backtests, 3)} dev${strategy.validation ? " · 1 unseen" : ""}` : "not tested"}</td><td>${m ? number(m.sharpe) : "—"}</td><td>${m ? pct(m.drawdown) : "—"}</td>
       <td class="score-cell">${m ? number(m.score, 1) : "—"}${m ? `<div class="score-bar"><i style="width:${Math.min(m.score, 100)}%"></i></div>` : ""}</td><td class="row-arrow">›</td></tr>`;
   }).join("");
   $$("#strategy-table tr").forEach((row) => row.addEventListener("click", () => {
@@ -230,6 +232,7 @@ async function action(path, payload, successMessage) {
 
 $("#generate-button").addEventListener("click", () => action("/api/generate", { count: 6 }, "Six new strategy DNAs seeded."));
 $("#review-button").addEventListener("click", () => action("/api/review", {}, "Supervisor review cycle complete."));
+$("#validate-button").addEventListener("click", () => action("/api/validate", {}, "Untouched holdout validation complete."));
 $("#advance-button").addEventListener("click", () => action("/api/advance", { periods: 1 }, "Paper market advanced by 21 sessions."));
 $("#sync-button").addEventListener("click", () => action("/api/alpaca/sync", {}, "Alpaca account and market data synchronized."));
 $("#reproduce-button").addEventListener("click", async () => {

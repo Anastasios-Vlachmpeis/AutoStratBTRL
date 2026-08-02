@@ -203,6 +203,7 @@ class StrategyLab:
             self.events: list[dict[str, str]] = []
             self.generate_batch(8, bootstrap=True)
             self.review_candidates(bootstrap=True)
+            self.validate_candidates(bootstrap=True)
             self.advance_market(2, bootstrap=True)
             self._event("SYSTEM", "Foundry restored", "Deterministic paper environment is online.")
 
@@ -241,7 +242,7 @@ class StrategyLab:
         return {
             "id": strategy_id, "name": name, "archetype": archetype, "asset": asset,
             "params": params, "state": "generated", "generation": 1 if not parent else parent["generation"] + 1,
-            "parent": parent["id"] if parent else None, "backtests": 0, "metrics": None,
+            "parent": parent["id"] if parent else None, "backtests": 0, "metrics": None, "validation": None,
             "monitor": {"returns": [], "streak": 0, "adjustments": 0, "sharpe": None, "drawdown": None, "ratio": None},
         }
 
@@ -262,7 +263,7 @@ class StrategyLab:
             and metrics["trades"] >= 18 and metrics["positive_regimes"] >= 3
         )
         if release:
-            return "released", f"score {metrics['score']:.1f} · Sharpe {metrics['sharpe']:.2f} · {metrics['positive_regimes']}/4 regimes"
+            return "validation", f"score {metrics['score']:.1f} · Sharpe {metrics['sharpe']:.2f} · {metrics['positive_regimes']}/4 regimes"
         if hard_fail or metrics["score"] < 48:
             return "dropped", f"hard gate failed · DD {metrics['drawdown'] * 100:.1f}% · {metrics['trades']:.0f} trades"
         return "rework", f"evidence incomplete · score {metrics['score']:.1f} · robustness {metrics['robustness']:.2f}"
@@ -274,7 +275,7 @@ class StrategyLab:
                 if not bootstrap:
                     self._event("REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.")
                 return
-            release_pool: list[dict[str, Any]] = []
+            validation_pool: list[dict[str, Any]] = []
             for strategy in candidates:
                 asset_index = ASSETS.index(strategy["asset"])
                 results = []
@@ -285,13 +286,59 @@ class StrategyLab:
                 strategy["metrics"] = aggregate_results(results)
                 state, reason = self._decision(strategy["metrics"])
                 strategy["state"] = state
-                if state == "released":
-                    release_pool.append(strategy)
-                self._event("PROMOTE" if state == "released" else "DROP" if state == "dropped" else "REWORK", f"{strategy['name']} → {state}", reason)
-            for strategy in sorted(release_pool, key=lambda item: item["metrics"]["score"], reverse=True)[3:]:
+                if state == "validation":
+                    validation_pool.append(strategy)
+                self._event("PROMOTE" if state == "validation" else "DROP" if state == "dropped" else "REWORK", f"{strategy['name']} → {state}", reason)
+            for strategy in sorted(validation_pool, key=lambda item: item["metrics"]["score"], reverse=True)[3:]:
                 strategy["state"] = "rework"
                 self._event("REWORK", f"{strategy['name']} held", "Release cap reached; retained for the next evidence cycle.")
             self.market_clock += 8
+
+    def _validation_verdict(self, strategy: dict[str, Any], result: dict[str, Any]) -> tuple[str, str]:
+        development = strategy["metrics"]
+        retention = result["sharpe"] / max(development["sharpe"], 0.30)
+        result["score"] = round(clamp(
+            50 + 20 * clamp(result["sharpe"] / 2, -1, 1)
+            + 15 * clamp(result["return"] / 0.10, -1, 1)
+            + 10 * clamp((0.15 - result["drawdown"]) / 0.15, -1, 1)
+            + 5 * clamp(result["profit_factor"] - 1, -1, 1), 0, 100), 1)
+        result["robustness"] = round(clamp(
+            0.50 + 0.25 * clamp(retention, -1, 1)
+            + 0.15 * clamp((0.15 - result["drawdown"]) / 0.15, -1, 1), 0, 1), 3)
+        result["sharpe_retention"] = round(retention, 3)
+        result["overfit_warning"] = retention < 0.40 or result["drawdown"] > development["drawdown"] * 1.50
+        hard_failure = (result["return"] <= 0 or result["sharpe"] <= 0 or result["profit_factor"] < 0.90
+                        or result["drawdown"] > 0.20 or result["trades"] < 4)
+        required_trades = max(4, math.ceil(development["trades"] * 0.20))
+        required_sharpe = max(0.30, development["sharpe"] * 0.35)
+        drawdown_limit = min(0.20, max(0.12, development["drawdown"] * 1.50, development["drawdown"] + 0.025))
+        passes = (not hard_failure and not result["overfit_warning"] and result["trades"] >= required_trades
+                  and result["sharpe"] >= required_sharpe and result["drawdown"] <= drawdown_limit
+                  and result["score"] >= development["score"] * 0.55 and result["robustness"] >= 0.45)
+        if passes:
+            return "released", f"unseen Sharpe {result['sharpe']:.2f} · {result['return'] * 100:.1f}% return · {result['trades']} trades"
+        if hard_failure:
+            return "dropped", f"unseen data failed hard gate · Sharpe {result['sharpe']:.2f} · DD {result['drawdown'] * 100:.1f}%"
+        return "rework", f"unseen evidence did not generalize · Sharpe retention {retention * 100:.0f}%"
+
+    def validate_candidates(self, bootstrap: bool = False) -> None:
+        with self._lock:
+            candidates = [item for item in self.strategies if item["state"] == "validation"]
+            if not candidates:
+                if not bootstrap:
+                    self._event("VALIDATE", "No strategies awaiting validation", "Supervisor approval is required before holdout testing.")
+                return
+            for strategy in candidates:
+                asset_index = ASSETS.index(strategy["asset"])
+                numeric_id = int(strategy["id"].split("-")[-1])
+                prices, regimes = market_series(self.seed + 10_007 + numeric_id, asset_index=asset_index)
+                result = backtest(strategy, prices, regimes)
+                strategy["backtests"] += 1
+                strategy["validation"] = result
+                state, reason = self._validation_verdict(strategy, result)
+                strategy["state"] = state
+                self._event("RELEASE" if state == "released" else "DROP" if state == "dropped" else "REWORK", f"{strategy['name']} → {state}", reason)
+            self.market_clock += 5
 
     def reproduce(self, strategy_id: str) -> None:
         with self._lock:
@@ -365,9 +412,12 @@ class StrategyLab:
                 "summary": {
                     "generated": sum(item["state"] == "generated" for item in strategies),
                     "testing": sum(item["state"] in ("rework",) for item in strategies),
+                    "validation": sum(item["state"] == "validation" for item in strategies),
                     "released": len(released), "dropped": sum(item["state"] == "dropped" for item in strategies),
                     "average_score": round(avg_score, 1), "capital": round(capital, 2),
                 },
                 "strategies": strategies, "events": deepcopy(self.events),
-                "policy": {"release_score": 61, "min_sharpe": 0.55, "max_drawdown": 0.20, "monitor_window": 21},
+                "policy": {"release_score": 61, "min_sharpe": 0.55, "max_drawdown": 0.20,
+                           "validation_min_sharpe": 0.30, "validation_max_drawdown": 0.20,
+                           "monitor_window": 21},
             }

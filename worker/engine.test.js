@@ -8,10 +8,12 @@ import {
   createDemoState,
   generateBatch,
   marketSeries,
+  migrateState,
   reproduce,
   reviewCandidates,
   reviewCandidatesWithBars,
   snapshot,
+  validateCandidates,
 } from "./engine.js";
 
 test("demo state is deterministic and begins with a release book", () => {
@@ -19,7 +21,7 @@ test("demo state is deterministic and begins with a release book", () => {
   const second = snapshot(createDemoState());
   assert.deepEqual(first.strategies, second.strategies);
   assert.ok(first.summary.released >= 1);
-  assert.ok(first.strategies.every((strategy) => strategy.backtests === 3));
+  assert.ok(first.strategies.every((strategy) => strategy.backtests >= 3));
 });
 
 test("cohorts wait for evidence before supervisor review", () => {
@@ -73,7 +75,48 @@ test("live-data review consumes Alpaca bars", () => {
   reviewCandidatesWithBars(state, bars);
   assert.equal(snapshot(state).summary.generated, 0);
   assert.ok(state.strategies.slice(0, 2).every((strategy) => strategy.backtests === 3));
-  assert.ok(state.events.some((item) => item.detail.includes("Alpaca IEX data")));
+  assert.ok(state.events.some((item) => item.detail.includes("development data only")));
+});
+
+test("supervisor cannot see the untouched final quarter", () => {
+  const strategyTemplate = {
+    id: "AX-99-001", name: "Holdout Canary", state: "generated", asset: "SPY", archetype: "Momentum",
+    params: { fast: 5, slow: 24, threshold: 0.001, position_size: 0.7 }, generation: 1,
+    parent: null, backtests: 0, metrics: null, validation: null,
+    monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
+  };
+  const development = Array.from({ length: 450 }, (_, index) => ({ c: 100 * (1.002 ** index) }));
+  const quietHoldout = Array.from({ length: 150 }, () => ({ c: development.at(-1).c }));
+  const violentHoldout = Array.from({ length: 150 }, (_, index) => ({ c: development.at(-1).c * (index % 2 ? 1.4 : 0.6) }));
+  const makeState = () => ({ seed: 1, cycle: 99, marketClock: 0, nextId: 2, strategies: [structuredClone(strategyTemplate)], events: [], alpaca: { connected: false } });
+  const quietState = makeState();
+  const violentState = makeState();
+  reviewCandidatesWithBars(quietState, { SPY: [...development, ...quietHoldout] });
+  reviewCandidatesWithBars(violentState, { SPY: [...development, ...violentHoldout] });
+  assert.deepEqual(quietState.strategies[0].metrics, violentState.strategies[0].metrics);
+  assert.equal(quietState.strategies[0].state, violentState.strategies[0].state);
+});
+
+test("supervisor approval enters validation before release", () => {
+  const state = createDemoState();
+  generateBatch(state, 12);
+  reviewCandidates(state);
+  const awaiting = state.strategies.filter((strategy) => strategy.state === "validation");
+  assert.ok(awaiting.length > 0);
+  assert.ok(awaiting.every((strategy) => strategy.validation === null));
+  validateCandidates(state);
+  assert.equal(state.strategies.filter((strategy) => strategy.state === "validation").length, 0);
+});
+
+test("legacy releases are migrated behind the validation gate", () => {
+  const state = createDemoState();
+  state.schemaVersion = 1;
+  const active = state.strategies.find((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
+  active.validation = null;
+  migrateState(state);
+  assert.equal(state.schemaVersion, 2);
+  assert.equal(active.state, "validation");
+  assert.ok(state.events.some((item) => item.title.includes("migration")));
 });
 
 test("Alpaca cycles are idempotent and record managed symbols", () => {
