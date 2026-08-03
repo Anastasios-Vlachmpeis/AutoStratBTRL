@@ -4,6 +4,7 @@ import {
   applyAlpacaOverview,
   advanceMarket,
   createDemoState,
+  CURRENT_SCHEMA_VERSION,
   generateBatch,
   migrateState,
   reproduce,
@@ -22,6 +23,25 @@ import {
 import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
 import { createRuntimeGateways } from "./gateways.js";
 import { consumeArchitectureQueue } from "./jobs.js";
+import {
+  MarketDataRepository,
+  applyLiveMinutePoll,
+  auditFiveMinuteBars,
+  backfillDateBounds,
+  buildBackfillJobs,
+  buildCalendarManifest,
+  buildDatasetManifest,
+  buildHistoricalPartitions,
+  buildSessionReconciliation,
+  describeMarketDataError,
+  ensureMarketDataState,
+  livePollBounds,
+  marketDataMode,
+  marketScheduleAction,
+  publicMarketDataState,
+  recordMarketDataUsage,
+} from "./market-data.js";
+import { initialUniverseManifest } from "./universe.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
@@ -32,6 +52,31 @@ function json(payload, status = 200) {
 
 function labStub(env) {
   return env.AXIOM_LAB.get(env.AXIOM_LAB.idFromName(SINGLETON_NAME));
+}
+
+function nextIsoDate(date) {
+  const value = new Date(`${date}T00:00:00Z`);
+  value.setUTCDate(value.getUTCDate() + 1);
+  return value.toISOString().slice(0, 10);
+}
+
+async function sendQueueMessages(queue, messages) {
+  for (let index = 0; index < messages.length; index += 100) {
+    const batch = messages.slice(index, index + 100);
+    if (typeof queue.sendBatch === "function") {
+      await queue.sendBatch(batch.map((body) => ({ body, contentType: "json" })));
+    } else {
+      for (const body of batch) await queue.send(body, { contentType: "json" });
+    }
+  }
+}
+
+async function tickMarketData(env, stub, scheduledTime = Date.now()) {
+  return stub.fetch(new Request("https://axiom.internal/internal/market-data/tick", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ scheduled_at: new Date(scheduledTime).toISOString() }),
+  }));
 }
 
 async function stateFrom(stub) {
@@ -102,20 +147,25 @@ export class AxiomLab extends DurableObject {
     this.env = env;
     this.controlPlane = createControlPlaneRuntime(ctx.storage, env, SINGLETON_NAME);
     this.gateways = createRuntimeGateways(env);
+    this.marketDataRepository = new MarketDataRepository(ctx.storage, env, SINGLETON_NAME);
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const existing = await this.controlPlane.loadState();
       if (!existing) {
         const initial = createDemoState();
-        initial.schemaVersion = 5; initial.datasets = {}; initial.backtestArtifacts = {};
+        initial.schemaVersion = CURRENT_SCHEMA_VERSION; initial.datasets = {}; initial.backtestArtifacts = {};
+        const universe = await ensureMarketDataState(initial, env);
+        await this.marketDataRepository.saveUniverse(universe);
         await this.controlPlane.saveState(initial);
       }
       else {
-        const migrated = (existing.schemaVersion ?? 1) < 5 ? migrateState(existing) : existing;
-        if ((migrated.schemaVersion ?? 1) < 5) {
-          migrated.schemaVersion = 5;
+        const migrated = (existing.schemaVersion ?? 1) < CURRENT_SCHEMA_VERSION ? migrateState(existing) : existing;
+        if ((migrated.schemaVersion ?? 1) < CURRENT_SCHEMA_VERSION) {
+          migrated.schemaVersion = CURRENT_SCHEMA_VERSION;
           migrated.datasets ??= {};
           migrated.backtestArtifacts ??= {};
         }
+        const universe = await ensureMarketDataState(migrated, env);
+        await this.marketDataRepository.saveUniverse(universe);
         await this.controlPlane.saveState(migrated);
       }
     });
@@ -127,9 +177,10 @@ export class AxiomLab extends DurableObject {
   }
 
   async save(state) {
-    state.schemaVersion = Math.max(state.schemaVersion ?? 1, 5);
+    state.schemaVersion = Math.max(state.schemaVersion ?? 1, CURRENT_SCHEMA_VERSION);
     state.datasets ??= {};
     state.backtestArtifacts ??= {};
+    await ensureMarketDataState(state, this.env);
     await this.controlPlane.saveState(state);
     return json(snapshot(state));
   }
@@ -141,8 +192,264 @@ export class AxiomLab extends DurableObject {
     state.events = state.events.slice(0, 28);
   }
 
-  async clearBacktestStorage() {
+  async clearWorkspaceStorage() {
+    await this.marketDataRepository.clear();
     await this.controlPlane.artifacts.clear();
+  }
+
+  async ensureMarketCalendar(state, start, end, force = false) {
+    const existing = state.marketData?.calendar;
+    if (!force && existing?.requested_start <= start && existing?.requested_end >= end) {
+      const stored = await this.marketDataRepository.loadCalendar(existing.id);
+      if (stored) return stored;
+    }
+    const rows = await this.gateways.marketData.calendar(start, end);
+    const manifest = await buildCalendarManifest(rows, start, end);
+    await this.marketDataRepository.saveCalendar(manifest);
+    recordMarketDataUsage(state, {
+      alpaca_requests: rows.__alpaca_request_count ?? 1, d1_rows: 1, r2_writes: 1,
+    });
+    state.marketData.calendar = {
+      id: manifest.id, sha256: manifest.sha256, source: manifest.source,
+      timezone: manifest.timezone, first_session: manifest.first_session,
+      last_session: manifest.last_session, session_count: manifest.session_count,
+      requested_start: manifest.requested_start, requested_end: manifest.requested_end,
+    };
+    return manifest;
+  }
+
+  async startMarketBackfill(state, body = {}) {
+    if (marketDataMode(this.env) !== "shadow") throw new Error("MARKET_DATA_MODE must be shadow to start a backfill");
+    this.marketDataRepository.assertPersistentReady();
+    const asOf = body.as_of ? new Date(`${body.as_of}T12:00:00Z`) : new Date();
+    if (Number.isNaN(asOf.getTime())) throw new Error("Invalid backfill as_of date");
+    const defaults = backfillDateBounds(asOf);
+    const start = String(body.start ?? defaults.start);
+    const end = String(body.end ?? defaults.end);
+    const durationDays = (new Date(`${end}T00:00:00Z`) - new Date(`${start}T00:00:00Z`)) / 86400000;
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(start) || !/^\d{4}-\d{2}-\d{2}$/.test(end)
+        || start > end || durationDays < 1090 || durationDays > 1105) {
+      throw new Error("Historical backfill must cover one bounded three-year period");
+    }
+    const universe = await initialUniverseManifest();
+    const assets = await this.gateways.marketData.assets(universe.symbols);
+    recordMarketDataUsage(state, { alpaca_requests: assets.__alpaca_request_count ?? universe.symbols.length });
+    const unavailable = universe.symbols.filter((symbol) => assets[symbol]?.status !== "active" || !assets[symbol]?.tradable);
+    if (unavailable.length) throw new Error(`Initial universe contains unavailable assets: ${unavailable.join(", ")}`);
+    await this.marketDataRepository.saveUniverse(universe);
+    const calendar = await this.ensureMarketCalendar(state, start, end, true);
+    const jobs = await buildBackfillJobs({ universe, calendar, start, end });
+    const backfillHash = await sha256({ universe_id: universe.id, universe_hash: universe.sha256,
+      calendar_id: calendar.id, start, end, jobs: jobs.map((job) => job.id) });
+    const backfillId = `backfill-${backfillHash.slice(0, 32)}`;
+    await this.marketDataRepository.createBackfillJobs(backfillId, jobs);
+    const progress = await this.marketDataRepository.backfillProgress(backfillId);
+    state.marketData.backfill = {
+      id: backfillId, status: progress.complete ? "running" : "queued", start, end, total_jobs: progress.total,
+      completed_jobs: progress.complete, failed_jobs: progress.failed,
+      dataset_id: state.marketData.backfill?.id === backfillId ? state.marketData.backfill.dataset_id : null,
+      calendar_id: calendar.id,
+      universe_id: universe.id, started_at: new Date().toISOString(), completed_at: null,
+    };
+    this.record(state, "MARKET_DATA", "Three-year IEX backfill queued",
+      `${universe.symbols.length} symbols · ${jobs.length} resumable monthly partitions`);
+    // Persist the immutable backfill identity before messages can reach the DO.
+    // If queue submission fails, restarting the same command safely re-enqueues
+    // every deterministic job and completed partitions are skipped.
+    await this.controlPlane.saveState(state);
+    await sendQueueMessages(this.env.AXIOM_JOBS, jobs.map((job) => ({
+      kind: "market-data.backfill-partition.v1", workspace_id: SINGLETON_NAME, backfill_id: backfillId, job,
+    })));
+    recordMarketDataUsage(state, { queue_messages: jobs.length, d1_rows: jobs.length });
+  }
+
+  async syncBackfillProgress(state, backfillId) {
+    const progress = await this.marketDataRepository.backfillProgress(backfillId);
+    if (state.marketData?.backfill?.id === backfillId) {
+      state.marketData.backfill.total_jobs = progress.total;
+      state.marketData.backfill.completed_jobs = progress.complete;
+      state.marketData.backfill.failed_jobs = progress.failed;
+      state.marketData.backfill.status = progress.complete === progress.total && progress.total > 0
+        ? "complete" : progress.failed ? "degraded" : "running";
+    }
+    return progress;
+  }
+
+  async finalizeBackfillDataset(state, backfillId, universe, calendar, start, end) {
+    if (state.marketData?.backfill?.dataset_id) return state.marketData.backfill.dataset_id;
+    const rows = await this.marketDataRepository.listPartitions(backfillId);
+    const partitions = rows.map((row) => ({
+      id: row.partition_id, universe_id: row.universe_id, calendar_id: row.calendar_id,
+      feed: row.feed, timeframe: row.timeframe, adjustment: row.adjustment, symbol: row.symbol,
+      month: row.partition_month, start: row.range_start, end: row.range_end, row_count: row.row_count,
+      expected_bars: row.expected_bars, missing_bars: row.missing_bars, coverage: row.coverage,
+      adjustment_discontinuities: row.adjustment_discontinuities,
+      content_hash: row.content_hash, sha256: row.manifest_hash, object_key: row.object_key,
+      byte_length: row.byte_length,
+    }));
+    const manifest = await buildDatasetManifest({ universe, calendar, start, end, partitions });
+    await this.marketDataRepository.saveDatasetManifest(manifest);
+    state.marketData.backfill.dataset_id = manifest.id;
+    state.marketData.backfill.dataset_hash = manifest.sha256;
+    state.marketData.backfill.row_count = manifest.row_count;
+    state.marketData.backfill.missing_bars = manifest.missing_bars;
+    state.marketData.backfill.completed_at = new Date().toISOString();
+    this.record(state, "MARKET_DATA", "Three-year IEX dataset sealed",
+      `${manifest.row_count} five-minute bars · root ${manifest.sha256.slice(0, 12)}`);
+    return manifest.id;
+  }
+
+  async processMarketBackfillPartition(state, body) {
+    const startedAt = Date.now();
+    const job = body?.job;
+    const backfillId = String(body?.backfill_id ?? "");
+    if (!job?.id || !backfillId || job.universe_id !== state.marketData?.backfill?.universe_id) {
+      throw new Error("Market-data backfill job does not match the active immutable backfill");
+    }
+    const existing = await this.marketDataRepository.backfillJobStatus(job.id);
+    if (existing?.status === "complete") {
+      const progress = await this.syncBackfillProgress(state, backfillId);
+      if (progress.complete === progress.total && progress.total > 0 && !state.marketData.backfill.dataset_id) {
+        const universe = await initialUniverseManifest();
+        const calendar = await this.marketDataRepository.loadCalendar(job.calendar_id);
+        if (!calendar) throw new Error("Sealed backfill calendar is unavailable for dataset finalization");
+        await this.finalizeBackfillDataset(state, backfillId, universe, calendar,
+          state.marketData.backfill.start, state.marketData.backfill.end);
+      }
+      return { duplicate: true, partition_id: existing.partition_id };
+    }
+    try {
+      await this.marketDataRepository.markBackfillJob(job.id, "running");
+      const calendar = await this.marketDataRepository.loadCalendar(job.calendar_id);
+      if (!calendar || calendar.sha256 !== state.marketData.calendar?.sha256) {
+        // The active live calendar may differ; accept the exact sealed backfill
+        // calendar by ID and verify its own hash through the stored manifest.
+        if (!calendar?.sha256) throw new Error("Sealed backfill calendar is unavailable");
+      }
+      const universe = await initialUniverseManifest();
+      if (job.universe_hash !== universe.sha256) throw new Error("Backfill universe hash mismatch");
+      const response = await this.gateways.marketData.fiveMinuteHistory(job.symbol, {
+        start: `${job.start}T00:00:00Z`, end: `${nextIsoDate(job.end)}T00:00:00Z`,
+      });
+      recordMarketDataUsage(state, { alpaca_requests: response.__alpaca_request_count ?? 1 });
+      const audit = auditFiveMinuteBars(job.symbol, response[job.symbol] ?? [], calendar.sessions,
+        { start: job.start, end: job.end });
+      if (!audit.bars.length) throw new Error(`${job.symbol} returned no regular-session bars for ${job.partition}`);
+      const partitions = await buildHistoricalPartitions({ universe, calendar, symbol: job.symbol, audit, job });
+      if (partitions.length !== 1 || partitions[0].month !== job.partition) {
+        throw new Error(`Backfill job ${job.id} did not produce its single expected monthly partition`);
+      }
+      const saved = await this.marketDataRepository.savePartition(partitions[0], audit);
+      await this.marketDataRepository.markBackfillJob(job.id, "complete", { partition_id: saved.id });
+      recordMarketDataUsage(state, { d1_rows: 3, r2_writes: 1, worker_elapsed_ms: Date.now() - startedAt });
+      const progress = await this.syncBackfillProgress(state, backfillId);
+      if (progress.complete === progress.total && progress.total > 0) {
+        await this.finalizeBackfillDataset(state, backfillId, universe, calendar,
+          state.marketData.backfill.start, state.marketData.backfill.end);
+      }
+      return { duplicate: false, partition_id: saved.id };
+    } catch (error) {
+      await this.marketDataRepository.markBackfillJob(job.id, "failed", { error: describeMarketDataError(error) });
+      recordMarketDataUsage(state, { d1_rows: 2, worker_elapsed_ms: Date.now() - startedAt });
+      await this.syncBackfillProgress(state, backfillId);
+      this.record(state, "MARKET_DATA_ERROR", `${job.symbol} backfill deferred`, describeMarketDataError(error));
+      await this.controlPlane.saveState(state);
+      throw error;
+    }
+  }
+
+  async ensureLiveCalendar(state, now) {
+    const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" })
+      .formatToParts(now).filter((part) => part.type !== "literal");
+    const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+    const date = `${values.year}-${values.month}-${values.day}`;
+    const startDate = new Date(`${date}T00:00:00Z`); startDate.setUTCDate(startDate.getUTCDate() - 14);
+    const endDate = new Date(`${date}T00:00:00Z`); endDate.setUTCDate(endDate.getUTCDate() + 45);
+    return this.ensureMarketCalendar(state, startDate.toISOString().slice(0, 10), endDate.toISOString().slice(0, 10));
+  }
+
+  async pollLiveMarketData(state, now, calendar) {
+    const startedAt = Date.now();
+    const bounds = livePollBounds(now);
+    const universe = await initialUniverseManifest();
+    const bars = await this.gateways.marketData.recentMinuteBars(universe.symbols, bounds);
+    const book = await this.marketDataRepository.loadLiveBook();
+    const result = await applyLiveMinutePoll(book, bars, calendar.sessions, {
+      feed: universe.feed, now, receivedAt: new Date().toISOString(), expectedSymbols: universe.symbols,
+    });
+    await this.marketDataRepository.saveLiveResult(result);
+    recordMarketDataUsage(state, {
+      alpaca_requests: bars.__alpaca_request_count ?? 1,
+      d1_rows: result.source_revisions.length + result.events.length + 1,
+      worker_elapsed_ms: Date.now() - startedAt,
+    }, now);
+    const previousStatus = state.marketData.live?.status;
+    state.marketData.live = {
+      ...state.marketData.live,
+      status: result.health.status,
+      last_poll_at: result.book.last_poll_at,
+      last_event_at: result.events.at(-1)?.finalized_at ?? state.marketData.live?.last_event_at ?? null,
+      healthy_symbols: result.health.healthy_symbols,
+      symbol_count: result.health.symbol_count,
+      coverage: result.health.coverage,
+      revision_events: Number(state.marketData.live?.revision_events ?? 0)
+        + result.events.filter((event) => event.retroactive).length,
+      latest_event_count: result.events.length,
+    };
+    if (previousStatus && previousStatus !== result.health.status) {
+      this.record(state, result.health.status === "healthy" ? "MARKET_DATA" : "MARKET_DATA_ERROR",
+        `Live IEX data ${result.health.status}`, `${result.health.healthy_symbols}/${result.health.symbol_count} symbols healthy`);
+    }
+    return result;
+  }
+
+  async reconcileLiveSession(state, now, calendar) {
+    const startedAt = Date.now();
+    const dateParts = new Intl.DateTimeFormat("en-CA", { timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit" })
+      .formatToParts(now).filter((part) => part.type !== "literal");
+    const values = Object.fromEntries(dateParts.map((part) => [part.type, part.value]));
+    const sessionDate = `${values.year}-${values.month}-${values.day}`;
+    if (state.marketData.live?.last_reconciliation?.session_date === sessionDate) return { duplicate: true };
+    const universe = await initialUniverseManifest();
+    const response = await this.gateways.marketData.fiveMinuteBars(universe.symbols, {
+      start: `${sessionDate}T00:00:00Z`, end: `${nextIsoDate(sessionDate)}T00:00:00Z`,
+    });
+    const session = calendar.sessions.filter((item) => item.date === sessionDate);
+    const audits = Object.fromEntries(universe.symbols.map((symbol) => [symbol,
+      auditFiveMinuteBars(symbol, response[symbol] ?? [], session, { start: sessionDate, end: sessionDate })]));
+    const liveEvents = await this.marketDataRepository.liveEventsForSession(sessionDate, universe.feed);
+    const reconciliation = await buildSessionReconciliation({ universe, calendar, sessionDate, audits, liveEvents });
+    await this.marketDataRepository.saveSessionReconciliation(reconciliation);
+    recordMarketDataUsage(state, {
+      alpaca_requests: response.__alpaca_request_count ?? 1, d1_rows: 1, r2_writes: 1,
+      worker_elapsed_ms: Date.now() - startedAt,
+    }, now);
+    state.marketData.live.last_reconciliation = {
+      id: reconciliation.id, session_date: sessionDate, status: reconciliation.status,
+      matched_bars: reconciliation.summary.matched, mismatched_bars: reconciliation.summary.mismatched,
+      missing_live_bars: reconciliation.summary.missing_live, sha256: reconciliation.sha256,
+    };
+    this.record(state, reconciliation.status === "healthy" ? "MARKET_DATA" : "MARKET_DATA_ERROR",
+      `IEX session reconciliation ${reconciliation.status}`,
+      `${reconciliation.summary.matched} matched · ${reconciliation.summary.mismatched} mismatched · ${reconciliation.summary.missing_live} missing live`);
+    return reconciliation;
+  }
+
+  async runMarketDataTick(state, scheduledAt) {
+    if (marketDataMode(this.env) !== "shadow") return { skipped: true, reason: "market_data_off" };
+    const now = new Date(scheduledAt);
+    if (Number.isNaN(now.getTime())) throw new Error("Invalid market-data schedule timestamp");
+    const bucket = now.toISOString().slice(0, 16);
+    if (state.marketData.last_tick_bucket === bucket) return { duplicate: true, changed: false };
+    const priorCalendarId = state.marketData.calendar?.id ?? null;
+    const calendar = await this.ensureLiveCalendar(state, now);
+    const action = marketScheduleAction(now, calendar.sessions);
+    let result = { skipped: true, reason: "outside_session" };
+    if (action === "poll") result = await this.pollLiveMarketData(state, now, calendar);
+    else if (action === "reconcile") result = await this.reconcileLiveSession(state, now, calendar);
+    const changed = action !== "idle" || priorCalendarId !== calendar.id;
+    if (action !== "idle") state.marketData.last_tick_bucket = bucket;
+    return { action, result, changed };
   }
 
   async persistArtifact(state, artifact, result) {
@@ -297,6 +604,20 @@ export class AxiomLab extends DurableObject {
       if (request.method === "GET" && url.pathname === "/api/architecture") {
         return json(await this.controlPlane.health(true));
       }
+      if (request.method === "GET" && url.pathname === "/api/market-data") {
+        return json(publicMarketDataState(state));
+      }
+
+      if (request.method === "POST" && url.pathname === "/api/market-data/backfill/start") {
+        const body = await request.json().catch(() => ({}));
+        await this.startMarketBackfill(state, body);
+        return this.save(state);
+      }
+      if (request.method === "POST" && url.pathname === "/api/market-data/poll") {
+        const body = await request.json().catch(() => ({}));
+        await this.runMarketDataTick(state, body.scheduled_at ?? new Date().toISOString());
+        return this.save(state);
+      }
 
       if (request.method === "POST" && url.pathname === "/api/generate") {
         const body = await request.json();
@@ -322,8 +643,20 @@ export class AxiomLab extends DurableObject {
         return this.save(state);
       }
       if (request.method === "POST" && url.pathname === "/api/reset") {
-        await this.clearBacktestStorage();
+        await this.clearWorkspaceStorage();
         return this.save(createDemoState());
+      }
+      if (request.method === "POST" && url.pathname === "/internal/market-data/backfill-partition") {
+        const body = await request.json();
+        const result = await this.processMarketBackfillPartition(state, body);
+        await this.controlPlane.saveState(state);
+        return json({ ok: true, ...result });
+      }
+      if (request.method === "POST" && url.pathname === "/internal/market-data/tick") {
+        const body = await request.json();
+        const result = await this.runMarketDataTick(state, body.scheduled_at);
+        if (result.changed) await this.controlPlane.saveState(state);
+        return json({ ok: true, ...result });
       }
       if (request.method === "POST" && url.pathname === "/internal/review-live") {
         const body = await request.json();
@@ -499,12 +832,20 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    const bucket = new Date(controller.scheduledTime).toISOString().slice(0, 13);
     if (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET) {
       console.warn("Alpaca schedule skipped: credentials are not configured");
       return;
     }
-    ctx.waitUntil(synchronizeAlpaca(env, labStub(env), bucket));
+    const stub = labStub(env);
+    const work = [];
+    if (controller.cron === "0 * * * *") {
+      const bucket = new Date(controller.scheduledTime).toISOString().slice(0, 13);
+      work.push(synchronizeAlpaca(env, stub, bucket));
+    }
+    if (marketDataMode(env) === "shadow" && controller.cron === "* * * * *") {
+      work.push(tickMarketData(env, stub, controller.scheduledTime));
+    }
+    if (work.length) ctx.waitUntil(Promise.all(work));
   },
 
   async queue(batch, env) {

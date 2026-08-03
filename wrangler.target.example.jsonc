@@ -35,9 +35,10 @@
       "dead_letter_queue": "axiom-jobs-dlq"
     }]
   },
-  "triggers": { "crons": ["0 * * * *"] },
+  "triggers": { "crons": ["* * * * *", "0 * * * *"] },
   "vars": {
     "CONTROL_PLANE_MODE": "dual_write",
+    "MARKET_DATA_MODE": "shadow",
     "ALPACA_DATA_FEED": "iex",
     "ALPACA_TRADING_ENABLED": "false",
     "ALPACA_SHORT_TRADING_ENABLED": "false",
@@ -47,4 +48,3 @@
   },
   "observability": { "enabled": true }
 }
-

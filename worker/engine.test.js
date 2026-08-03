@@ -7,6 +7,7 @@ import {
   advanceMarket,
   backtest,
   createDemoState,
+  CURRENT_SCHEMA_VERSION,
   evaluateStrategyWindow,
   generateBatch,
   marketSeries,
@@ -200,7 +201,7 @@ test("legacy preloaded state is migrated to an empty workspace", () => {
   addReleasedStrategy(state);
   state.schemaVersion = 2;
   const migrated = migrateState(state);
-  assert.equal(migrated.schemaVersion, 5);
+  assert.equal(migrated.schemaVersion, CURRENT_SCHEMA_VERSION);
   assert.deepEqual(migrated.strategies, []);
   assert.deepEqual(migrated.events, []);
 });
@@ -211,7 +212,7 @@ test("schema 3 migration preserves user strategies and adds backtest provenance 
   delete state.strategies[0].rework;
   state.schemaVersion = 3;
   const migrated = migrateState(state);
-  assert.equal(migrated.schemaVersion, 5);
+  assert.equal(migrated.schemaVersion, CURRENT_SCHEMA_VERSION);
   assert.equal(migrated.strategies.length, 1);
   assert.equal(migrated.strategies[0].rework.attempt, 0);
   assert.equal(migrated.strategies[0].engine_family, null);
@@ -226,10 +227,22 @@ test("schema 4 migration preserves strategies while upgrading to sealed-backtest
   delete state.strategies[0].backtest_runs;
   delete state.datasets;
   const migrated = migrateState(state);
-  assert.equal(migrated.schemaVersion, 5);
+  assert.equal(migrated.schemaVersion, CURRENT_SCHEMA_VERSION);
   assert.equal(migrated.strategies[0].id, id);
   assert.deepEqual(migrated.strategies[0].backtest_runs, {});
   assert.deepEqual(migrated.datasets, {});
+});
+
+test("schema 5 migration preserves strategies and initializes private market-data metadata", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  state.schemaVersion = 5;
+  delete state.marketData;
+  const migrated = migrateState(state);
+  assert.equal(migrated.schemaVersion, CURRENT_SCHEMA_VERSION);
+  assert.equal(migrated.strategies.length, 1);
+  assert.deepEqual(migrated.marketData, {});
+  assert.equal(snapshot(migrated).market_data.mode, "off");
 });
 
 test("Alpaca cycles are idempotent and record managed symbols", () => {

@@ -27,6 +27,7 @@
   },
   "vars": {
     "CONTROL_PLANE_MODE": "legacy",
+    "MARKET_DATA_MODE": "off",
     "ALPACA_DATA_FEED": "iex",
     "ALPACA_TRADING_ENABLED": "false",
     "ALPACA_SHORT_TRADING_ENABLED": "false",

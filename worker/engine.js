@@ -2,6 +2,7 @@
 
 export const REGIMES = ["Expansion", "Compression", "Stress", "Recovery"];
 export const ASSETS = ["SPY", "QQQ", "IWM", "TLT"];
+export const CURRENT_SCHEMA_VERSION = 6;
 
 const NAMES = [
   "Orion Pulse", "Kestrel Drift", "Helix Break", "Cobalt Revert",
@@ -798,7 +799,7 @@ export function applyAlpacaCycle(state, cycle) {
 
 export function createDemoState() {
   return {
-    schemaVersion: 5,
+    schemaVersion: CURRENT_SCHEMA_VERSION,
     seed: 20260801,
     cycle: 0,
     marketClock: 0,
@@ -807,15 +808,16 @@ export function createDemoState() {
     events: [],
     lastScheduledBucket: null,
     alpaca: { connected: false, managed_symbols: [], last_cycle_bucket: null, short_trading_enabled: false, safety_reasons: [] },
+    marketData: {},
   };
 }
 
 export function migrateState(state) {
   const version = state.schemaVersion ?? 1;
   if (version < 3) return createDemoState();
-  if (version >= 5) return state;
+  if (version >= CURRENT_SCHEMA_VERSION) return state;
   const migrated = clone(state);
-  migrated.schemaVersion = 5;
+  migrated.schemaVersion = CURRENT_SCHEMA_VERSION;
   migrated.strategies = (migrated.strategies ?? []).map((strategy) => ({
     ...strategy,
     rework: strategy.rework ?? emptyRework(),
@@ -826,6 +828,7 @@ export function migrateState(state) {
   }));
   migrated.datasets ??= {};
   migrated.backtestArtifacts ??= {};
+  migrated.marketData ??= {};
   return migrated;
 }
 
@@ -843,7 +846,7 @@ export function snapshot(state) {
       cycle: state.cycle,
       clock: state.marketClock,
       environment: state.alpaca?.connected ? "ALPACA PAPER" : "PAPER SIM",
-      schema_version: state.schemaVersion ?? 5,
+      schema_version: state.schemaVersion ?? CURRENT_SCHEMA_VERSION,
       seed: state.seed,
       last_scheduled_bucket: state.lastScheduledBucket,
     },
@@ -859,6 +862,14 @@ export function snapshot(state) {
     strategies,
     events: clone(state.events),
     alpaca: clone(state.alpaca ?? { connected: false }),
+    market_data: clone({
+      schema_version: state.marketData?.schema_version ?? 1,
+      mode: state.marketData?.mode ?? "off",
+      universe: state.marketData?.universe ?? null,
+      calendar: state.marketData?.calendar ?? null,
+      backfill: state.marketData?.backfill ?? null,
+      live: state.marketData?.live ?? null,
+    }),
     policy: {
       release_score: 61, min_sharpe: 0.55, max_drawdown: 0.20,
       validation_min_sharpe: 0.30, validation_max_drawdown: 0.20, monitor_window: 21,

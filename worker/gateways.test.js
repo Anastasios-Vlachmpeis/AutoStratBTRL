@@ -14,8 +14,12 @@ test("runtime gateways expose explicit market, broker, and research boundaries",
   assert.ok(gateways.broker instanceof AlpacaPaperBrokerGateway);
   assert.ok(gateways.research instanceof BacktestResearchGateway);
   assert.equal(typeof gateways.marketData.researchBars, "function");
+  assert.equal(typeof gateways.marketData.calendar, "function");
+  assert.equal(typeof gateways.marketData.fiveMinuteHistory, "function");
+  assert.equal(typeof gateways.marketData.fiveMinuteBars, "function");
+  assert.equal(typeof gateways.marketData.recentMinuteBars, "function");
+  assert.equal(typeof gateways.marketData.assets, "function");
   assert.equal(typeof gateways.broker.accountOverview, "function");
   assert.equal(typeof gateways.broker.buildCycle, "function");
   assert.equal(typeof gateways.research.run, "function");
 });
-

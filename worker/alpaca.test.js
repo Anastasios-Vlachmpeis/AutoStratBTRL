@@ -1,7 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { buildPaperCycle, getAccountOverview, getPortfolioHistory, getResearchBars } from "./alpaca.js";
+import {
+  buildPaperCycle,
+  getAccountOverview,
+  getFiveMinuteHistory,
+  getMarketCalendar,
+  getPortfolioHistory,
+  getResearchBars,
+  getStockBars,
+} from "./alpaca.js";
 
 const credentials = {
   ALPACA_API_KEY: "paper-key",
@@ -38,10 +46,12 @@ function fixtureFetch({
     base_value: 100000,
     base_value_asof: "2026-07-31T00:00:00Z",
   },
-} = {}) {
+  } = {}) {
   const submitted = [];
+  const requests = [];
   const mock = async (input, init = {}) => {
     const url = new URL(String(input));
+    requests.push(url);
     const requestHeaders = new Headers(init.headers);
     assert.equal(requestHeaders.get("APCA-API-KEY-ID"), "paper-key");
     assert.equal(requestHeaders.get("APCA-API-SECRET-KEY"), "paper-secret");
@@ -58,6 +68,10 @@ function fixtureFetch({
       is_open: true, timestamp: "2026-08-03T15:00:00Z",
       next_open: "2026-08-04T13:30:00Z", next_close: "2026-08-03T20:00:00Z",
     });
+    if (url.pathname === "/v2/calendar") return Response.json([
+      { date: "2026-08-03", open: "09:30", close: "16:00" },
+      { date: "2026-11-27", open: "09:30", close: "13:00" },
+    ]);
     if (url.pathname === "/v2/account/portfolio/history") return Response.json(portfolioHistory);
     if (url.pathname === "/v2/stocks/bars") {
       const symbols = url.searchParams.get("symbols").split(",");
@@ -86,6 +100,7 @@ function fixtureFetch({
     return Response.json({ message: `Unhandled ${url.pathname}` }, { status: 500 });
   };
   mock.submitted = submitted;
+  mock.requests = requests;
   return mock;
 }
 
@@ -146,6 +161,41 @@ test("research bars request the configured IEX feed", async () => {
   const bars = await getResearchBars(credentials, ["SPY", "QQQ"]);
   assert.equal(bars.SPY.length, 260);
   assert.equal(bars.QQQ.at(-1).c, 359.5);
+});
+
+test("five-minute history and calendar requests freeze explicit source parameters", async () => {
+  const mock = fixtureFetch();
+  globalThis.fetch = mock;
+  const bars = await getFiveMinuteHistory(credentials, "SPY", {
+    start: "2026-07-01T00:00:00Z", end: "2026-08-01T00:00:00Z",
+  });
+  const calendar = await getMarketCalendar(credentials, "2026-07-01", "2026-08-01");
+  assert.equal(bars.SPY.length, 260);
+  const request = mock.requests.find((url) => url.pathname === "/v2/stocks/bars");
+  assert.equal(request.searchParams.get("timeframe"), "5Min");
+  assert.equal(request.searchParams.get("feed"), "iex");
+  assert.equal(request.searchParams.get("adjustment"), "all");
+  assert.equal(calendar[1].close, "13:00");
+});
+
+test("stock-bar pagination follows deterministic tokens beyond one response", async () => {
+  let calls = 0;
+  globalThis.fetch = async (input, init = {}) => {
+    const headers = new Headers(init.headers);
+    assert.equal(headers.get("APCA-API-KEY-ID"), "paper-key");
+    const url = new URL(String(input));
+    calls += 1;
+    const second = url.searchParams.get("page_token") === "page-2";
+    return Response.json({ bars: { SPY: [barFixture(second ? 2 : 1)] }, next_page_token: second ? null : "page-2" });
+  };
+  function barFixture(day) {
+    return { t: `2026-08-0${day}T13:30:00Z`, o: 100, h: 101, l: 99, c: 100.5, v: 1000 };
+  }
+  const bars = await getStockBars(credentials, ["SPY"], {
+    timeframe: "5Min", start: "2026-08-01T00:00:00Z", end: "2026-08-03T00:00:00Z",
+  });
+  assert.equal(calls, 2);
+  assert.equal(bars.SPY.length, 2);
 });
 
 test("paper cycle proposes but does not submit while trading is disabled", async () => {

@@ -59,3 +59,21 @@ test("queue consumer retries malformed or mismatched verification jobs", async (
   assert.equal(database.receipts, 0);
 });
 
+test("queue consumer delegates market-data partitions to the singleton Durable Object", async () => {
+  let requestBody;
+  const namespace = {
+    idFromName(name) { assert.equal(name, "axiom-global-supervisor"); return "singleton-id"; },
+    get(id) {
+      assert.equal(id, "singleton-id");
+      return { async fetch(request) { requestBody = await request.json(); return Response.json({ ok: true }); } };
+    },
+  };
+  const body = {
+    kind: "market-data.backfill-partition.v1", workspace_id: "axiom-global-supervisor",
+    backfill_id: "backfill-1", job: { id: "job-1" },
+  };
+  const message = queueMessage(body);
+  await consumeArchitectureQueue({ messages: [message] }, { AXIOM_LAB: namespace });
+  assert.equal(message.acked, true);
+  assert.deepEqual(requestBody, body);
+});

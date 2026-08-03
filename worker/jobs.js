@@ -1,3 +1,5 @@
+import { CONTROL_PLANE_WORKSPACE } from "./control-plane.js";
+
 function messageOf(error) {
   return error instanceof Error ? error.message : String(error ?? "Unknown queue error");
 }
@@ -22,12 +24,26 @@ async function verifyCheckpoint(body, env) {
   `).bind(receiptId, body.kind, workspaceId, checkpointId, new Date().toISOString()).run();
 }
 
+async function processMarketBackfill(body, env) {
+  if (!env.AXIOM_LAB) throw new Error("AXIOM_LAB binding is required for market-data backfills");
+  if (body.workspace_id !== CONTROL_PLANE_WORKSPACE) throw new Error("Market-data job targets an unknown workspace");
+  const stub = env.AXIOM_LAB.get(env.AXIOM_LAB.idFromName(CONTROL_PLANE_WORKSPACE));
+  const response = await stub.fetch(new Request("https://axiom.internal/internal/market-data/backfill-partition", {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }));
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    throw new Error(payload.error ?? `Market-data backfill returned ${response.status}`);
+  }
+}
+
 export async function consumeArchitectureQueue(batch, env) {
   for (const message of batch.messages ?? []) {
     try {
       const body = message.body ?? {};
-      if (body.kind !== "architecture.verify-checkpoint.v1") throw new Error(`Unsupported architecture job: ${body.kind ?? "missing"}`);
-      await verifyCheckpoint(body, env);
+      if (body.kind === "architecture.verify-checkpoint.v1") await verifyCheckpoint(body, env);
+      else if (body.kind === "market-data.backfill-partition.v1") await processMarketBackfill(body, env);
+      else throw new Error(`Unsupported architecture job: ${body.kind ?? "missing"}`);
       message.ack();
     } catch (error) {
       console.error("Architecture queue job failed", { id: message.id, error: messageOf(error) });
@@ -35,4 +51,3 @@ export async function consumeArchitectureQueue(batch, env) {
     }
   }
 }
-

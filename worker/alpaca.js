@@ -1,8 +1,9 @@
 import { evaluateStrategyWindow, latestSignal } from "./engine.js";
+import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
 
 const PAPER_BASE = "https://paper-api.alpaca.markets";
 const DATA_BASE = "https://data.alpaca.markets";
-const SUPPORTED_SYMBOLS = ["SPY", "QQQ", "IWM", "TLT"];
+const SUPPORTED_SYMBOLS = [...INITIAL_UNIVERSE_SYMBOLS];
 
 function requireCredentials(env) {
   if (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET) {
@@ -33,6 +34,13 @@ async function alpacaRequest(env, base, path, init = {}, allowNotFound = false) 
     throw new Error(`Alpaca ${response.status}: ${detail}${requestId ? ` [${requestId}]` : ""}`);
   }
   return payload;
+}
+
+function attachRequestCount(value, count) {
+  Object.defineProperty(value, "__alpaca_request_count", {
+    value: Number(count), enumerable: false, configurable: false, writable: false,
+  });
+  return value;
 }
 
 function cleanNumber(value) {
@@ -144,12 +152,16 @@ export async function getAccountOverview(env) {
   };
 }
 
-export async function getStockBars(env, symbols, { timeframe, start, end = new Date().toISOString(), limit = 10000 }) {
+export async function getStockBars(env, symbols, {
+  timeframe, start, end = new Date().toISOString(), limit = 10000,
+  adjustment = "all", maxPages = 1000,
+}) {
   const allowed = [...new Set(symbols)].filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol));
   if (!allowed.length) return {};
   const collected = Object.fromEntries(allowed.map((symbol) => [symbol, []]));
   let pageToken = null;
   let pages = 0;
+  const tokens = new Set();
   do {
     const query = new URLSearchParams({
       symbols: allowed.join(","),
@@ -158,7 +170,7 @@ export async function getStockBars(env, symbols, { timeframe, start, end = new D
       end,
       limit: String(limit),
       feed: env.ALPACA_DATA_FEED || "iex",
-      adjustment: "all",
+      adjustment,
       sort: "asc",
     });
     if (pageToken) query.set("page_token", pageToken);
@@ -175,9 +187,32 @@ export async function getStockBars(env, symbols, { timeframe, start, end = new D
       })));
     }
     pageToken = payload.next_page_token || null;
+    if (pageToken && tokens.has(pageToken)) throw new Error("Alpaca bars pagination repeated a page token");
+    if (pageToken) tokens.add(pageToken);
     pages += 1;
-  } while (pageToken && pages < 8);
-  return collected;
+    if (pageToken && pages >= maxPages) throw new Error(`Alpaca bars pagination exceeded ${maxPages} pages`);
+  } while (pageToken);
+  return attachRequestCount(collected, pages);
+}
+
+export async function getFiveMinuteHistory(env, symbol, { start, end }) {
+  return getStockBars(env, [symbol], { timeframe: "5Min", start, end, adjustment: "all", maxPages: 100 });
+}
+
+export async function getFiveMinuteBars(env, symbols, { start, end }) {
+  return getStockBars(env, symbols, { timeframe: "5Min", start, end, adjustment: "all", maxPages: 20 });
+}
+
+export async function getRecentMinuteBars(env, symbols, { start, end }) {
+  return getStockBars(env, symbols, { timeframe: "1Min", start, end, adjustment: "all", maxPages: 10 });
+}
+
+export async function getMarketCalendar(env, start, end) {
+  const query = new URLSearchParams({ start, end });
+  const rows = await alpacaRequest(env, PAPER_BASE, `/v2/calendar?${query}`);
+  return attachRequestCount((rows ?? []).map((row) => ({
+    date: String(row.date), open: String(row.open), close: String(row.close),
+  })), 1);
 }
 
 export async function getResearchBars(env, symbols) {
@@ -190,21 +225,28 @@ export async function getMonitoringBars(env, symbols) {
   return getStockBars(env, symbols, { timeframe: "1Hour", start });
 }
 
-async function getAssets(env, symbols) {
-  const entries = await Promise.all(symbols.map(async (symbol) => {
-    const asset = await alpacaRequest(env, PAPER_BASE, `/v2/assets/${encodeURIComponent(symbol)}`);
-    return [symbol, {
-      tradable: Boolean(asset.tradable),
-      fractionable: Boolean(asset.fractionable),
-      shortable: Boolean(asset.shortable),
-      // `easy_to_borrow` is retained while Alpaca transitions clients to
-      // `borrow_status`.  Do not infer borrowability when neither is present.
-      borrow_status: asset.borrow_status ?? null,
-      easy_to_borrow: asset.easy_to_borrow === true,
-      status: asset.status,
-    }];
-  }));
-  return Object.fromEntries(entries);
+export async function getAssets(env, symbols) {
+  const entries = [];
+  const unique = [...new Set(symbols)];
+  // Keep outbound concurrency bounded for Workers while still avoiding a slow
+  // fully serial validation of the 40-symbol universe.
+  for (let index = 0; index < unique.length; index += 5) {
+    const batch = await Promise.all(unique.slice(index, index + 5).map(async (symbol) => {
+      const asset = await alpacaRequest(env, PAPER_BASE, `/v2/assets/${encodeURIComponent(symbol)}`);
+      return [symbol, {
+        tradable: Boolean(asset.tradable),
+        fractionable: Boolean(asset.fractionable),
+        shortable: Boolean(asset.shortable),
+        // `easy_to_borrow` is retained while Alpaca transitions clients to
+        // `borrow_status`.  Do not infer borrowability when neither is present.
+        borrow_status: asset.borrow_status ?? null,
+        easy_to_borrow: asset.easy_to_borrow === true,
+        status: asset.status,
+      }];
+    }));
+    entries.push(...batch);
+  }
+  return attachRequestCount(Object.fromEntries(entries), unique.length);
 }
 
 async function findOrderByClientId(env, clientOrderId) {
