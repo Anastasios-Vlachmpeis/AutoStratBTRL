@@ -1,0 +1,50 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "axiom-strategy-foundry",
+  "main": "worker/index.js",
+  "compatibility_date": "2026-08-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "run_worker_first": ["/api/*"]
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "AXIOM_LAB", "class_name": "AxiomLab" }]
+  },
+  "exports": {
+    "AxiomLab": { "type": "durable-object", "storage": "sqlite" }
+  },
+  "d1_databases": [{
+    "binding": "AXIOM_DB",
+    "database_name": "axiom-control",
+    "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+    "migrations_dir": "migrations"
+  }],
+  "r2_buckets": [{
+    "binding": "AXIOM_ARTIFACTS",
+    "bucket_name": "axiom-private-artifacts",
+    "preview_bucket_name": "axiom-private-artifacts-preview"
+  }],
+  "queues": {
+    "producers": [{ "binding": "AXIOM_JOBS", "queue": "axiom-jobs" }],
+    "consumers": [{
+      "queue": "axiom-jobs",
+      "max_batch_size": 10,
+      "max_batch_timeout": 5,
+      "max_retries": 5,
+      "dead_letter_queue": "axiom-jobs-dlq"
+    }]
+  },
+  "triggers": { "crons": ["0 * * * *"] },
+  "vars": {
+    "CONTROL_PLANE_MODE": "dual_write",
+    "ALPACA_DATA_FEED": "iex",
+    "ALPACA_TRADING_ENABLED": "false",
+    "ALPACA_SHORT_TRADING_ENABLED": "false",
+    "ALPACA_MAX_STRATEGY_PCT": "0.02",
+    "ALPACA_MAX_PORTFOLIO_PCT": "0.20",
+    "BACKTEST_ENGINE": "shadow"
+  },
+  "observability": { "enabled": true }
+}
+

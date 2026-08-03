@@ -14,15 +14,17 @@ import {
   validateCandidates,
   validateCandidatesWithBars,
 } from "./engine.js";
-import { buildPaperCycle, getAccountOverview, getResearchBars } from "./alpaca.js";
 import { isAuthorized } from "./auth.js";
 import {
   aggregateMetrics, buildBacktestPayload, comparison, engineMode, frozenDna,
-  makeDataset, normalizeMetrics, remoteEnabled, reviewDecision, sha256, signedBacktest, validationDecision,
+  makeDataset, normalizeMetrics, remoteEnabled, reviewDecision, sha256, validationDecision,
 } from "./backtest.js";
+import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
+import { createRuntimeGateways } from "./gateways.js";
+import { consumeArchitectureQueue } from "./jobs.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
-const SINGLETON_NAME = "axiom-global-supervisor";
+const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
 
 function json(payload, status = 200) {
   return new Response(JSON.stringify(payload), { status, headers: JSON_HEADERS });
@@ -40,7 +42,7 @@ async function stateFrom(stub) {
 
 async function synchronizeAlpaca(env, stub, bucket, orderBucket = bucket) {
   const appState = await stateFrom(stub);
-  const cycle = await buildPaperCycle(env, appState, bucket, orderBucket);
+  const cycle = await createRuntimeGateways(env).broker.buildCycle(appState, bucket, orderBucket);
   return stub.fetch(new Request("https://axiom.internal/internal/alpaca-cycle", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -49,7 +51,7 @@ async function synchronizeAlpaca(env, stub, bucket, orderBucket = bucket) {
 }
 
 async function refreshAlpacaPortfolio(env, stub) {
-  const overview = await getAccountOverview(env);
+  const overview = await createRuntimeGateways(env).broker.accountOverview();
   return stub.fetch(new Request("https://axiom.internal/internal/alpaca-overview", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -62,7 +64,7 @@ async function reviewWithAlpaca(env, stub) {
   const symbols = [...new Set(appState.strategies
     .filter((strategy) => ["generated", "rework"].includes(strategy.state))
     .map((strategy) => strategy.asset))];
-  const bars = await getResearchBars(env, symbols);
+  const bars = await createRuntimeGateways(env).marketData.researchBars(symbols);
   return stub.fetch(new Request("https://axiom.internal/internal/review-live", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -85,7 +87,7 @@ async function validateWithAlpaca(env, stub) {
   const symbols = [...new Set(appState.strategies
     .filter((strategy) => strategy.state === "validation")
     .map((strategy) => strategy.asset))];
-  const bars = await getResearchBars(env, symbols);
+  const bars = await createRuntimeGateways(env).marketData.researchBars(symbols);
   return stub.fetch(new Request("https://axiom.internal/internal/validate-live", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -98,12 +100,14 @@ export class AxiomLab extends DurableObject {
     super(ctx, env);
     this.ctx = ctx;
     this.env = env;
+    this.controlPlane = createControlPlaneRuntime(ctx.storage, env, SINGLETON_NAME);
+    this.gateways = createRuntimeGateways(env);
     this.ready = ctx.blockConcurrencyWhile(async () => {
-      const existing = await ctx.storage.get("state");
+      const existing = await this.controlPlane.loadState();
       if (!existing) {
         const initial = createDemoState();
         initial.schemaVersion = 5; initial.datasets = {}; initial.backtestArtifacts = {};
-        await ctx.storage.put("state", initial);
+        await this.controlPlane.saveState(initial);
       }
       else {
         const migrated = (existing.schemaVersion ?? 1) < 5 ? migrateState(existing) : existing;
@@ -112,21 +116,21 @@ export class AxiomLab extends DurableObject {
           migrated.datasets ??= {};
           migrated.backtestArtifacts ??= {};
         }
-        await ctx.storage.put("state", migrated);
+        await this.controlPlane.saveState(migrated);
       }
     });
   }
 
   async load() {
     await this.ready;
-    return this.ctx.storage.get("state");
+    return this.controlPlane.loadState();
   }
 
   async save(state) {
     state.schemaVersion = Math.max(state.schemaVersion ?? 1, 5);
     state.datasets ??= {};
     state.backtestArtifacts ??= {};
-    await this.ctx.storage.put("state", state);
+    await this.controlPlane.saveState(state);
     return json(snapshot(state));
   }
 
@@ -138,21 +142,14 @@ export class AxiomLab extends DurableObject {
   }
 
   async clearBacktestStorage() {
-    const keys = await this.ctx.storage.list({ prefix: "bt:" });
-    if (keys.size) await this.ctx.storage.delete([...keys.keys()]);
+    await this.controlPlane.artifacts.clear();
   }
 
   async persistArtifact(state, artifact, result) {
     const artifactId = `artifact-${artifact.job_id}-${artifact.strategy_id}`;
-    const redactBars = (value) => {
-      if (Array.isArray(value)) return value.map(redactBars);
-      if (!value || typeof value !== "object") return value;
-      return Object.fromEntries(Object.entries(value)
-        .filter(([key]) => !["bars", "raw_bars", "development_bars", "holdout_bars"].includes(key))
-        .map(([key, item]) => [key, redactBars(item)]));
-    };
-    const safe = redactBars({ ...artifact, result });
-    await this.ctx.storage.put(`bt:artifact:${artifactId}`, safe);
+    await this.controlPlane.artifacts.putArtifact(artifactId, { ...artifact, result }, {
+      phase: artifact.phase, strategy_id: artifact.strategy_id, dataset_id: artifact.dataset?.id,
+    });
     state.backtestArtifacts ??= {};
     state.backtestArtifacts[artifactId] = { id: artifactId, phase: artifact.phase, strategy_id: artifact.strategy_id, created_at: artifact.created_at, engine: artifact.engine, dataset: artifact.dataset };
     return artifactId;
@@ -163,8 +160,12 @@ export class AxiomLab extends DurableObject {
     if (dataset.development.length < 300 || dataset.holdout.length < 100) throw new Error(`${symbol} has insufficient history for sealed backtesting`);
     state.datasets ??= {};
     if (!state.datasets[dataset.id]) {
-      await this.ctx.storage.put(`bt:dataset:${dataset.id}:development`, dataset.development);
-      await this.ctx.storage.put(`bt:dataset:${dataset.id}:holdout`, dataset.holdout);
+      await this.controlPlane.artifacts.putDatasetSlice(dataset.id, "development", dataset.development, {
+        symbol: dataset.symbol, timeframe: dataset.timeframe,
+      });
+      await this.controlPlane.artifacts.putDatasetSlice(dataset.id, "holdout", dataset.holdout, {
+        symbol: dataset.symbol, timeframe: dataset.timeframe,
+      });
       state.datasets[dataset.id] = { id: dataset.id, symbol: dataset.symbol, timeframe: dataset.timeframe, bar_count: dataset.bar_count, split_index: dataset.split_index, start: dataset.start, end: dataset.end, sha256: dataset.sha256 };
     }
     return state.datasets[dataset.id];
@@ -177,8 +178,8 @@ export class AxiomLab extends DurableObject {
       let bars = fallbackBars[strategy.asset] ?? [];
       if (strategy.dataset_id) {
         const [development, holdout] = await Promise.all([
-          this.ctx.storage.get(`bt:dataset:${strategy.dataset_id}:development`),
-          this.ctx.storage.get(`bt:dataset:${strategy.dataset_id}:holdout`),
+          this.controlPlane.artifacts.getDatasetSlice(strategy.dataset_id, "development"),
+          this.controlPlane.artifacts.getDatasetSlice(strategy.dataset_id, "holdout"),
         ]);
         if (development?.length && holdout?.length) bars = [...development, ...holdout];
         else this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, "sealed legacy comparison dataset is missing");
@@ -190,13 +191,13 @@ export class AxiomLab extends DurableObject {
     return candidates.length > 0;
   }
 
-  async invokeBacktrader(state, env, phase, strategies, dataset) {
-    const bars = await this.ctx.storage.get(`bt:dataset:${dataset.id}:${phase === "holdout" ? "holdout" : "development"}`);
+  async invokeBacktrader(state, phase, strategies, dataset) {
+    const bars = await this.controlPlane.artifacts.getDatasetSlice(dataset.id, phase === "holdout" ? "holdout" : "development");
     if (!bars?.length) throw new Error(`Sealed ${phase} dataset is unavailable`);
     const built = await buildBacktestPayload(phase, strategies, dataset, bars);
     const { payload, config_hash, dna, slice_hash: sliceHash } = built;
     const job_id = payload.job_id;
-    const response = await signedBacktest(env, payload);
+    const response = await this.gateways.research.run(payload);
     if (response.job_id !== job_id || response.phase !== phase) throw new Error("Backtest service provenance does not match the request");
     if (response.dataset?.sha256 !== sliceHash || response.engine?.name !== "backtrader"
       || response.engine?.config_hash !== config_hash) {
@@ -226,7 +227,7 @@ export class AxiomLab extends DurableObject {
     }
     for (const { dataset, strategies } of byDataset.values()) {
       try {
-        const run = await this.invokeBacktrader(state, env, "development", strategies, dataset);
+        const run = await this.invokeBacktrader(state, "development", strategies, dataset);
         for (const strategy of strategies) {
           const strategyResult = run.response.results.find((item) => String(item.strategy_id ?? item.id) === strategy.id);
           if (strategyResult?.dna_hash !== strategy.dna_hash) throw new Error(`service returned mismatched DNA for ${strategy.id}`);
@@ -266,7 +267,7 @@ export class AxiomLab extends DurableObject {
     const groups = new Map();
     for (const strategy of candidates) { const dataset = state.datasets?.[strategy.dataset_id]; if (!dataset) { this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, "sealed dataset missing"); continue; } const group = groups.get(dataset.id) ?? { dataset, strategies: [] }; group.strategies.push(strategy); groups.set(dataset.id, group); }
     for (const { dataset, strategies } of groups.values()) try {
-      const run = await this.invokeBacktrader(state, env, "holdout", strategies, dataset);
+      const run = await this.invokeBacktrader(state, "holdout", strategies, dataset);
       for (const strategy of strategies) {
         const strategyResult = run.response.results.find((item) => String(item.strategy_id ?? item.id) === strategy.id);
         if (strategyResult?.dna_hash !== strategy.dna_hash) throw new Error(`service returned mismatched DNA for ${strategy.id}`);
@@ -293,6 +294,9 @@ export class AxiomLab extends DurableObject {
 
     try {
       if (request.method === "GET" && url.pathname === "/api/state") return json(snapshot(state));
+      if (request.method === "GET" && url.pathname === "/api/architecture") {
+        return json(await this.controlPlane.health(true));
+      }
 
       if (request.method === "POST" && url.pathname === "/api/generate") {
         const body = await request.json();
@@ -435,7 +439,7 @@ export class AxiomLab extends DurableObject {
       }
       if (request.method === "GET" && url.pathname.startsWith("/api/backtest-artifacts/")) {
         const id = decodeURIComponent(url.pathname.slice("/api/backtest-artifacts/".length));
-        const artifact = await this.ctx.storage.get(`bt:artifact:${id}`);
+        const artifact = await this.controlPlane.artifacts.getArtifact(id);
         return artifact ? json(artifact) : json({ error: "Artifact not found" }, 404);
       }
       if (request.method === "POST" && url.pathname === "/internal/alpaca-cycle") {
@@ -454,7 +458,7 @@ export class AxiomLab extends DurableObject {
         if (state.lastScheduledBucket === scheduledBucket) return json({ ok: true, duplicate: true });
         state.lastScheduledBucket = scheduledBucket;
         advanceMarket(state, 1);
-        await this.ctx.storage.put("state", state);
+        await this.controlPlane.saveState(state);
         return json({ ok: true, duplicate: false, bucket: scheduledBucket });
       }
       return json({ error: "Unknown endpoint" }, 404);
@@ -501,5 +505,9 @@ export default {
       return;
     }
     ctx.waitUntil(synchronizeAlpaca(env, labStub(env), bucket));
+  },
+
+  async queue(batch, env) {
+    await consumeArchitectureQueue(batch, env);
   },
 };

@@ -26,6 +26,7 @@
     "crons": ["0 * * * *"]
   },
   "vars": {
+    "CONTROL_PLANE_MODE": "legacy",
     "ALPACA_DATA_FEED": "iex",
     "ALPACA_TRADING_ENABLED": "false",
     "ALPACA_SHORT_TRADING_ENABLED": "false",
