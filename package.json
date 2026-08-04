@@ -7,7 +7,7 @@
     "dev:cloudflare": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
-    "check": "node --check worker/index.js && node --check worker/engine.js && node --check worker/alpaca.js && node --check worker/auth.js && node --check worker/backtest.js && node --check worker/control-plane.js && node --check worker/gateways.js && node --check worker/jobs.js && node --check worker/market-data.js && node --check worker/universe.js && node --check public/assets/app.js && node --test worker/engine.test.js worker/alpaca.test.js worker/auth.test.js worker/backtest.test.js worker/control-plane.test.js worker/gateways.test.js worker/jobs.test.js worker/market-data.test.js worker/universe.test.js"
+    "check": "node --check worker/index.js && node --check worker/engine.js && node --check worker/alpaca.js && node --check worker/auth.js && node --check worker/backtest.js && node --check worker/control-plane.js && node --check worker/dsl.js && node --check worker/dsl-generation.js && node --check worker/gateways.js && node --check worker/jobs.js && node --check worker/market-data.js && node --check worker/universe.js && node --check public/assets/app.js && node --test worker/engine.test.js worker/alpaca.test.js worker/auth.test.js worker/backtest.test.js worker/control-plane.test.js worker/dsl.test.js worker/dsl-generation.test.js worker/dsl-golden.test.js worker/gateways.test.js worker/jobs.test.js worker/market-data.test.js worker/universe.test.js"
   },
   "devDependencies": {
     "wrangler": "^4.68.0"

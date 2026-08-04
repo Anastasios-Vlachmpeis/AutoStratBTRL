@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   INITIAL_UNIVERSE_ID,
+  INITIAL_UNIVERSE_SHA256,
   INITIAL_UNIVERSE_SYMBOLS,
   assertInitialUniverse,
   initialUniverseManifest,
@@ -19,6 +20,7 @@ test("initial IEX universe is a frozen diversified set of exactly 40 symbols", a
   assert.equal(manifest.symbols.length, 40);
   assert.equal(manifest.point_in_time_membership, false);
   assert.match(manifest.sha256, /^[a-f0-9]{64}$/);
+  assert.equal(manifest.sha256, INITIAL_UNIVERSE_SHA256);
 });
 
 test("universe manifest and membership are deterministic", async () => {
@@ -26,4 +28,3 @@ test("universe manifest and membership are deterministic", async () => {
   assert.equal(isInitialUniverseSymbol("spy"), true);
   assert.equal(isInitialUniverseSymbol("BTCUSD"), false);
 });
-

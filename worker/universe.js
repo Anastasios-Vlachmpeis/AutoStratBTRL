@@ -2,6 +2,7 @@ import { sha256 } from "./backtest.js";
 
 export const INITIAL_UNIVERSE_ID = "us-iex-liquid-40-v1";
 export const INITIAL_UNIVERSE_EFFECTIVE_FROM = "2026-08-03";
+export const INITIAL_UNIVERSE_SHA256 = "6702cf7b153c4cbbc37cd79b4a8c544456841b981fa27cdd40975fbc41d56e43";
 
 export const INITIAL_UNIVERSE_SYMBOLS = Object.freeze([
   "SPY", "QQQ", "IWM", "DIA", "TLT", "GLD", "SLV", "XLF", "XLK", "XLE", "XLV", "XLI",
@@ -60,4 +61,3 @@ export function assertInitialUniverse() {
 }
 
 assertInitialUniverse();
-

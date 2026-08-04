@@ -7,6 +7,7 @@ import {
   getMarketCalendar,
   getRecentMinuteBars,
   getResearchBars,
+  getDslResearchBars,
 } from "./alpaca.js";
 import { signedBacktest } from "./backtest.js";
 
@@ -17,6 +18,10 @@ export class AlpacaMarketDataGateway {
 
   async researchBars(symbols) {
     return getResearchBars(this.env, symbols);
+  }
+
+  async dslResearchBars(symbols) {
+    return getDslResearchBars(this.env, symbols);
   }
 
   async calendar(start, end) {

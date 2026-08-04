@@ -1,6 +1,6 @@
 # Axiom Backtester Service
 
-This is the isolated Backtrader execution service. Cloudflare remains responsible for strategy state, data sealing, release decisions, Alpaca orders and scheduling. This service is stateless: it receives one already-authorized bar slice, runs frozen strategy DNA and returns deterministic artifacts.
+This is the isolated Backtrader execution service. Cloudflare remains responsible for strategy state, data sealing, release decisions, Alpaca orders and scheduling. This service receives one already-authorized bar slice, runs frozen strategy DNA and returns deterministic artifacts.
 
 ## Contract
 

@@ -1,0 +1,30 @@
+{
+  "name": "long-short-hold-session-flatten",
+  "document": {
+    "lineage": { "trial_id": "golden-1", "generation": 1, "parent_strategy_id": null, "creation_seed": 17 },
+    "scope": { "mode": "time_series", "universe_id": "fixture-v1", "universe_sha256": "0000000000000000000000000000000000000000000000000000000000000000", "symbols": ["SPY"], "minimum_dollar_volume": 0, "allow_long": true, "allow_short": true },
+    "features": [
+      { "id": "close", "op": "close", "inputs": [], "params": {} },
+      { "id": "momentum", "op": "simple_return", "inputs": ["close"], "params": { "lag": 1 } },
+      { "id": "zero", "op": "constant", "inputs": [], "params": { "value": 0 } },
+      { "id": "long", "op": "greater_than", "inputs": ["momentum", "zero"], "params": {} },
+      { "id": "short", "op": "less_than", "inputs": ["momentum", "zero"], "params": {} }
+    ],
+    "entry": { "long": "long", "short": "short" },
+    "exit": { "flat": null },
+    "cooldown": { "bars": 0 },
+    "target": { "position_size": 0.5, "max_strategy_gross": 0.005, "per_symbol_cap": 0.005, "normalization": "unit", "ranking": "none", "reverse_on_opposite": true },
+    "session": { "timezone": "America/New_York", "regular_hours_only": true, "entry_cutoff": "15:45", "flatten_at": "15:55" },
+    "risk": { "stop_loss_bps": null, "max_turnover_per_day": 1, "max_concurrent_symbols": 1, "minimum_data_coverage": 0.9, "flatten_on_unhealthy_data": true },
+    "warmup_bars": 1
+  },
+  "bars": [
+    { "t": "2026-08-03T13:30:00Z", "o": 100, "h": 100, "l": 100, "c": 100, "v": 1000, "data_health": "healthy", "data_coverage": 1 },
+    { "t": "2026-08-03T13:35:00Z", "o": 101, "h": 101, "l": 101, "c": 101, "v": 1000, "data_health": "healthy", "data_coverage": 1 },
+    { "t": "2026-08-03T13:40:00Z", "o": 99, "h": 99, "l": 99, "c": 99, "v": 1000, "data_health": "healthy", "data_coverage": 1 },
+    { "t": "2026-08-03T13:45:00Z", "o": 99, "h": 99, "l": 99, "c": 99, "v": 1000, "data_health": "healthy", "data_coverage": 1 },
+    { "t": "2026-08-03T19:50:00Z", "o": 100, "h": 100, "l": 100, "c": 100, "v": 1000, "data_health": "healthy", "data_coverage": 1 }
+  ],
+  "expected_dna_hash": "516d2cf0dc6b4b244b0faee84d9588ac1107804503daf47249ebdf492fcf2894",
+  "expected_targets": [0, 0.0025, -0.0025, -0.0025, 0]
+}

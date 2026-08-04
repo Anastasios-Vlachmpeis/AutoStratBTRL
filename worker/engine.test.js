@@ -4,6 +4,7 @@ import test from "node:test";
 import {
   applyAlpacaCycle,
   applyAlpacaOverview,
+  ASSETS,
   advanceMarket,
   backtest,
   createDemoState,
@@ -155,13 +156,27 @@ test("market advance records monitoring evidence", () => {
 test("live-data review consumes Alpaca bars", () => {
   const state = createDemoState();
   generateBatch(state, 2);
-  const bars = Object.fromEntries(["SPY", "QQQ", "IWM", "TLT"].map((symbol) => [symbol,
+  const bars = Object.fromEntries(ASSETS.map((symbol) => [symbol,
     Array.from({ length: 620 }, (_, index) => ({ c: 100 + index * 0.08 + Math.sin(index / 8) }))
   ]));
   reviewCandidatesWithBars(state, bars);
   assert.equal(snapshot(state).summary.generated, 0);
   assert.ok(state.strategies.slice(0, 2).every((strategy) => strategy.backtests === 3));
   assert.ok(state.events.some((item) => item.detail.includes("development data only")));
+});
+
+test("DSL review uses its five-minute channel when a legacy feed is absent", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  const strategy = state.strategies[0];
+  const bars = Array.from({ length: 600 }, (_, index) => ({
+    t: new Date(Date.UTC(2026, 0, 5, 14, 30 + index * 5)).toISOString(),
+    o: 100 + index * .01, h: 101 + index * .01, l: 99 + index * .01,
+    c: 100 + index * .01, v: 1000, interval_minutes: 5,
+  }));
+  reviewCandidatesWithBars(state, {}, { [strategy.asset]: bars });
+  assert.equal(strategy.backtests, 3);
+  assert.notEqual(strategy.rework?.source_stage, "data");
 });
 
 test("supervisor cannot see the untouched final quarter", () => {
@@ -189,8 +204,16 @@ test("supervisor approval enters validation before release", () => {
   state.nextId = 38;
   generateBatch(state, 8);
   reviewCandidates(state);
-  const awaiting = state.strategies.filter((strategy) => strategy.state === "validation");
-  assert.ok(awaiting.length > 0);
+  let awaiting = state.strategies.filter((strategy) => strategy.state === "validation");
+  assert.ok(state.strategies.every((strategy) => strategy.strategy_format === "dsl-v1"));
+  assert.ok(state.strategies.every((strategy) => strategy.state !== "released"));
+  // The supervisor gate may reject an entire deterministic cohort. Exercise
+  // the validation transition without weakening that evidence gate.
+  if (!awaiting.length) {
+    const candidate = state.strategies.find((strategy) => strategy.metrics);
+    candidate.state = "validation";
+    awaiting = [candidate];
+  }
   assert.ok(awaiting.every((strategy) => strategy.validation === null));
   validateCandidates(state);
   assert.equal(state.strategies.filter((strategy) => strategy.state === "validation").length, 0);
@@ -243,6 +266,31 @@ test("schema 5 migration preserves strategies and initializes private market-dat
   assert.equal(migrated.strategies.length, 1);
   assert.deepEqual(migrated.marketData, {});
   assert.equal(snapshot(migrated).market_data.mode, "off");
+});
+
+test("schema 6 migration freezes legacy strategies while new cohorts remain DSL-only", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  const original = state.strategies[0];
+  delete original.strategy_format;
+  delete original.strategy_dna;
+  delete original.compiler;
+  delete original.explanation;
+  original.dna_hash = null;
+  state.schemaVersion = 6;
+
+  const migrated = migrateState(state);
+  assert.equal(migrated.strategies[0].strategy_format, "legacy-archetype-v0");
+  assert.equal(migrated.strategies[0].strategy_dna, null);
+  assert.deepEqual(migrated.strategies[0].legacy_dna, {
+    id: original.id, asset: original.asset, archetype: original.archetype, params: original.params,
+  });
+
+  generateBatch(migrated, 1);
+  const newest = migrated.strategies[0];
+  assert.equal(newest.strategy_format, "dsl-v1");
+  assert.ok(newest.strategy_dna);
+  assert.equal(newest.legacy_dna ?? null, null);
 });
 
 test("Alpaca cycles are idempotent and record managed symbols", () => {

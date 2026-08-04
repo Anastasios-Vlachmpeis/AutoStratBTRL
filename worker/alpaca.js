@@ -1,5 +1,6 @@
 import { evaluateStrategyWindow, latestSignal } from "./engine.js";
 import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
+import { evaluateLatestTarget } from "./dsl.js";
 
 const PAPER_BASE = "https://paper-api.alpaca.markets";
 const DATA_BASE = "https://data.alpaca.markets";
@@ -220,9 +221,19 @@ export async function getResearchBars(env, symbols) {
   return getStockBars(env, symbols, { timeframe: "1Day", start });
 }
 
+export async function getDslResearchBars(env, symbols) {
+  const start = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
+  return getStockBars(env, symbols, { timeframe: "5Min", start, adjustment: "all", maxPages: 200 });
+}
+
 export async function getMonitoringBars(env, symbols) {
   const start = new Date(Date.now() - 45 * 24 * 60 * 60 * 1000).toISOString();
   return getStockBars(env, symbols, { timeframe: "1Hour", start });
+}
+
+export async function getDslMonitoringBars(env, symbols) {
+  const start = new Date(Date.now() - 20 * 24 * 60 * 60 * 1000).toISOString();
+  return getStockBars(env, symbols, { timeframe: "5Min", start, adjustment: "all", maxPages: 50 });
 }
 
 export async function getAssets(env, symbols) {
@@ -290,7 +301,14 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
   const overview = await getAccountOverview(env);
   const active = appState.strategies.filter((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
   const symbols = [...new Set(active.map((strategy) => strategy.asset).filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)))];
-  const bars = await getMonitoringBars(env, symbols.length ? symbols : SUPPORTED_SYMBOLS);
+  const dslSymbols = [...new Set(active.filter((strategy) => strategy.strategy_format === "dsl-v1")
+    .map((strategy) => strategy.asset).filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)))];
+  const legacySymbols = symbols.filter((symbol) => !dslSymbols.includes(symbol)
+    || active.some((strategy) => strategy.asset === symbol && strategy.strategy_format !== "dsl-v1"));
+  const [legacyBars, dslBars] = await Promise.all([
+    legacySymbols.length ? getMonitoringBars(env, legacySymbols) : {},
+    dslSymbols.length ? getDslMonitoringBars(env, dslSymbols) : {},
+  ]);
   const evaluations = {};
   const desiredBySymbol = Object.fromEntries(SUPPORTED_SYMBOLS.map((symbol) => [symbol, 0]));
   const equity = overview.account.equity;
@@ -301,20 +319,24 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
   );
 
   for (const strategy of active) {
-    const symbolBars = bars[strategy.asset] ?? [];
+    const isDsl = strategy.strategy_format === "dsl-v1" && strategy.strategy_dna;
+    const symbolBars = (isDsl ? dslBars : legacyBars)[strategy.asset] ?? [];
     const prices = symbolBars.map((bar) => bar.c);
     if (prices.length < 60) continue;
-    const evaluation = evaluateStrategyWindow(strategy, prices, 21);
+    const evaluation = evaluateStrategyWindow(strategy, isDsl ? symbolBars : prices, 21);
     // Keep execution explicitly tied to the frozen strategy's signed signal.
-    const signal = latestSignal(strategy, prices);
+    const rawTarget = isDsl ? evaluateLatestTarget(strategy.strategy_dna, symbolBars) : null;
+    const signal = isDsl ? Math.sign(rawTarget) : latestSignal(strategy, prices);
     evaluations[strategy.id] = {
       ...evaluation,
       signal,
       latest_price: prices.at(-1),
       bar_time: symbolBars.at(-1).t,
     };
-    desiredBySymbol[strategy.asset] += Math.max(-strategyCap, Math.min(strategyCap,
-      strategyCap * Number(strategy.params.position_size || 0) * signal));
+    const desired = isDsl
+      ? equity * rawTarget * Number(strategy.risk_multiplier ?? 1)
+      : strategyCap * Number(strategy.params.position_size || 0) * signal;
+    desiredBySymbol[strategy.asset] += Math.max(-strategyCap, Math.min(strategyCap, desired));
   }
 
   const desiredGross = Object.values(desiredBySymbol).reduce((sum, value) => sum + Math.abs(value), 0);

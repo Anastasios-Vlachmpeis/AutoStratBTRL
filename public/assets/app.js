@@ -631,7 +631,16 @@ function renderDNA(strategy) {
   const positionSize = Math.max(0, Math.min(1, Number(strategy.params.position_size) || 0));
   const dimensions = Object.entries(strategy.params).filter(([key]) => key !== "position_size").slice(0, 3);
   const legend = dimensions.map(([key, value], index) => `<div><i class="axis-color-${index}"></i><span>${escapeHtml(labelParam(key))}</span><strong>${escapeHtml(formatDNAParameter(key, value))}</strong></div>`).join("");
+  const dna = strategy.strategy_format === "dsl-v1" ? strategy.strategy_dna : null;
+  const identity = dna ? `<section class="dsl-identity" aria-label="Typed strategy definition">
+      <div><span>TYPED DSL</span><strong>${escapeHtml(dna.strategy_id)}</strong></div>
+      <p>${escapeHtml(strategy.explanation?.summary || "A frozen, typed rule graph evaluated only from data available at each decision bar.")}</p>
+      <div class="dsl-badges">
+        <span>${dna.features.length} NODES</span><span>${dna.warmup_bars} BAR WARMUP</span><span>${pct(dna.target.max_strategy_gross, 1)} MAX GROSS</span><span>${dna.scope.symbols.length} SYMBOLS</span>
+      </div>
+    </section>` : "";
   $("#dna-content").innerHTML = `<div class="dna-lineage compact">${lineage}</div>
+    ${identity}
     <section class="dna-position-chart" aria-label="Position size ${pct(positionSize, 0)}">
       <div><span>POSITION SIZE</span><strong>${pct(positionSize, 0)}</strong></div>
       <div class="dna-position-track"><i style="width:${(positionSize * 100).toFixed(1)}%"></i><span></span><span></span><span></span></div>

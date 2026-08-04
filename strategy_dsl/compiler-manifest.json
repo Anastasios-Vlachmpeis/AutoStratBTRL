@@ -1,0 +1,43 @@
+{
+  "dsl_version": "1.0.0",
+  "semantic_version": "1.0.0",
+  "schema_file": "schema/strategy-dsl-v1.schema.json",
+  "schema_sha256": "05dcadc08adf0172b720b59d8a7efb394b5c2429a3727deacb9d808dab7b38c3",
+  "semantic_sha256": "5798d51c72aad04b9ccb0d8825af559bdc9419554dfbd1ab12aa4b61226ff452",
+  "semantic_contract": {
+    "bar_timestamp": "bar_open_utc",
+    "bar_interval": "five_minutes",
+    "decision_point": "after_completed_bar",
+    "fill_model": "next_bar_open",
+    "identity_hash_excludes": ["strategy_id", "dna_hash"],
+    "graph_order": "topological_required",
+    "missing_numeric": null,
+    "invalid_arithmetic": null,
+    "invalid_boolean": false,
+    "unhealthy_data_target": 0,
+    "both_entries_target": 0,
+    "no_entry_while_positioned": "hold",
+    "no_entry_while_flat": 0,
+    "exit_precedence": true,
+    "opposite_entry_reverses_only_when_enabled": true,
+    "cooldown_starts_after_flatten": true,
+    "window_includes_current_completed_bar": true,
+    "standard_deviation": "population",
+    "ema_seed": "first_complete_window_sma",
+    "session_clock": "America/New_York",
+    "session_decision_clock": "bar_interval_end",
+    "session_close_source": "bar.session_close_else_16:00",
+    "flatten_time": "minimum_of_dna_flatten_and_session_close",
+    "entry_cutoff_time": "minimum_of_dna_cutoff_and_15_minutes_before_session_close",
+    "position_target_unit": "fraction_of_account_equity",
+    "position_target_formula": "side*position_size*min(per_symbol_cap,max_strategy_gross/(normalization==equal_weight?max_concurrent_symbols:1))",
+    "turnover": "sum_absolute_target_changes_per_exchange_date",
+    "data_health_fields": ["data_health", "data_coverage"],
+    "compiler_limits": {
+      "nodes": 64,
+      "depth": 12,
+      "distinct_lookbacks": 12,
+      "warmup_bars": 252
+    }
+  }
+}

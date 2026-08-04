@@ -106,14 +106,18 @@ async function refreshAlpacaPortfolio(env, stub) {
 
 async function reviewWithAlpaca(env, stub) {
   const appState = await stateFrom(stub);
-  const symbols = [...new Set(appState.strategies
-    .filter((strategy) => ["generated", "rework"].includes(strategy.state))
-    .map((strategy) => strategy.asset))];
-  const bars = await createRuntimeGateways(env).marketData.researchBars(symbols);
+  const candidates = appState.strategies.filter((strategy) => ["generated", "rework"].includes(strategy.state));
+  const dslSymbols = [...new Set(candidates.filter((strategy) => strategy.strategy_format === "dsl-v1").map((strategy) => strategy.asset))];
+  const legacySymbols = [...new Set(candidates.filter((strategy) => strategy.strategy_format !== "dsl-v1").map((strategy) => strategy.asset))];
+  const gateway = createRuntimeGateways(env).marketData;
+  const [dslBars, legacyBars] = await Promise.all([
+    dslSymbols.length ? gateway.dslResearchBars(dslSymbols) : {},
+    legacySymbols.length ? gateway.researchBars(legacySymbols) : {},
+  ]);
   return stub.fetch(new Request("https://axiom.internal/internal/review-live", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ bars }),
+    body: JSON.stringify({ legacy_bars: legacyBars, dsl_bars: dslBars }),
   }));
 }
 
@@ -129,14 +133,19 @@ async function validateWithAlpaca(env, stub) {
       method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({}),
     }));
   }
-  const symbols = [...new Set(appState.strategies
-    .filter((strategy) => strategy.state === "validation")
-    .map((strategy) => strategy.asset))];
-  const bars = await createRuntimeGateways(env).marketData.researchBars(symbols);
+  const localValidation = validation.filter((strategy) => engineMode(env) === "legacy"
+    || (strategy.engine_family ?? "legacy") === "legacy");
+  const dslSymbols = [...new Set(localValidation.filter((strategy) => strategy.strategy_format === "dsl-v1").map((strategy) => strategy.asset))];
+  const legacySymbols = [...new Set(localValidation.filter((strategy) => strategy.strategy_format !== "dsl-v1").map((strategy) => strategy.asset))];
+  const gateway = createRuntimeGateways(env).marketData;
+  const [dslBars, legacyBars] = await Promise.all([
+    dslSymbols.length ? gateway.dslResearchBars(dslSymbols) : {},
+    legacySymbols.length ? gateway.researchBars(legacySymbols) : {},
+  ]);
   return stub.fetch(new Request("https://axiom.internal/internal/validate-live", {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ bars }),
+    body: JSON.stringify({ legacy_bars: legacyBars, dsl_bars: dslBars }),
   }));
 }
 
@@ -462,8 +471,8 @@ export class AxiomLab extends DurableObject {
     return artifactId;
   }
 
-  async sealDataset(state, symbol, bars) {
-    const dataset = await makeDataset(symbol, bars);
+  async sealDataset(state, symbol, bars, options = {}) {
+    const dataset = await makeDataset(symbol, bars, options);
     if (dataset.development.length < 300 || dataset.holdout.length < 100) throw new Error(`${symbol} has insufficient history for sealed backtesting`);
     state.datasets ??= {};
     if (!state.datasets[dataset.id]) {
@@ -478,11 +487,11 @@ export class AxiomLab extends DurableObject {
     return state.datasets[dataset.id];
   }
 
-  async validateLegacyStrategies(state, fallbackBars = {}) {
+  async validateLegacyStrategies(state, fallbackBars = {}, fallbackDslBars = fallbackBars) {
     const candidates = state.strategies.filter((item) => item.state === "validation"
       && (item.engine_family ?? "legacy") === "legacy");
     for (const strategy of candidates) {
-      let bars = fallbackBars[strategy.asset] ?? [];
+      let bars = (strategy.strategy_format === "dsl-v1" ? fallbackDslBars : fallbackBars)[strategy.asset] ?? [];
       if (strategy.dataset_id) {
         const [development, holdout] = await Promise.all([
           this.controlPlane.artifacts.getDatasetSlice(strategy.dataset_id, "development"),
@@ -513,20 +522,24 @@ export class AxiomLab extends DurableObject {
     return { response, job_id, config_hash, dna, dataset };
   }
 
-  async reviewRemote(state, env, barsBySymbol) {
+  async reviewRemote(state, env, barsByFormat) {
     reworkCandidates(state);
     const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
     if (!candidates.length) return this.record(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
     const byDataset = new Map();
     for (const strategy of candidates) {
       try {
-        const dataset = await this.sealDataset(state, strategy.asset, barsBySymbol[strategy.asset] ?? []);
+        const isDsl = strategy.strategy_format === "dsl-v1";
+        const barsBySymbol = isDsl ? barsByFormat.dsl : barsByFormat.legacy;
+        const dataset = await this.sealDataset(state, strategy.asset, barsBySymbol[strategy.asset] ?? [],
+          isDsl ? { timeframe: "5Min", max_bars: 20000 } : { timeframe: "1Day", max_bars: 600 });
         strategy.dna_hash ??= await frozenDna(strategy);
         strategy.engine_family ??= "backtrader";
         strategy.dataset_id ??= dataset.id;
         if (strategy.dataset_id !== dataset.id) throw new Error("strategy dataset is immutable");
-        const group = byDataset.get(dataset.id) ?? { dataset, strategies: [] };
-        group.strategies.push(strategy); byDataset.set(dataset.id, group);
+        const groupKey = `${strategy.strategy_format ?? "legacy-archetype-v0"}:${dataset.id}`;
+        const group = byDataset.get(groupKey) ?? { dataset, strategies: [] };
+        group.strategies.push(strategy); byDataset.set(groupKey, group);
       } catch (error) {
         strategy.rework = { ...(strategy.rework ?? {}), source_stage: "data", diagnosis: error.message, attempt: strategy.rework?.attempt ?? 0, max_attempts: 3, history: strategy.rework?.history ?? [] };
         strategy.state = "rework"; this.record(state, "BACKTEST_ERROR", `${strategy.name} data unavailable`, error.message);
@@ -538,10 +551,16 @@ export class AxiomLab extends DurableObject {
         for (const strategy of strategies) {
           const strategyResult = run.response.results.find((item) => String(item.strategy_id ?? item.id) === strategy.id);
           if (strategyResult?.dna_hash !== strategy.dna_hash) throw new Error(`service returned mismatched DNA for ${strategy.id}`);
+          if (strategy.strategy_format === "dsl-v1"
+              && (strategyResult?.strategy_format !== "dsl-v1"
+                || strategyResult?.compiler?.schema_sha256 !== strategy.strategy_dna.compiler.schema_sha256
+                || strategyResult?.compiler?.semantic_sha256 !== strategy.strategy_dna.compiler.semantic_sha256)) {
+            throw new Error(`service returned mismatched DSL compiler for ${strategy.id}`);
+          }
           const results = strategyResult?.windows ?? (strategyResult ? [strategyResult] : []);
           if (!results.length) throw new Error(`service returned no result for ${strategy.id}`);
           const metrics = aggregateMetrics(results);
-          const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "development", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
+          const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "development", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
             input_hash: run.response.input_hash, service_result_hash: run.response.result_hash,
             warnings: run.response.warnings ?? [] }, { strategy: strategyResult, metrics });
           strategy.backtest_runs ??= {}; strategy.backtest_runs.development = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: run.response.engine ?? { name: "backtrader" }, input_hash: run.response.input_hash,
@@ -572,16 +591,22 @@ export class AxiomLab extends DurableObject {
       return;
     }
     const groups = new Map();
-    for (const strategy of candidates) { const dataset = state.datasets?.[strategy.dataset_id]; if (!dataset) { this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, "sealed dataset missing"); continue; } const group = groups.get(dataset.id) ?? { dataset, strategies: [] }; group.strategies.push(strategy); groups.set(dataset.id, group); }
+    for (const strategy of candidates) { const dataset = state.datasets?.[strategy.dataset_id]; if (!dataset) { this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, "sealed dataset missing"); continue; } const groupKey = `${strategy.strategy_format ?? "legacy-archetype-v0"}:${dataset.id}`; const group = groups.get(groupKey) ?? { dataset, strategies: [] }; group.strategies.push(strategy); groups.set(groupKey, group); }
     for (const { dataset, strategies } of groups.values()) try {
       const run = await this.invokeBacktrader(state, "holdout", strategies, dataset);
       for (const strategy of strategies) {
         const strategyResult = run.response.results.find((item) => String(item.strategy_id ?? item.id) === strategy.id);
         if (strategyResult?.dna_hash !== strategy.dna_hash) throw new Error(`service returned mismatched DNA for ${strategy.id}`);
+        if (strategy.strategy_format === "dsl-v1"
+            && (strategyResult?.strategy_format !== "dsl-v1"
+              || strategyResult?.compiler?.schema_sha256 !== strategy.strategy_dna.compiler.schema_sha256
+              || strategyResult?.compiler?.semantic_sha256 !== strategy.strategy_dna.compiler.semantic_sha256)) {
+          throw new Error(`service returned mismatched DSL compiler for ${strategy.id}`);
+        }
         const result = strategyResult?.windows?.[0] ?? strategyResult;
         if (!result) throw new Error(`service returned no result for ${strategy.id}`);
         const validation = normalizeMetrics(result);
-        const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "holdout", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
+        const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "holdout", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
           input_hash: run.response.input_hash, service_result_hash: run.response.result_hash,
           warnings: run.response.warnings ?? [] }, { strategy: strategyResult, metrics: validation });
         strategy.backtest_runs ??= {}; strategy.backtest_runs.holdout = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: run.response.engine ?? { name: "backtrader" }, input_hash: run.response.input_hash,
@@ -660,30 +685,33 @@ export class AxiomLab extends DurableObject {
       }
       if (request.method === "POST" && url.pathname === "/internal/review-live") {
         const body = await request.json();
+        const legacyBars = body.legacy_bars ?? body.bars ?? {};
+        const dslBars = body.dsl_bars ?? body.bars ?? {};
+        const barsByFormat = { legacy: legacyBars, dsl: dslBars };
         if (!remoteEnabled(this.env)) {
           const deferred = state.strategies.filter((item) => ["generated", "rework"].includes(item.state)
             && item.engine_family === "backtrader").map((item) => [item, item.state]);
           deferred.forEach(([item]) => { item.state = "engine-deferred"; });
           state.strategies.filter((item) => ["generated", "rework"].includes(item.state)).forEach((item) => { item.engine_family ??= "legacy"; });
-          reviewCandidatesWithBars(state, body.bars ?? {});
+          reviewCandidatesWithBars(state, legacyBars, dslBars);
           deferred.forEach(([item, priorState]) => {
             item.state = priorState;
             this.record(state, "BACKTEST_ERROR", `${item.name} review deferred`, "Backtrader engine is unavailable; engine family was not changed");
           });
           state.strategies.filter((item) => item.metrics && !item.engine_family).forEach((item) => { item.engine_family = "legacy"; });
         }
-        else if (engineMode(this.env) === "backtrader") await this.reviewRemote(state, this.env, body.bars ?? {});
+        else if (engineMode(this.env) === "backtrader") await this.reviewRemote(state, this.env, barsByFormat);
         else {
           // Shadow runs write provenance only; lifecycle decisions remain legacy.
           const shadow = structuredClone(state);
-          await this.reviewRemote(shadow, this.env, body.bars ?? {});
+          await this.reviewRemote(shadow, this.env, barsByFormat);
           state.datasets = shadow.datasets;
           state.backtestArtifacts = shadow.backtestArtifacts;
           const backtraderDeferred = state.strategies.filter((item) => ["generated", "rework"].includes(item.state)
             && item.engine_family === "backtrader").map((item) => [item, item.state]);
           backtraderDeferred.forEach(([item]) => { item.state = "engine-deferred"; });
           state.strategies.filter((item) => ["generated", "rework"].includes(item.state)).forEach((item) => { item.engine_family ??= "legacy"; });
-          reviewCandidatesWithBars(state, body.bars ?? {});
+          reviewCandidatesWithBars(state, legacyBars, dslBars);
           backtraderDeferred.forEach(([item, priorState]) => { item.state = priorState; });
           for (const remote of shadow.strategies) {
             if (remote.engine_family === "backtrader" && !state.strategies.some((item) => item.id === remote.id)) {
@@ -720,9 +748,11 @@ export class AxiomLab extends DurableObject {
       }
       if (request.method === "POST" && url.pathname === "/internal/validate-live") {
         const body = await request.json();
+        const legacyBars = body.legacy_bars ?? body.bars ?? {};
+        const dslBars = body.dsl_bars ?? body.bars ?? {};
         if (!remoteEnabled(this.env)) {
           const awaiting = state.strategies.filter((item) => item.state === "validation");
-          const hasLegacy = await this.validateLegacyStrategies(state, body.bars ?? {});
+          const hasLegacy = await this.validateLegacyStrategies(state, legacyBars, dslBars);
           awaiting.filter((item) => item.engine_family === "backtrader").forEach((item) => {
             this.record(state, "BACKTEST_ERROR", `${item.name} validation deferred`, "Backtrader engine is unavailable; holdout was not run by another engine");
           });
@@ -734,7 +764,7 @@ export class AxiomLab extends DurableObject {
           const hasLegacy = awaiting.some((item) => (item.engine_family ?? "legacy") === "legacy");
           const hasRemote = awaiting.some((item) => item.engine_family === "backtrader");
           if (!awaiting.length) this.record(state, "VALIDATE", "No strategies awaiting validation", "Supervisor approval is required before holdout testing.");
-          if (hasLegacy) await this.validateLegacyStrategies(state, body.bars ?? {});
+          if (hasLegacy) await this.validateLegacyStrategies(state, legacyBars, dslBars);
           if (hasRemote) await this.validateRemote(state, this.env, { advanceClock: false, silent: true });
           if (hasLegacy || hasRemote) state.marketClock += 5;
         }
@@ -757,7 +787,7 @@ export class AxiomLab extends DurableObject {
             strategy.backtest_runs ??= {};
             strategy.backtest_runs.shadow_validation = { ...remote.backtest_runs.holdout, phase: "holdout", remote_metrics: remote.validation, comparison: comparison(strategy.validation, remote.validation) };
           }
-          await this.validateLegacyStrategies(state, body.bars ?? {});
+          await this.validateLegacyStrategies(state, legacyBars, dslBars);
           if (awaiting) state.marketClock += 5;
           state.strategies.forEach((strategy) => {
             if (strategy.backtest_runs?.shadow_validation) strategy.backtest_runs.shadow_validation.comparison = comparison(strategy.validation, strategy.backtest_runs.shadow_validation.remote_metrics);

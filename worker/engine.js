@@ -1,15 +1,19 @@
 /** Deterministic strategy generation, backtesting, and lifecycle supervision. */
 
+import { evaluateLatestTarget, evaluateStrategyTargets } from "./dsl.js";
+import { DSL_FAMILIES, buildGeneratedStrategyDNA } from "./dsl-generation.js";
+import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
+
 export const REGIMES = ["Expansion", "Compression", "Stress", "Recovery"];
-export const ASSETS = ["SPY", "QQQ", "IWM", "TLT"];
-export const CURRENT_SCHEMA_VERSION = 6;
+export const ASSETS = [...INITIAL_UNIVERSE_SYMBOLS];
+export const CURRENT_SCHEMA_VERSION = 7;
 
 const NAMES = [
   "Orion Pulse", "Kestrel Drift", "Helix Break", "Cobalt Revert",
   "Nimbus Edge", "Atlas Flux", "Vega Current", "Sable Vector",
   "Aster Signal", "Parallax Run", "Ion Cascade", "Morrow Wave",
 ];
-const ARCHETYPES = ["Momentum", "Mean reversion", "Breakout", "Volatility filter"];
+const ARCHETYPES = DSL_FAMILIES;
 const ACTIVE_STATES = new Set(["released", "healthy", "watch", "adjusted"]);
 
 class SeededRandom {
@@ -57,7 +61,7 @@ const clone = (value) => structuredClone(value);
 
 export function marketSeries(seed, length = 420, assetIndex = 0) {
   const rng = new SeededRandom(seed * 97 + assetIndex * 7919);
-  let price = [450, 380, 190, 100][assetIndex];
+  let price = [450, 380, 190, 100][assetIndex % 4];
   const prices = [price];
   const labels = [];
   const specs = {
@@ -67,7 +71,7 @@ export function marketSeries(seed, length = 420, assetIndex = 0) {
     Recovery: [0.00095, 0.0105],
   };
   const segment = Math.max(1, Math.floor(length / 4));
-  const assetVolatility = [1.0, 1.15, 0.62, 0.35][assetIndex];
+  const assetVolatility = [1.0, 1.15, 0.62, 0.35][assetIndex % 4];
   let memory = 0;
 
   for (let index = 0; index < length - 1; index += 1) {
@@ -85,7 +89,35 @@ export function marketSeries(seed, length = 420, assetIndex = 0) {
   return { prices, labels };
 }
 
+function strategyFormat(strategy) {
+  return strategy?.strategy_format === "dsl-v1" && strategy?.strategy_dna ? "dsl-v1" : "legacy-archetype-v0";
+}
+
+function barsForEvaluation(values) {
+  if (!Array.isArray(values)) return [];
+  const start = new Date("2026-01-05T14:30:00Z");
+  let cursor = new Date(start);
+  if (values.every((item) => item && typeof item === "object")) return values.map((item) => {
+    while ([0, 6].includes(cursor.getUTCDay())) cursor.setUTCDate(cursor.getUTCDate() + 1);
+    const point = {
+      ...item, t: item.t ?? cursor.toISOString(), o: Number(item.o ?? item.c), h: Number(item.h ?? item.c),
+      l: Number(item.l ?? item.c), c: Number(item.c), v: Number(item.v ?? 0),
+    };
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    return point;
+  });
+  return values.map((value) => {
+    while ([0, 6].includes(cursor.getUTCDay())) cursor.setUTCDate(cursor.getUTCDate() + 1);
+    const point = { t: cursor.toISOString(), o: Number(value), h: Number(value), l: Number(value), c: Number(value), v: 1 };
+    cursor.setUTCDate(cursor.getUTCDate() + 1);
+    return point;
+  });
+}
+
 function signal(strategy, prices) {
+  if (strategyFormat(strategy) === "dsl-v1") {
+    return Math.sign(evaluateLatestTarget(strategy.strategy_dna, barsForEvaluation(prices)));
+  }
   const params = strategy.params;
   if (strategy.archetype === "Momentum") {
     if (prices.length < params.slow) return 0;
@@ -125,6 +157,21 @@ export function latestSignal(strategy, prices) {
 }
 
 export function evaluateStrategyWindow(strategy, prices, window = 21) {
+  if (strategyFormat(strategy) === "dsl-v1") {
+    const bars = barsForEvaluation(prices);
+    const targets = evaluateStrategyTargets(strategy.strategy_dna, bars).targets;
+    const returns = [];
+    const start = Math.max(52, bars.length - window - 1);
+    let priorPosition = 0;
+    for (let index = start; index < bars.length - 1; index += 1) {
+      const position = targets[index] * Number(strategy.risk_multiplier ?? 1);
+      const marketReturn = bars[index + 1].c / bars[index].c - 1;
+      const cost = Math.abs(position - priorPosition) * 0.0005;
+      returns.push(position * marketReturn - cost);
+      priorPosition = position;
+    }
+    return { signal: Math.sign(targets.at(-1) ?? 0), target: targets.at(-1) ?? 0, returns };
+  }
   const returns = [];
   const start = Math.max(52, prices.length - window - 1);
   let priorPosition = 0;
@@ -140,6 +187,10 @@ export function evaluateStrategyWindow(strategy, prices, window = 21) {
 }
 
 export function backtest(strategy, prices, regimes) {
+  const bars = barsForEvaluation(prices);
+  const closePrices = bars.map((bar) => bar.c);
+  const dslTargets = strategyFormat(strategy) === "dsl-v1"
+    ? evaluateStrategyTargets(strategy.strategy_dna, bars).targets : null;
   const size = strategy.params.position_size;
   let equity = 1;
   const curve = [equity];
@@ -151,9 +202,11 @@ export function backtest(strategy, prices, regimes) {
   let priorPosition = 0;
   const warmup = 52;
 
-  for (let index = warmup; index < prices.length - 1; index += 1) {
-    const position = signal(strategy, prices.slice(0, index + 1)) * size;
-    const marketReturn = prices[index + 1] / prices[index] - 1;
+  for (let index = warmup; index < closePrices.length - 1; index += 1) {
+    const position = dslTargets
+      ? dslTargets[index] * Number(strategy.risk_multiplier ?? 1)
+      : signal(strategy, closePrices.slice(0, index + 1)) * size;
+    const marketReturn = closePrices[index + 1] / closePrices[index] - 1;
     const cost = Math.abs(position - priorPosition) * 0.0005;
     const daily = position * marketReturn - cost;
     equity *= Math.max(0.01, 1 + daily);
@@ -254,14 +307,14 @@ function event(state, kind, title, detail) {
 
 function parameters(archetype, rng) {
   const size = round(rng.between(0.42, 0.90), 2);
-  if (archetype === "Momentum") {
+  if (archetype === "Dual average trend") {
     const fast = rng.integer(5, 14);
     return { fast, slow: rng.integer(fast + 12, fast + 38), threshold: round(rng.between(0.001, 0.008), 4), position_size: size };
   }
-  if (archetype === "Mean reversion") {
+  if (archetype === "Residual reversion") {
     return { lookback: rng.integer(12, 34), entry_z: round(rng.between(0.75, 1.75), 2), exit_z: 0.35, position_size: size };
   }
-  if (archetype === "Breakout") {
+  if (archetype === "Range expansion") {
     return { lookback: rng.integer(12, 38), buffer: round(rng.between(0.0005, 0.006), 4), position_size: size };
   }
   return { lookback: rng.integer(9, 24), vol_ceiling: round(rng.between(0.16, 0.42), 2), threshold: round(rng.between(0.004, 0.018), 3), position_size: size };
@@ -284,6 +337,7 @@ function newStrategy(state, parent = null, mutateParent = true) {
   const strategyId = `AX-${String(state.cycle).padStart(2, "0")}-${String(state.nextId).padStart(3, "0")}`;
   const rng = new SeededRandom(state.seed + state.nextId * 103 + state.cycle);
   state.nextId += 1;
+  if (parent && strategyFormat(parent) !== "dsl-v1") throw new Error("Legacy strategies are replay-only and cannot create new autonomous DNA");
   const archetype = parent ? parent.archetype : rng.pick(ARCHETYPES);
   const asset = parent ? parent.asset : rng.pick(ASSETS);
   const params = parent ? clone(parent.params) : parameters(archetype, rng);
@@ -297,6 +351,11 @@ function newStrategy(state, parent = null, mutateParent = true) {
     params.position_size = round(clamp(params.position_size * 0.92, 0.2, 1), 2);
   }
   const name = `${NAMES[(state.nextId - 1) % NAMES.length]} ${String.fromCharCode(65 + state.cycle % 26)}${state.nextId % 10}`;
+  const generation = parent ? parent.generation + 1 : 1;
+  const built = buildGeneratedStrategyDNA({
+    family: archetype, params, seed: state.seed + (state.nextId - 1) * 103 + state.cycle,
+    trialId: strategyId, generation, parentStrategyId: parent?.strategy_dna?.strategy_id ?? null,
+  });
   return {
     id: strategyId,
     name,
@@ -304,18 +363,37 @@ function newStrategy(state, parent = null, mutateParent = true) {
     asset,
     params,
     state: "generated",
-    generation: parent ? parent.generation + 1 : 1,
+    generation,
     parent: parent?.id ?? null,
     backtests: 0,
     metrics: null,
     validation: null,
-    dna_hash: null,
+    strategy_format: "dsl-v1",
+    strategy_dna: built.dna,
+    explanation: built.explanation,
+    dna_hash: built.dna.dna_hash,
+    compiler: built.dna.compiler,
+    risk_multiplier: 1,
     engine_family: null,
     dataset_id: null,
     backtest_runs: {},
     rework: emptyRework(parent?.rework?.attempt ?? 0, parent?.rework?.history ?? []),
     monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
   };
+}
+
+function refreshStrategyDNA(strategy, parent = null) {
+  if (strategyFormat(strategy) !== "dsl-v1") return strategy;
+  const built = buildGeneratedStrategyDNA({
+    family: strategy.archetype, params: strategy.params,
+    seed: strategy.strategy_dna.lineage.creation_seed, trialId: strategy.id,
+    generation: strategy.generation, parentStrategyId: parent?.strategy_dna?.strategy_id ?? strategy.strategy_dna.lineage.parent_strategy_id,
+  });
+  strategy.strategy_dna = built.dna;
+  strategy.explanation = built.explanation;
+  strategy.dna_hash = built.dna.dna_hash;
+  strategy.compiler = built.dna.compiler;
+  return strategy;
 }
 
 export function generateBatch(state, count = 6, bootstrap = false) {
@@ -342,17 +420,17 @@ function diagnoseDevelopment(strategy) {
     return { code: "risk", text: "development drawdown is too close to the risk limit", key: "position_size", factor: 0.80 };
   }
   if ((metrics.trades ?? 0) < 18) {
-    const key = strategy.archetype === "Mean reversion" ? "entry_z"
-      : strategy.archetype === "Breakout" ? "buffer" : "threshold";
+    const key = strategy.archetype === "Residual reversion" ? "entry_z"
+      : strategy.archetype === "Range expansion" ? "buffer" : "threshold";
     return { code: "frequency", text: "development produced too few independent trades", key, factor: 0.82 };
   }
   if ((metrics.positive_regimes ?? 0) < 3 || (metrics.robustness ?? 0) < 0.60) {
-    const key = strategy.archetype === "Momentum" ? "slow" : "lookback";
+    const key = strategy.archetype === "Dual average trend" ? "slow" : "lookback";
     return { code: "robustness", text: "development performance is not broad enough across regimes", key };
   }
-  const key = strategy.archetype === "Mean reversion" ? "entry_z"
-    : strategy.archetype === "Breakout" ? "buffer"
-      : strategy.archetype === "Momentum" ? "threshold" : "lookback";
+  const key = strategy.archetype === "Residual reversion" ? "entry_z"
+    : strategy.archetype === "Range expansion" ? "buffer"
+      : strategy.archetype === "Dual average trend" ? "threshold" : "lookback";
   return { code: "edge", text: "development edge is below the promotion threshold", key, factor: 0.88 };
 }
 
@@ -389,6 +467,7 @@ function mutateDevelopmentDNA(state, parent) {
   }
   if (after === before) after = Number.isInteger(before) ? before + 1 : round(before * 0.9, 4);
   child.params[diagnosis.key] = after;
+  refreshStrategyDNA(child, parent);
   const change = { parameter: diagnosis.key, from: before, to: after };
   const history = [
     ...(parent.rework?.history ?? []),
@@ -493,7 +572,7 @@ function marketRegimes(prices) {
   });
 }
 
-export function reviewCandidatesWithBars(state, barsBySymbol) {
+export function reviewCandidatesWithBars(state, barsBySymbol, dslBarsBySymbol = barsBySymbol) {
   reworkCandidates(state);
   const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
   const validationPool = state.strategies.filter((item) => item.state === "rework" && item.rework?.source_stage === "capacity");
@@ -502,10 +581,11 @@ export function reviewCandidatesWithBars(state, barsBySymbol) {
     return;
   }
   for (const strategy of candidates) {
-    const allPrices = (barsBySymbol[strategy.asset] ?? []).map((bar) => Number(bar.c)).filter((value) => Number.isFinite(value) && value > 0);
+    const sourceBars = strategyFormat(strategy) === "dsl-v1" ? dslBarsBySymbol : barsBySymbol;
+    const allPrices = (sourceBars[strategy.asset] ?? []).map((bar) => Number(bar.c)).filter((value) => Number.isFinite(value) && value > 0);
     if (allPrices.length < 400) {
       queueRework(strategy, "data", `waiting for sufficient Alpaca history (${allPrices.length}/400 bars)`);
-      event(state, "REWORK", `${strategy.name} waiting for data`, `Only ${allPrices.length} Alpaca daily bars were available.`);
+      event(state, "REWORK", `${strategy.name} waiting for data`, `Only ${allPrices.length} compatible Alpaca bars were available.`);
       continue;
     }
     const prices = allPrices.slice(-600);
@@ -515,9 +595,9 @@ export function reviewCandidatesWithBars(state, barsBySymbol) {
     const ends = [Math.floor(development.length * 0.80), Math.floor(development.length * 0.90), development.length];
     const results = ends.map((end) => {
       const start = Math.max(0, end - windowSize);
-      const windowBars = (barsBySymbol[strategy.asset] ?? []).slice(-600).slice(0, developmentEnd).slice(start, end);
+      const windowBars = (sourceBars[strategy.asset] ?? []).slice(-600).slice(0, developmentEnd).slice(start, end);
       const windowPrices = windowBars.map((bar) => Number(bar.c));
-      const result = backtest(strategy, windowPrices, marketRegimes(windowPrices));
+      const result = backtest(strategy, windowBars, marketRegimes(windowPrices));
       result.trade_events = result.trade_events.map((trade) => ({ ...trade,
         signal_time: windowBars[trade.signal_index]?.t ?? null,
         fill_time: windowBars[trade.fill_index]?.t ?? null,
@@ -590,7 +670,7 @@ export function validateCandidates(state, bootstrap = false) {
   state.marketClock += 5;
 }
 
-export function validateCandidatesWithBars(state, barsBySymbol, options = {}) {
+export function validateCandidatesWithBars(state, barsBySymbol, options = {}, dslBarsBySymbol = barsBySymbol) {
   const family = options.family ?? null;
   const strategyIds = options.strategyIds ? new Set(options.strategyIds) : null;
   const candidates = state.strategies.filter((item) => item.state === "validation"
@@ -601,14 +681,16 @@ export function validateCandidatesWithBars(state, barsBySymbol, options = {}) {
     return;
   }
   for (const strategy of candidates) {
-    const allPrices = (barsBySymbol[strategy.asset] ?? []).map((bar) => Number(bar.c)).filter((value) => Number.isFinite(value) && value > 0).slice(-600);
+    const sourceBars = strategyFormat(strategy) === "dsl-v1" ? dslBarsBySymbol : barsBySymbol;
+    const allPrices = (sourceBars[strategy.asset] ?? []).map((bar) => Number(bar.c)).filter((value) => Number.isFinite(value) && value > 0).slice(-600);
     const validationStart = Math.floor(allPrices.length * 0.75);
     const holdout = allPrices.slice(validationStart);
     if (holdout.length < 100) {
       event(state, "VALIDATE", `${strategy.name} validation deferred`, `Only ${holdout.length} untouched bars were available; frozen DNA remains in validation.`);
       continue;
     }
-    const result = backtest(strategy, holdout, marketRegimes(holdout));
+    const holdoutBars = (sourceBars[strategy.asset] ?? []).slice(-600).slice(validationStart);
+    const result = backtest(strategy, holdoutBars, marketRegimes(holdout));
     strategy.backtests += 1;
     strategy.validation = result;
     const [nextState, reason] = validationVerdict(strategy, result);
@@ -663,7 +745,8 @@ export function advanceMarket(state, periods = 1, bootstrap = false) {
         event(state, "DROP", `${strategy.name} retired`, `monitor Sharpe ${sharpe.toFixed(2)} · rolling DD ${(drawdown * 100).toFixed(1)}%`);
       } else if (monitor.streak >= 2) {
         strategy.state = "adjusted";
-        strategy.params.position_size = round(strategy.params.position_size * 0.80, 2);
+        if (strategyFormat(strategy) === "dsl-v1") strategy.risk_multiplier = round(Number(strategy.risk_multiplier ?? 1) * 0.80, 4);
+        else strategy.params.position_size = round(strategy.params.position_size * 0.80, 2);
         monitor.adjustments += 1;
         monitor.streak = 0;
         event(state, "ADJUST", `${strategy.name} risk reduced`, "position size cut 20% after two weak monitor windows.");
@@ -705,7 +788,8 @@ function monitorStrategy(state, strategy, newReturns) {
     event(state, "DROP", `${strategy.name} retired`, `Alpaca monitor Sharpe ${sharpe.toFixed(2)} · rolling DD ${(drawdown * 100).toFixed(1)}%`);
   } else if (monitor.streak >= 2) {
     strategy.state = "adjusted";
-    strategy.params.position_size = round(strategy.params.position_size * 0.80, 2);
+    if (strategyFormat(strategy) === "dsl-v1") strategy.risk_multiplier = round(Number(strategy.risk_multiplier ?? 1) * 0.80, 4);
+    else strategy.params.position_size = round(strategy.params.position_size * 0.80, 2);
     monitor.adjustments += 1;
     monitor.streak = 0;
     event(state, "ADJUST", `${strategy.name} risk reduced`, "position size cut 20% after two weak live-data windows.");
@@ -820,6 +904,14 @@ export function migrateState(state) {
   migrated.schemaVersion = CURRENT_SCHEMA_VERSION;
   migrated.strategies = (migrated.strategies ?? []).map((strategy) => ({
     ...strategy,
+    strategy_format: strategy.strategy_format ?? (strategy.strategy_dna ? "dsl-v1" : "legacy-archetype-v0"),
+    legacy_dna: strategy.strategy_dna ? (strategy.legacy_dna ?? null) : (strategy.legacy_dna ?? {
+      id: strategy.id, asset: strategy.asset, archetype: strategy.archetype, params: clone(strategy.params ?? {}),
+    }),
+    strategy_dna: strategy.strategy_dna ?? null,
+    explanation: strategy.explanation ?? null,
+    compiler: strategy.compiler ?? strategy.strategy_dna?.compiler ?? null,
+    risk_multiplier: Number(strategy.risk_multiplier ?? 1),
     rework: strategy.rework ?? emptyRework(),
     dna_hash: strategy.dna_hash ?? null,
     engine_family: strategy.engine_family ?? null,

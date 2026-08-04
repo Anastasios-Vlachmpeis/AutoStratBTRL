@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { aggregateMetrics, buildBacktestPayload, cleanBars, comparison, developmentWindows, frozenDna, makeDataset, normalizeMetrics,
   remoteEnabled, sha256, signedBacktest, validationDecision } from "./backtest.js";
+import { buildGeneratedStrategyDNA } from "./dsl-generation.js";
 
 test("sealed datasets split immutable development and holdout slices", async () => {
   const bars = Array.from({ length: 600 }, (_, index) => ({ t: `2026-01-${String(index + 1).padStart(3, "0")}`, o: 100 + index, h: 101 + index, l: 99 + index, c: 100 + index, v: 10 }));
@@ -9,6 +10,7 @@ test("sealed datasets split immutable development and holdout slices", async () 
   assert.equal(dataset.development.length, 450);
   assert.equal(dataset.holdout.length, 150);
   assert.ok(dataset.id.includes(dataset.sha256.slice(0, 16)));
+  assert.ok(dataset.development.every((bar) => bar.interval_minutes === 1440));
   assert.deepEqual(developmentWindows(dataset.development).map((item) => item.end), [360, 405, 450]);
 });
 
@@ -26,6 +28,25 @@ test("canonical hashes include nested DNA parameters", async () => {
   const first = await frozenDna(strategy);
   strategy.params.fast = 6;
   assert.notEqual(first, await frozenDna(strategy));
+});
+
+test("DSL payloads carry a discriminated immutable document without legacy executable fields", async () => {
+  const built = buildGeneratedStrategyDNA({ family: "Dual average trend",
+    params: { fast: 5, slow: 20, threshold: .001, position_size: .5 }, seed: 4, trialId: "AX-DSL" });
+  const strategy = { id: "AX-DSL", asset: "SPY", strategy_format: "dsl-v1",
+    strategy_dna: built.dna, dna_hash: built.dna.dna_hash };
+  const bars = Array.from({ length: 600 }, (_, index) => ({
+    t: new Date(Date.UTC(2024, 0, index + 1, 14, 30)).toISOString(),
+    o: 100 + index, h: 101 + index, l: 99 + index, c: 100 + index, v: 10,
+  }));
+  const dataset = await makeDataset("SPY", bars, { timeframe: "5Min" });
+  const { payload } = await buildBacktestPayload("development", [strategy], dataset, dataset.development);
+  assert.equal(await frozenDna(strategy), built.dna.dna_hash);
+  assert.equal(payload.strategies[0].strategy_format, "dsl-v1");
+  assert.deepEqual(payload.strategies[0].dna, built.dna);
+  assert.equal("archetype" in payload.strategies[0], false);
+  assert.equal("params" in payload.strategies[0], false);
+  assert.ok(payload.bars.every((bar) => bar.interval_minutes === 5));
 });
 
 test("service payload contains only the permitted slice and exact contract fields", async () => {

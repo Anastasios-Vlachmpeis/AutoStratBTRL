@@ -1,5 +1,7 @@
 /** Cloudflare control-plane helpers for the remote Backtrader runner. */
 
+import { validateStrategyDNA } from "./dsl.js";
+
 const encoder = new TextEncoder();
 const stable = (value) => {
   const canonical = (item) => {
@@ -43,20 +45,28 @@ export function cleanBars(raw) {
   return (raw ?? []).map((bar) => ({
     t: String(bar.t ?? ""), o: Number(bar.o ?? bar.c), h: Number(bar.h ?? bar.c),
     l: Number(bar.l ?? bar.c), c: Number(bar.c), v: Number(bar.v ?? 0),
+    ...(bar.session_close ? { session_close: String(bar.session_close) } : {}),
+    ...(bar.data_health ? { data_health: String(bar.data_health) } : {}),
+    ...(bar.data_coverage !== undefined ? { data_coverage: Number(bar.data_coverage) } : {}),
+    ...(bar.interval_minutes !== undefined ? { interval_minutes: Number(bar.interval_minutes) } : {}),
   })).filter((bar) => bar.t && Number.isFinite(bar.o) && Number.isFinite(bar.h)
     && Number.isFinite(bar.l) && Number.isFinite(bar.c) && bar.c > 0 && !seen.has(bar.t) && (seen.add(bar.t) || true))
     .sort((left, right) => left.t.localeCompare(right.t));
 }
 
-export async function makeDataset(symbol, rawBars) {
-  const bars = cleanBars(rawBars).slice(-600);
+export async function makeDataset(symbol, rawBars, options = {}) {
+  const maxBars = Math.max(600, Number(options.max_bars ?? 600));
+  const timeframe = String(options.timeframe ?? "1Day");
+  const defaultInterval = timeframe.toLowerCase() === "5min" ? 5 : timeframe.toLowerCase() === "1day" ? 1440 : undefined;
+  const bars = cleanBars(rawBars).map((bar) => bar.interval_minutes === undefined && defaultInterval
+    ? { ...bar, interval_minutes: defaultInterval } : bar).slice(-maxBars);
   const split = Math.floor(bars.length * 0.75);
   const development = bars.slice(0, split);
   const holdout = bars.slice(split);
   const hash = await sha256(bars);
   return {
-    id: `dataset-${symbol.toLowerCase()}-${hash.slice(0, 16)}`,
-    symbol, timeframe: "1Day", bar_count: bars.length, split_index: split,
+    id: `dataset-${symbol.toLowerCase()}-${timeframe.toLowerCase()}-${hash.slice(0, 16)}`,
+    symbol, timeframe, bar_count: bars.length, split_index: split,
     start: bars.at(0)?.t ?? null, end: bars.at(-1)?.t ?? null, sha256: hash,
     development, holdout,
   };
@@ -71,6 +81,10 @@ export function developmentWindows(bars) {
 }
 
 export async function frozenDna(strategy) {
+  if (strategy?.strategy_format === "dsl-v1") {
+    validateStrategyDNA(strategy.strategy_dna);
+    return strategy.strategy_dna.dna_hash;
+  }
   return sha256({ id: strategy.id, asset: strategy.asset, archetype: strategy.archetype, params: strategy.params });
 }
 
@@ -89,8 +103,13 @@ export async function buildBacktestPayload(phase, strategies, dataset, bars) {
   return {
     config_hash, dna, slice_hash: sliceHash,
     payload: {
-      job_id, phase, strategies: dna.map((item) => ({ id: item.id, asset: item.asset,
-        archetype: item.archetype, params: item.params, dna_hash: item.dna_hash })),
+      job_id, phase, strategies: dna.map((item) => item.strategy_format === "dsl-v1" ? ({
+        strategy_format: "dsl-v1", id: item.id, asset: item.asset,
+        dna: item.strategy_dna, dna_hash: item.strategy_dna.dna_hash,
+      }) : ({
+        strategy_format: "legacy-archetype-v0", id: item.id, asset: item.asset,
+        archetype: item.archetype, params: item.params, dna_hash: item.dna_hash,
+      })),
       dataset: { snapshot_id: dataset.id, symbol: dataset.symbol, timeframe: dataset.timeframe,
         start: bars.at(0).t, end: bars.at(-1).t, bar_count: bars.length, sha256: sliceHash },
       bars, windows: phase === "development" ? developmentWindows(bars)

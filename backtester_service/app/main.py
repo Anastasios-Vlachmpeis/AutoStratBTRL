@@ -14,6 +14,8 @@ import backtrader as bt
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .dsl import MANIFEST as DSL_COMPILER_MANIFEST, TargetStateMachine, canonical_json as dsl_canonical_json, validate_strategy_dna
+
 ENGINE_NAME = "backtrader"
 ENGINE_VERSION = "1.9.78.123"
 WARMUP_BARS = 52
@@ -32,7 +34,7 @@ APPROVED_CONFIG = {
 
 
 def canonical_json(value: Any) -> bytes:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False).encode()
+    return dsl_canonical_json(value)
 
 
 def digest(value: Any) -> str:
@@ -54,6 +56,10 @@ class Bar(BaseModel):
     c: float
     v: float = 0
     regime: str | None = None
+    session_close: str | None = None
+    data_health: Literal["healthy", "delayed", "gapped", "revising", "closed", "unknown"] | None = None
+    data_coverage: float | None = Field(default=None, ge=0, le=1)
+    interval_minutes: int = Field(default=5, ge=1, le=1440)
 
     @field_validator("o", "h", "l", "c", "v")
     @classmethod
@@ -91,6 +97,7 @@ class DatasetManifest(BaseModel):
 
 class StrategyDNA(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    strategy_format: Literal["legacy-archetype-v0"] = "legacy-archetype-v0"
     id: str = Field(min_length=1, max_length=200)
     asset: str = Field(min_length=1, max_length=32)
     archetype: str
@@ -137,6 +144,24 @@ class StrategyDNA(BaseModel):
         return self
 
 
+class DSLStrategyDNA(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    strategy_format: Literal["dsl-v1"]
+    id: str = Field(min_length=1, max_length=200)
+    asset: str = Field(min_length=1, max_length=32)
+    dna: dict[str, Any]
+    dna_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @model_validator(mode="after")
+    def valid_dsl(self) -> "DSLStrategyDNA":
+        frozen = validate_strategy_dna(self.dna)
+        if not hmac.compare_digest(frozen.dna_hash, self.dna_hash):
+            raise ValueError("envelope dna_hash does not match DSL document")
+        if self.asset not in frozen.scope["symbols"]:
+            raise ValueError("dataset asset is outside the frozen DSL scope")
+        return self
+
+
 class Window(BaseModel):
     model_config = ConfigDict(extra="forbid")
     id: str = Field(min_length=1, max_length=100)
@@ -168,7 +193,7 @@ class BacktestRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     job_id: str = Field(min_length=1, max_length=200)
     phase: Literal["development", "holdout", "shadow"]
-    strategies: list[StrategyDNA] = Field(min_length=1, max_length=12)
+    strategies: list[StrategyDNA | DSLStrategyDNA] = Field(min_length=1, max_length=12)
     dataset: DatasetManifest
     bars: list[Bar] = Field(min_length=WARMUP_BARS + 2)
     windows: list[Window] = Field(min_length=1, max_length=3)
@@ -192,6 +217,8 @@ class BacktestRequest(BaseModel):
             raise ValueError("bars must have strictly increasing timestamps")
         if self.dataset.start != stamps[0] or self.dataset.end != stamps[-1]:
             raise ValueError("dataset bounds do not match submitted bars")
+        if any(strategy.asset != self.dataset.symbol for strategy in self.strategies):
+            raise ValueError("every strategy must match the sealed single-symbol dataset")
         seen: set[str] = set()
         for window in self.windows:
             if window.id in seen or window.end > len(bars) or window.end - window.start < WARMUP_BARS + 2:
@@ -229,6 +256,12 @@ class BarFeed(bt.feed.DataBase):
         self.lines.volume[0] = row["v"]
         self._index += 1
         return True
+
+
+class FractionalCommissionInfo(bt.CommissionInfo):
+    """Backtrader's stock sizing floors to whole shares; research targets require fractions."""
+    def getsize(self, price: float, cash: float) -> float:
+        return self.p.leverage * (cash / price) if price else 0.0
 
 
 def mean(values: list[float]) -> float:
@@ -276,7 +309,7 @@ def strategy_signal(archetype: str, params: dict[str, float | int], prices: list
 
 
 class FrozenDNA(bt.Strategy):
-    params = (("dna", None), ("warmup", WARMUP_BARS))
+    params = (("dna", None), ("bars", None), ("warmup", WARMUP_BARS))
 
     def __init__(self) -> None:
         self.closes: list[float] = []
@@ -287,13 +320,19 @@ class FrozenDNA(bt.Strategy):
         self.exposure_curve: list[dict[str, Any]] = []
         self.pending_order: bt.Order | None = None
         self.target_exposure = 0.0
+        self.dsl_machine = TargetStateMachine(self.p.dna["dna"]) if self.p.dna.get("strategy_format") == "dsl-v1" else None
 
     def next(self) -> None:
         self.closes.append(float(self.data.close[0]))
         current_index = len(self.closes) - 1
         target = 0.0
         signal = 0
-        if current_index >= self.p.warmup:
+        if self.dsl_machine is not None:
+            decision = self.dsl_machine.step(dict(self.p.bars[current_index]))
+            if current_index >= self.p.warmup:
+                target = float(decision["target"])
+                signal = 1 if target > 0 else -1 if target < 0 else 0
+        elif current_index >= self.p.warmup:
             signal = strategy_signal(self.p.dna["archetype"], self.p.dna["params"], self.closes)
             target = signal * float(self.p.dna["params"]["position_size"])
         value = self.broker.getvalue()
@@ -365,13 +404,13 @@ def regimes_for(bars: list[dict[str, Any]]) -> list[str]:
     return values
 
 
-def run_window(dna: StrategyDNA, bars: list[dict[str, Any]], config: ExecutionConfig) -> dict[str, Any]:
+def run_window(dna: StrategyDNA | DSLStrategyDNA, bars: list[dict[str, Any]], config: ExecutionConfig) -> dict[str, Any]:
     feed = BarFeed(bars=bars)
     cerebro = bt.Cerebro(stdstats=False)
     cerebro.adddata(feed)
-    cerebro.addstrategy(FrozenDNA, dna=dna.model_dump(exclude={"dna_hash"}), warmup=config.warmup_bars)
+    cerebro.addstrategy(FrozenDNA, dna=dna.model_dump(exclude={"dna_hash"}), bars=bars, warmup=config.warmup_bars)
     cerebro.broker.setcash(config.initial_cash)
-    cerebro.broker.setcommission(commission=config.commission)
+    cerebro.broker.addcommissioninfo(FractionalCommissionInfo(commission=config.commission))
     cerebro.broker.set_slippage_perc(perc=config.slippage_bps / 10_000, slip_open=True, slip_match=True, slip_out=False)
     strategy = cerebro.run()[0]
     curve = strategy.equity_curve
@@ -388,6 +427,8 @@ def run_window(dna: StrategyDNA, bars: list[dict[str, Any]], config: ExecutionCo
     winners = [trade["pnl_after_costs"] for trade in closed if trade["pnl_after_costs"] > 0]
     losers = [trade["pnl_after_costs"] for trade in closed if trade["pnl_after_costs"] < 0]
     profit_factor = sum(winners) / max(abs(sum(losers)), 0.0001)
+    interval_minutes = float(bars[0].get("interval_minutes", 5 if isinstance(dna, DSLStrategyDNA) else 1440)) if bars else 1440
+    periods_per_year = config.annualization * (390 / interval_minutes if interval_minutes <= 390 else 1)
     regimes = regimes_for(bars)
     regime_returns: dict[str, list[float]] = defaultdict(list)
     for i, value in enumerate(returns):
@@ -403,7 +444,7 @@ def run_window(dna: StrategyDNA, bars: list[dict[str, Any]], config: ExecutionCo
             local_equity *= 1 + item
             local_peak = max(local_peak, local_equity)
             local_drawdown = max(local_drawdown, 1 - local_equity / local_peak)
-        regime_sharpe = mean(entries) / max(stdev(entries), .0001) * math.sqrt(252)
+        regime_sharpe = mean(entries) / max(stdev(entries), .0001) * math.sqrt(periods_per_year)
         regime_return = local - 1
         score = .48 * max(-1, min(1, regime_sharpe / 2)) \
             + .30 * max(-1, min(1, regime_return / .10)) \
@@ -413,11 +454,13 @@ def run_window(dna: StrategyDNA, bars: list[dict[str, Any]], config: ExecutionCo
             "drawdown": round(local_drawdown, 5), "score": round(score, 4),
         }
     positive_regimes = sum(1 for item in regime_summary.values() if item["score"] > 0)
+    annualized_log_growth = math.log(max(equity / config.initial_cash, .01)) * periods_per_year / max(len(returns), 1)
+    annualized_return = math.expm1(min(annualized_log_growth, math.log(1000)))
     metrics = {
         "return": round(equity / config.initial_cash - 1, 5),
-        "annualized": round(max(equity / config.initial_cash, .01) ** (252 / max(len(returns), 1)) - 1, 5),
-        "volatility": round(stdev(returns) * math.sqrt(252), 5),
-        "sharpe": round(mean(returns) / max(stdev(returns), .0001) * math.sqrt(252), 3),
+        "annualized": round(annualized_return, 5),
+        "volatility": round(stdev(returns) * math.sqrt(periods_per_year), 5),
+        "sharpe": round(mean(returns) / max(stdev(returns), .0001) * math.sqrt(periods_per_year), 3),
         "drawdown": round(max_drawdown, 5),
         "win_rate": round(len(winners) / max(len(closed), 1), 4),
         "profit_factor": round(min(profit_factor, 9.99), 3),
@@ -487,11 +530,18 @@ async def run_backtests(request: Request) -> dict[str, Any]:
             result = run_window(dna, bars[window.start:window.end], payload.execution)
             result["window_id"] = window.id
             windows.append(result)
-        results.append({"strategy_id": dna.id, "dna_hash": dna.dna_hash, "windows": windows})
+        results.append({"strategy_id": dna.id, "strategy_format": dna.strategy_format,
+                        "dna_hash": dna.dna_hash,
+                        "compiler": dna.dna.get("compiler") if isinstance(dna, DSLStrategyDNA) else None,
+                        "windows": windows})
     response = {
         "job_id": payload.job_id,
         "phase": payload.phase,
-        "engine": {"name": ENGINE_NAME, "version": ENGINE_VERSION, "image_digest": os.environ.get("BACKTEST_IMAGE_DIGEST", os.environ.get("K_REVISION", "local")), "config_hash": digest(APPROVED_CONFIG)},
+        "engine": {"name": ENGINE_NAME, "version": ENGINE_VERSION, "image_digest": os.environ.get("BACKTEST_IMAGE_DIGEST", os.environ.get("K_REVISION", "local")), "config_hash": digest(APPROVED_CONFIG),
+                   "dsl_compiler": {"dsl_version": DSL_COMPILER_MANIFEST["dsl_version"],
+                                    "semantic_version": DSL_COMPILER_MANIFEST["semantic_version"],
+                                    "schema_sha256": DSL_COMPILER_MANIFEST["schema_sha256"],
+                                    "semantic_sha256": DSL_COMPILER_MANIFEST["semantic_sha256"]}},
         "dataset": {"snapshot_id": payload.dataset.snapshot_id, "sha256": payload.dataset.sha256, "bar_count": payload.dataset.bar_count},
         "input_hash": input_hash,
         "results": results,

@@ -8,7 +8,8 @@ from datetime import datetime, timedelta, timezone
 from fastapi.testclient import TestClient
 
 os.environ["AXIOM_BACKTEST_SECRET"] = "test-secret"
-from app.main import ExecutionConfig, StrategyDNA, app, digest, run_window, strategy_signal  # noqa: E402
+from app.dsl import legacy_strategy_to_dsl  # noqa: E402
+from app.main import DSLStrategyDNA, ExecutionConfig, StrategyDNA, app, digest, run_window, strategy_signal  # noqa: E402
 
 client = TestClient(app)
 
@@ -72,6 +73,23 @@ def test_orders_fill_at_the_following_bar_open():
     signal_index = next(index for index, bar in enumerate(market) if bar["t"] == first_order["signal_time"])
     assert first_fill["t"] == market[signal_index + 1]["t"]
     assert first_fill["price"] >= market[signal_index + 1]["o"]
+
+
+def test_small_dsl_targets_use_fractional_backtest_shares() -> None:
+    start = datetime(2026, 8, 3, 13, 30, tzinfo=timezone.utc)
+    market = []
+    for index in range(70):
+        close = 100 + index
+        market.append({"t": (start + timedelta(minutes=5 * index)).isoformat().replace("+00:00", "Z"),
+                       "o": close, "h": close + 1, "l": close - 1, "c": close, "v": 1000,
+                       "interval_minutes": 5, "data_health": "healthy", "data_coverage": 1})
+    frozen = legacy_strategy_to_dsl({"id": "fractional", "asset": "SPY", "archetype": "Momentum",
+                                     "params": {"fast": 2, "slow": 4, "threshold": .0001, "position_size": .05}})
+    envelope = DSLStrategyDNA(strategy_format="dsl-v1", id="AX-FRACTIONAL", asset="SPY",
+                              dna=frozen, dna_hash=frozen["dna_hash"])
+    result = run_window(envelope, market, ExecutionConfig())
+    assert result["fills"]
+    assert 0 < abs(result["fills"][0]["size"]) < 1
 
 
 def test_signed_batch_is_deterministic_and_has_artifacts():
