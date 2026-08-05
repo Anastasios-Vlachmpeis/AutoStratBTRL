@@ -496,18 +496,30 @@ def run_window(dna: StrategyDNA | DSLStrategyDNA, bars: list[dict[str, Any]], co
 
 
 def verify_auth(request: Request, raw: bytes, job_id: str) -> None:
-    secret = os.environ.get("AXIOM_BACKTEST_SECRET")
-    if not secret:
+    current_secret = os.environ.get("AXIOM_BACKTEST_SECRET")
+    current_key_id = os.environ.get("AXIOM_BACKTEST_KEY_ID", "current")
+    previous_secret = os.environ.get("AXIOM_BACKTEST_PREVIOUS_SECRET")
+    previous_key_id = os.environ.get("AXIOM_BACKTEST_PREVIOUS_KEY_ID")
+    if not current_secret:
         raise HTTPException(503, "AXIOM_BACKTEST_SECRET is not configured")
+    if previous_secret and (not previous_key_id or previous_key_id == current_key_id):
+        raise HTTPException(503, "Backtest HMAC rotation configuration is invalid")
     timestamp = request.headers.get("X-Axiom-Timestamp", "")
     signature = request.headers.get("X-Axiom-Signature", "")
     request_job_id = request.headers.get("X-Axiom-Job-Id", "")
+    key_id = request.headers.get("X-Axiom-Key-Id", "") or current_key_id
     try:
         parsed_timestamp = int(timestamp)
     except ValueError:
         raise HTTPException(401, "missing or invalid timestamp")
     if request_job_id != job_id or abs(time.time() - parsed_timestamp) > REPLAY_WINDOW_SECONDS:
         raise HTTPException(401, "expired request or job id mismatch")
+    keys = {current_key_id: current_secret}
+    if previous_secret and previous_key_id:
+        keys[previous_key_id] = previous_secret
+    secret = keys.get(key_id)
+    if not secret:
+        raise HTTPException(401, "unknown signing key")
     expected = hmac.new(secret.encode(), timestamp.encode() + b"." + job_id.encode() + b"." + raw, hashlib.sha256).hexdigest()
     if not hmac.compare_digest(expected, signature):
         raise HTTPException(401, "invalid request signature")

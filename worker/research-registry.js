@@ -20,7 +20,7 @@ const dateOf = (value) => {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(valueString)) throw new Error("Research session_date must use YYYY-MM-DD");
   return valueString;
 };
-const statusOf = (telemetry) => ["healthy", "stale", "unavailable"].includes(String(telemetry?.status))
+const statusOf = (telemetry) => ["healthy", "constrained", "paused", "stale", "unavailable"].includes(String(telemetry?.status))
   ? String(telemetry.status) : "healthy";
 
 function researchOf(state) {
@@ -72,7 +72,7 @@ function capFor(kind, config) {
 
 function telemetryBlocked(research) {
   const status = research.budget.telemetry_status;
-  return status === "stale" || status === "unavailable";
+  return ["paused", "stale", "unavailable"].includes(status);
 }
 
 function appendAttempt(research, trial) {
@@ -133,7 +133,8 @@ export function canStartResearch(state, { session_date, kind = "sampled", teleme
     research.budget.telemetry_at = telemetry.at ?? now();
   }
   if (research.paused) return { ok: false, reason: research.pause_reason ?? "operator_paused" };
-  if (telemetryBlocked(research)) return { ok: false, reason: "budget_telemetry_unavailable" };
+  if (kind !== "validation" && telemetryBlocked(research)) return { ok: false,
+    reason: research.budget.telemetry_status === "paused" ? "optional_research_paused_for_budget" : "budget_telemetry_unavailable" };
   const latest = research.cohorts.at(-1);
   const config = latest ? configOf(latest) : normalizeResearchConfig({});
   if (research.budget.runtime_ms >= config.max_runtime_ms) return { ok: false, reason: "runtime_ceiling" };

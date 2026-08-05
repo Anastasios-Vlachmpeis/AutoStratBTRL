@@ -42,6 +42,32 @@ export async function initialUniverseManifest() {
   return { ...manifest, sha256: await sha256(manifest) };
 }
 
+export async function runtimeUniverseManifest(env = {}) {
+  const environment = String(env.ENVIRONMENT ?? "local").trim().toLowerCase();
+  if (environment !== "staging") return initialUniverseManifest();
+
+  const requested = Number.parseInt(String(env.STAGING_SYMBOL_LIMIT ?? "5"), 10);
+  const limit = Number.isFinite(requested)
+    ? Math.max(1, Math.min(INITIAL_UNIVERSE_SYMBOLS.length, requested))
+    : 5;
+  if (limit === INITIAL_UNIVERSE_SYMBOLS.length) return initialUniverseManifest();
+
+  const selected = INITIAL_UNIVERSE_SYMBOLS.slice(0, limit);
+  const selectedSet = new Set(selected);
+  const manifest = {
+    ...canonicalUniverse(),
+    id: `${INITIAL_UNIVERSE_ID}-staging-${limit}`,
+    symbols: selected,
+    groups: Object.fromEntries(Object.entries(INITIAL_UNIVERSE_GROUPS)
+      .map(([name, symbols]) => [name, symbols.filter((symbol) => selectedSet.has(symbol))])
+      .filter(([, symbols]) => symbols.length > 0)),
+    selection_policy: `staging-only deterministic prefix of ${limit} symbols from ${INITIAL_UNIVERSE_ID}`,
+    parent_universe_id: INITIAL_UNIVERSE_ID,
+    staging_only: true,
+  };
+  return { ...manifest, sha256: await sha256(manifest) };
+}
+
 export function isInitialUniverseSymbol(symbol) {
   return INITIAL_UNIVERSE_SYMBOLS.includes(String(symbol ?? "").toUpperCase());
 }

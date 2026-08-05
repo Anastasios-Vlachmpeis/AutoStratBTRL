@@ -92,6 +92,7 @@ test("remote requests use the service timestamp and HMAC contract", async () => 
   const timestamp = captured.init.headers["x-axiom-timestamp"];
   assert.match(timestamp, /^\d{10}$/);
   assert.equal(captured.init.headers["x-axiom-job-id"], payload.job_id);
+  assert.equal(captured.init.headers["x-axiom-key-id"], "current");
   const key = await crypto.subtle.importKey("raw", new TextEncoder().encode("shared-secret"),
     { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   const bytes = await crypto.subtle.sign("HMAC", key,

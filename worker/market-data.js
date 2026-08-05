@@ -1,6 +1,7 @@
 import { sha256 } from "./backtest.js";
 import { CONTROL_PLANE_WORKSPACE } from "./control-plane.js";
-import { INITIAL_UNIVERSE_SYMBOLS, initialUniverseManifest } from "./universe.js";
+import { recordCostUsage } from "./cost-controller.js";
+import { INITIAL_UNIVERSE_SYMBOLS, runtimeUniverseManifest } from "./universe.js";
 
 export const MARKET_DATA_SCHEMA_VERSION = 1;
 export const FIVE_MINUTE_MS = 5 * 60 * 1000;
@@ -50,6 +51,13 @@ export function recordMarketDataUsage(state, increments = {}, at = new Date()) {
   }
   current.updated_at = new Date().toISOString();
   state.marketData.usage = current;
+  recordCostUsage(state, {
+    alpaca_requests: Math.max(0, Number(increments.alpaca_requests ?? 0)),
+    queue_operations: Math.max(0, Number(increments.queue_messages ?? 0)),
+    d1_rows_written: Math.max(0, Number(increments.d1_rows ?? 0)),
+    r2_class_a_operations: Math.max(0, Number(increments.r2_writes ?? 0)),
+    worker_cpu_ms: Math.max(0, Number(increments.worker_elapsed_ms ?? 0)),
+  }, clock);
   return current;
 }
 
@@ -941,7 +949,7 @@ export class MarketDataRepository {
 }
 
 export async function ensureMarketDataState(state, env = {}) {
-  const universe = await initialUniverseManifest();
+  const universe = await runtimeUniverseManifest(env);
   state.marketData ??= {};
   state.marketData.schema_version = MARKET_DATA_SCHEMA_VERSION;
   state.marketData.mode = marketDataMode(env);

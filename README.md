@@ -49,7 +49,7 @@ npx wrangler queues create axiom-jobs
 npx wrangler queues create axiom-jobs-dlq
 ```
 
-Copy the returned D1 database ID into `wrangler.target.example.jsonc`, review every setting, then use it as the deployment configuration. Apply migrations before deployment:
+Use `wrangler.staging.example.jsonc` or `wrangler.production-paper.example.jsonc` as the reviewed starting point. They deliberately use different Worker, D1, R2, Queue, and DLQ names. Staging runs a separately hashed five-symbol universe; production-paper uses the frozen 40-symbol universe. Copy each template to the ignored `wrangler.target.jsonc`, replace its placeholders, and apply migrations before deployment:
 
 ```powershell
 npx wrangler d1 migrations apply axiom-control --remote
@@ -72,15 +72,18 @@ Required runtime values:
 | `ALPACA_API_KEY` | Dedicated Alpaca paper key ID |
 | `ALPACA_API_SECRET` | Dedicated Alpaca paper secret |
 | `BACKTEST_SERVICE_SECRET` | HMAC secret shared with Cloud Run |
+| `BACKTEST_SERVICE_KEY_ID` | Active HMAC rotation identifier |
 | `BACKTEST_SERVICE_URL` | HTTPS URL of the Cloud Run backtester |
 
 `ADMIN_TOKEN` protects application APIs. Private artifact routes always require strict authorization, including in local/demo mode.
+
+Staging and production-paper reject absent or weak admin tokens. During a bounded rotation, `ADMIN_TOKEN_PREVIOUS` and `BACKTEST_SERVICE_PREVIOUS_SECRET` may coexist with the new current values; remove previous keys after clients have moved. Keep admin, Alpaca, Backtrader, and any future callback secrets distinct.
 
 ## Backtrader service
 
 The pinned Python 3.11 service is in `backtester_service/`. It verifies the HMAC signature and complete deterministic job identity, rejects malformed or mismatched sealed inputs, and returns content-hashed metrics, curves, orders, fills, trades, and provenance.
 
-Deploy it only after reviewing `backtester_service/deploy-cloud-run.ps1`. The script builds a unique image, resolves its immutable digest, deploys that exact digest to Cloud Run in `europe-west1`, and supplies the digest to result provenance. Cloud Run should use 1 vCPU, 512 MiB, concurrency 1, zero minimum instances, three maximum instances, and a 300-second timeout.
+Deploy it only after reviewing `backtester_service/deploy-cloud-run.ps1`. The script builds a unique image in regional Artifact Registry, resolves its immutable digest, deploys that exact digest to Cloud Run in `europe-west1`, and supplies the digest to result provenance. Cloud Run should use 1 vCPU, 512 MiB, concurrency 1, zero minimum instances, three maximum instances, and a 300-second timeout.
 
 Use `BACKTEST_ENGINE=shadow` during engine comparison. Switch to `backtrader` only after the documented golden, determinism, leakage, replay, success-rate, and runtime gates pass. `legacy` is the rollback mode. Production-like deployments should keep `BACKTEST_REQUIRE_IMAGE_DIGEST=true`.
 
@@ -111,11 +114,27 @@ Paper reconciliation is capped at 0.5% absolute exposure per strategy and 10% po
 
 No live-money endpoint, hard-to-borrow locate, options, crypto, or browser-controlled risk-limit changes are included.
 
+## Cost and operations
+
+The runtime records daily provider usage and projects the calendar month against a USD 50 limit. At 50% it informs; at 75% it halves new research and disables optional deep work; at 90% it pauses optional generation and backfills; at 100%, or when telemetry is stale/unavailable, optional cloud research stops. An already sealed validation may finish, while market-data safety and risk supervision remain active at every tier.
+
+The Operations page exposes the measured month-to-date/projected cost, subsystem-specific heartbeats, structured correlated events, and alerts classified as `info`, `research_degraded`, `execution_blocked`, or `critical_risk`. Secrets are recursively redacted before events enter state or logs.
+
+After collecting real staging usage samples, calculate the 30-day projection with:
+
+```powershell
+node scripts/estimate-monthly-cost.mjs .\protected-staging-usage.json
+```
+
+Do not commit the usage file. Billing alerts should also be configured at the providers; they complement rather than replace the application controller.
+
 ## Verification
 
 ```powershell
 npm run check
 npm run test:incubation
+npm run test:plan13
+npm run scan:secrets
 python -m unittest discover -s tests -v
 ```
 
@@ -124,5 +143,7 @@ For the service, install its pinned dependencies in an isolated Python 3.11 envi
 ```powershell
 python -m pytest backtester_service/tests -q
 ```
+
+Before a reviewed remote deployment, run `.\scripts\plan13-smoke.ps1`. After deployment, pass `-BacktestServiceUrl` to include the public health endpoint. The script never deploys or submits an Alpaca order.
 
 No repository push or cloud deployment is performed by the implementation or test commands above.

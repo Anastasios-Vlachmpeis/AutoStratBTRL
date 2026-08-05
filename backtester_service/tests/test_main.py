@@ -49,13 +49,14 @@ def bind_job_id(body):
     return body
 
 
-def signed(body, timestamp=None, *, rebind=True):
+def signed(body, timestamp=None, *, rebind=True, secret="test-secret", key_id="current"):
     if rebind:
         bind_job_id(body)
     raw = json.dumps(body, separators=(",", ":")).encode()
     timestamp = str(int(time.time()) if timestamp is None else timestamp)
-    signature = hmac.new(b"test-secret", timestamp.encode() + b"." + body["job_id"].encode() + b"." + raw, hashlib.sha256).hexdigest()
-    return raw, {"X-Axiom-Timestamp": timestamp, "X-Axiom-Job-Id": body["job_id"], "X-Axiom-Signature": signature, "Content-Type": "application/json"}
+    signature = hmac.new(secret.encode(), timestamp.encode() + b"." + body["job_id"].encode() + b"." + raw, hashlib.sha256).hexdigest()
+    return raw, {"X-Axiom-Timestamp": timestamp, "X-Axiom-Job-Id": body["job_id"], "X-Axiom-Key-Id": key_id,
+                 "X-Axiom-Signature": signature, "Content-Type": "application/json"}
 
 
 def test_health():
@@ -126,6 +127,18 @@ def test_rejects_bad_hash_and_auth():
     body = payload()
     raw, headers = signed(body)
     headers["X-Axiom-Signature"] = "0" * 64
+    assert client.post("/v1/backtests/batch", content=raw, headers=headers).status_code == 401
+
+
+def test_hmac_rotation_accepts_previous_key_and_rejects_unknown_key(monkeypatch):
+    monkeypatch.setenv("AXIOM_BACKTEST_KEY_ID", "2026-08")
+    monkeypatch.setenv("AXIOM_BACKTEST_PREVIOUS_KEY_ID", "2026-07")
+    monkeypatch.setenv("AXIOM_BACKTEST_PREVIOUS_SECRET", "previous-test-secret")
+    body = payload()
+    raw, headers = signed(body, secret="previous-test-secret", key_id="2026-07")
+    assert client.post("/v1/backtests/batch", content=raw, headers=headers).status_code == 200
+    other = payload()
+    raw, headers = signed(other, key_id="unknown")
     assert client.post("/v1/backtests/batch", content=raw, headers=headers).status_code == 401
 
 

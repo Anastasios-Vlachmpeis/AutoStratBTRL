@@ -1,6 +1,11 @@
 # Copy this file to .dev.vars for authenticated local mutation requests.
 # Generate a long random value; never commit the real token.
 ADMIN_TOKEN=replace-with-a-long-random-secret
+ADMIN_TOKEN_KEY_ID=local-current
+# During rotation only; remove after every browser session has moved.
+ADMIN_TOKEN_PREVIOUS=replace-with-the-previous-long-random-secret
+ADMIN_TOKEN_PREVIOUS_KEY_ID=local-previous
+ENVIRONMENT=local
 CONTROL_PLANE_MODE=legacy
 NORMALIZED_STORAGE_ENABLED=false
 NORMALIZED_READ_ENABLED=false
@@ -28,4 +33,13 @@ ALPACA_MAX_ORDER_PCT=0.02
 # immediate rollback, and switch to backtrader only after parity review.
 BACKTEST_SERVICE_URL=https://your-cloud-run-service.run.app
 BACKTEST_SERVICE_SECRET=replace-with-a-second-long-random-secret
+BACKTEST_SERVICE_KEY_ID=local-current
+# Cloud Run may accept this previous key during a bounded rotation window.
+BACKTEST_SERVICE_PREVIOUS_SECRET=replace-with-the-previous-backtest-secret
+BACKTEST_SERVICE_PREVIOUS_KEY_ID=local-previous
+BACKTEST_CALLBACK_SECRET=replace-with-a-distinct-future-callback-secret
 BACKTEST_ENGINE=shadow
+COST_CONTROL_ENABLED=false
+MONTHLY_BUDGET_LIMIT_USD=50
+MONTHLY_FIXED_COST_USD=0
+COST_TELEMETRY_MAX_AGE_MS=21600000

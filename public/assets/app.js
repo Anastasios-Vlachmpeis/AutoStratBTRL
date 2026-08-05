@@ -245,13 +245,15 @@ function renderOperations() {
   const grossUsed = ops.risk.portfolio_gross_limit > 0 ? ops.risk.portfolio_gross_fraction / ops.risk.portfolio_gross_limit : 0;
   const queue = ops.services.queue, backtester = ops.services.backtester, broker = ops.services.broker;
   const cost = ops.budget.estimated_monthly_usd == null ? "NOT ESTIMATED" : usd(ops.budget.estimated_monthly_usd);
+  const costTone = ["hard_stop", "optional_paused", "telemetry_unavailable"].includes(ops.budget.level) ? "bad"
+    : ["constrained", "informational"].includes(ops.budget.level) ? "warn" : "good";
   grid.innerHTML = [
     ["MARKET / NEXT", ops.market.session_status.toUpperCase(), `${ops.market.next_action.label} · ${ops.market.feed} (not SIP)`, ops.market.session_status === "open" ? "good" : ""],
     ["ALPACA PAPER", ops.account.connected ? usd(ops.account.equity) : "DISCONNECTED", `${usd(ops.account.cash)} cash · ${usd(ops.account.buying_power)} buying power`, ops.account.connected ? "good" : "warn"],
     ["DAILY LOSS", pct(ops.risk.daily_loss_fraction, 2), `${Math.round(dailyUsed * 100)}% of ${pct(ops.risk.daily_loss_limit, 2)} halt`, ops.risk.daily_loss_halted ? "bad" : dailyUsed >= .8 ? "warn" : "good"],
     ["PORTFOLIO GROSS", pct(ops.risk.portfolio_gross_fraction, 2), `${Math.round(grossUsed * 100)}% of ${pct(ops.risk.portfolio_gross_limit, 0)} cap · ${usd(ops.account.net_exposure_usd)} net`, grossUsed >= 1 ? "bad" : grossUsed >= .8 ? "warn" : "good"],
-    ["DATA / 40 SYMBOLS", `${ops.data.healthy_symbols}/${ops.data.expected_symbols} ${String(ops.data.status).toUpperCase()}`, `${pct(ops.data.coverage, 0)} coverage · ${ops.data.revision_events} revisions`, ops.data.status === "healthy" && ops.data.coverage >= .9 ? "good" : "warn"],
-    ["JOBS / COST", `${queue.research_pending} QUEUED · ${backtester.active_runs} RUNS`, `${queue.status} queue · ${broker.mode} broker · ${cost}/${usd(ops.budget.monthly_limit_usd)} limit`, cost === "NOT ESTIMATED" ? "warn" : ""],
+    [`DATA / ${ops.data.expected_symbols} SYMBOLS`, `${ops.data.healthy_symbols}/${ops.data.expected_symbols} ${String(ops.data.status).toUpperCase()}`, `${pct(ops.data.coverage, 0)} coverage · ${ops.data.revision_events} revisions`, ops.data.status === "healthy" && ops.data.coverage >= .9 ? "good" : "warn"],
+    ["JOBS / COST", `${queue.research_pending} QUEUED · ${backtester.active_runs} RUNS`, `${queue.status} queue · ${broker.mode} broker · ${cost}/${usd(ops.budget.monthly_limit_usd)} limit · ${String(ops.budget.level).replaceAll("_", " ")}`, cost === "NOT ESTIMATED" ? "warn" : costTone],
   ].map(([label, value, detail, tone]) => `<div class="operations-card"><span>${escapeHtml(label)}</span><strong class="${tone}">${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></div>`).join("");
   attention.innerHTML = ops.attention.length
     ? ops.attention.slice(0, 12).map((item) => `<span class="attention-chip ${escapeHtml(item.severity)}" title="${escapeHtml(item.summary)}">${escapeHtml(item.code)}</span>`).join("")

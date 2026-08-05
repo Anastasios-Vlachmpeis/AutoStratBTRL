@@ -20,6 +20,7 @@ import {
   makeDataset, makeMultiSymbolDataset, normalizeMetrics, remoteEnabled, sha256,
 } from "./backtest.js";
 import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
+import { evaluateCostPolicy, recordCostUsage } from "./cost-controller.js";
 import { createIncubationPolicy, evaluateIncubationGate, finalizeIncubationSession,
   recordIncubationEvent, startIncubation } from "./incubation.js";
 import { IncubationStore } from "./incubation-store.js";
@@ -49,7 +50,7 @@ import {
   publicMarketDataState,
   recordMarketDataUsage,
 } from "./market-data.js";
-import { initialUniverseManifest } from "./universe.js";
+import { runtimeUniverseManifest } from "./universe.js";
 import {
   developmentOnlyDataset,
   finalizeEvolutionaryResearch,
@@ -74,12 +75,32 @@ import { planOrchestrationWork } from "./orchestration-schedule.js";
 import { applyLifecycleCommand, bindLifecycleProvenance, initialLifecycle, transitionId } from "./lifecycle.js";
 import { ADMIN_COMMAND_DTO_VERSION, buildOperationsReadModel, operatorArtifacts, operatorLogs,
   operatorOrders, operatorTrades, operatorTrials, paginateOperatorItems, strategyEvidenceDto } from "./operator-api.js";
+import { incrementOperationalMetric, operationalHealth, recordHeartbeat, recordOperationalEvent, structuredLogLine } from "./observability.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
 
 function json(payload, status = 200) {
   return new Response(JSON.stringify(payload), { status, headers: JSON_HEADERS });
+}
+
+function eventSubsystem(type) {
+  const value = String(type ?? "").toUpperCase();
+  if (value.includes("MARKET_DATA")) return "market_data";
+  if (value.includes("BROKER") || value.includes("ORDER") || value.includes("RISK")) return "broker";
+  if (value.includes("BACKTEST") || value.includes("VALIDATE") || value.includes("SUPERVISOR")) return "backtester";
+  if (value.includes("COST")) return "cost_telemetry";
+  if (value.includes("ARTIFACT") || value.includes("WORKSPACE") || value === "AUDIT") return "storage";
+  if (value.includes("QUEUE") || value.includes("EVOLVE")) return "queue";
+  return "scheduler";
+}
+
+function eventSeverity(type) {
+  const value = String(type ?? "").toUpperCase();
+  if (value.includes("QUARANTINE") || value.includes("DAILY_LOSS") || value.includes("POSITION_DIVERGENCE")) return "critical_risk";
+  if (value.includes("BLOCK") || value.includes("ORDER_ERROR")) return "execution_blocked";
+  if (value.includes("ERROR") || value.includes("PAUSED")) return "research_degraded";
+  return "info";
 }
 
 // Plan 06 policy seam: the numerical evaluator may be replaced by the
@@ -458,8 +479,18 @@ export class AxiomLab extends DurableObject {
 
   record(state, type, title, detail, metadata = {}) {
     const now = new Date();
-    state.events.unshift({ id: `BT-${now.getTime()}-${Math.random().toString(36).slice(2, 7)}`,
-      kind: type, type, title, detail, time: now.toISOString().slice(11, 16), at: now.toISOString(),
+    const operational = recordOperationalEvent(state, { at: now, subsystem: eventSubsystem(type),
+      severity: eventSeverity(type), code: type, message: `${title}: ${detail}`,
+      correlation_id: metadata.correlation_id, job_id: metadata.job_id, transition_id: metadata.transition_id,
+      broker_intent_id: metadata.broker_intent_id, order_id: metadata.order_id, strategy_id: metadata.strategy_id });
+    if (operational.severity !== "info") {
+      recordHeartbeat(state, operational.subsystem, { status: operational.severity === "critical_risk" ? "blocked" : "degraded",
+        at: now, correlation_id: operational.correlation_id, detail: { code: operational.code } });
+      incrementOperationalMetric(state, operational.subsystem, "failures", 1, now);
+    }
+    console.log(structuredLogLine(operational));
+    state.events.unshift({ id: operational.event_id,
+      kind: type, type, title, detail: operational.message.replace(`${title}: `, ""), time: now.toISOString().slice(11, 16), at: now.toISOString(),
       correlation_id: metadata.correlation_id ?? null, command_id: metadata.command_id ?? null,
       strategy_id: metadata.strategy_id ?? null });
     state.events = state.events.slice(0, 2048);
@@ -486,6 +517,18 @@ export class AxiomLab extends DurableObject {
   }
 
   async runSealedResearchCohort(state, command) {
+    const costPolicy = evaluateCostPolicy(state, this.env, command.timestamp);
+    if (!costPolicy.optional_research_allowed) {
+      const orchestration = ensureOrchestrationState(state, orchestrationMode(this.env));
+      orchestration.incidents.push({ kind: "optional_research_budget_block", severity: "research_degraded",
+        action: "research.run_cohort", command_id: command.command_id, reason: costPolicy.reason,
+        projected_ratio: costPolicy.projected_ratio, opened_at: command.timestamp });
+      orchestration.incidents = orchestration.incidents.slice(-512);
+      this.record(state, "COST_CONTROL", "Optional evolutionary research paused",
+        `${costPolicy.level} · projected ${(costPolicy.projected_ratio * 100).toFixed(1)}% of monthly limit`,
+        { correlation_id: command.correlation_id, command_id: command.command_id });
+      return { paused: true, reason: costPolicy.reason };
+    }
     const datasetId = state.marketData?.backfill?.dataset_id;
     if (!datasetId) throw new Error("Three-year sealed market dataset is not complete");
     const contentStore = this.controlPlane.artifacts.contentStore;
@@ -509,16 +552,20 @@ export class AxiomLab extends DurableObject {
     const dataset = this.registerPartitionedDataset(state, { manifest, dataset_hash: developmentHash });
     const sessionDate = command.payload?.session_date ?? newYorkClock(command.timestamp).date;
     const finalists = boundedInt(command.payload?.finalists ?? this.env.RESEARCH_AUTORUN_FINALISTS, 6, 1, 12);
+    const quotaMultiplier = Math.max(.01, Number(costPolicy.quota_multiplier ?? 1));
+    const configuredSampled = boundedInt(this.env.RESEARCH_AUTORUN_SAMPLED_GENOMES, Math.max(16, finalists * 4), 1, 128);
+    const configuredChallengers = boundedInt(this.env.RESEARCH_AUTORUN_CHALLENGERS, Math.min(32, Math.max(4, finalists * 2)), 0, 32);
     const generated = generateEvolutionaryResearch(state, {
       seed: (Number(state.seed ?? 0) ^ Number(sessionDate.replaceAll("-", ""))) >>> 0,
       session_date: sessionDate, dataset_id: dataset.id, dataset_hash: developmentHash,
       dataset_scope: "development_only",
-      telemetry: { status: String(this.env.RESEARCH_BUDGET_STATUS ?? "healthy"), at: command.timestamp },
-      config: { sampled_genomes: boundedInt(this.env.RESEARCH_AUTORUN_SAMPLED_GENOMES, Math.max(16, finalists * 4), 1, 128),
-        challengers: boundedInt(this.env.RESEARCH_AUTORUN_CHALLENGERS, Math.min(32, Math.max(4, finalists * 2)), 0, 32),
-        finalists, validation_slots: 3, minimum_symbols: 5, maximum_symbols: 5,
+      telemetry: { status: costPolicy.level === "constrained" ? "constrained" : "healthy", at: command.timestamp },
+      config: { sampled_genomes: Math.max(1, Math.floor(configuredSampled * quotaMultiplier)),
+        challengers: Math.max(0, Math.floor(configuredChallengers * quotaMultiplier)),
+        finalists: Math.max(1, Math.floor(finalists * quotaMultiplier)), validation_slots: 3, minimum_symbols: 5, maximum_symbols: 5,
         maximum_symbol_concentration: .35 },
     });
+    recordCostUsage(state, { research_trials: generated.proposals.length }, command.timestamp);
     if (generated.duplicate) return { duplicate: true, completed: true, cohort_id: generated.cohort.cohort_id };
     const jobs = planResearchJobs(generated, { workspace_id: SINGLETON_NAME, actor: command.actor });
     generated.cohort.screen_receipts ??= {};
@@ -527,6 +574,8 @@ export class AxiomLab extends DurableObject {
     generated.cohort.finalize_job_payload = jobs.finalize;
     await this.controlPlane.saveState(state);
     await sendQueueMessages(this.env.AXIOM_JOBS, jobs.all);
+    recordHeartbeat(state, "queue", { status: "healthy", at: command.timestamp,
+      correlation_id: command.command_id, detail: { messages: jobs.all.length, kind: "research" } });
     recordMarketDataUsage(state, { queue_messages: jobs.all.length });
     this.record(state, "EVOLVE", `${generated.proposals.length} evolutionary trials queued`,
       "One bounded development-only screen per trial · final selection waits for every receipt");
@@ -620,6 +669,7 @@ export class AxiomLab extends DurableObject {
       const committed = finalizeEvolutionaryResearch(state, { cohort_id: cohort.cohort_id, records, artifact_ids: artifactIds });
       for (const strategy of committed.created) strategy.dataset_id = cohort.contract.dataset_id;
       finalistCount = committed.created.length;
+      recordCostUsage(state, { research_finalists: finalistCount }, cohort.completed_at ?? new Date());
       this.record(state, "EVOLVE", `${finalistCount} evolutionary finalists registered`,
         `${records.length} bounded screens · deterministic cohort-wide selection`);
       await this.controlPlane.saveState(state);
@@ -704,8 +754,14 @@ export class AxiomLab extends DurableObject {
   }
 
   async runBrokerCycle(state, bucket, orderBucket, options = {}) {
+    const startedAt = Date.now();
     const plan = await this.gateways.broker.planCycle(state, bucket, orderBucket, options);
-    if (options.scope === "incubation") return plan;
+    if (options.scope === "incubation") {
+      recordHeartbeat(state, "broker", { status: "healthy", at: plan.clock?.timestamp ?? new Date(),
+        correlation_id: bucket, detail: { mode: "incubation_shadow", safety_reasons: plan.safety_reasons?.length ?? 0 } });
+      incrementOperationalMetric(state, "broker", "plan_latency_ms", Date.now() - startedAt);
+      return plan;
+    }
     if (this.brokerStore) {
       await this.brokerStore.persistPlan({ workspaceId: SINGLETON_NAME, plan });
     } else {
@@ -738,6 +794,12 @@ export class AxiomLab extends DurableObject {
         opened_at: execution.clock?.timestamp ?? new Date().toISOString(),
       });
     }
+    const critical = execution.safety_reasons.some((item) => item.severity === "critical");
+    recordHeartbeat(state, "broker", { status: critical ? "blocked" : "healthy",
+      at: execution.clock?.timestamp ?? new Date(), correlation_id: bucket,
+      detail: { order_count: execution.submitted_orders?.length ?? 0, critical_safety_reasons: critical ? 1 : 0 } });
+    incrementOperationalMetric(state, "broker", "cycle_latency_ms", Date.now() - startedAt);
+    incrementOperationalMetric(state, "broker", "orders_submitted", execution.submitted_orders?.length ?? 0);
     return execution;
   }
 
@@ -1451,6 +1513,11 @@ export class AxiomLab extends DurableObject {
 
   async startMarketBackfill(state, body = {}) {
     if (marketDataMode(this.env) !== "shadow") throw new Error("MARKET_DATA_MODE must be shadow to start a backfill");
+    const costPolicy = evaluateCostPolicy(state, this.env, new Date());
+    if (!costPolicy.optional_backfills_allowed) {
+      const error = new Error(`Optional historical backfill is paused: ${costPolicy.reason}`);
+      error.status = 429; throw error;
+    }
     this.marketDataRepository.assertPersistentReady();
     const asOf = body.as_of ? new Date(`${body.as_of}T12:00:00Z`) : new Date();
     if (Number.isNaN(asOf.getTime())) throw new Error("Invalid backfill as_of date");
@@ -1462,7 +1529,7 @@ export class AxiomLab extends DurableObject {
         || start > end || durationDays < 1090 || durationDays > 1105) {
       throw new Error("Historical backfill must cover one bounded three-year period");
     }
-    const universe = await initialUniverseManifest();
+    const universe = await runtimeUniverseManifest(this.env);
     const assets = await this.gateways.marketData.assets(universe.symbols);
     recordMarketDataUsage(state, { alpaca_requests: assets.__alpaca_request_count ?? universe.symbols.length });
     const unavailable = universe.symbols.filter((symbol) => assets[symbol]?.status !== "active" || !assets[symbol]?.tradable);
@@ -1491,6 +1558,8 @@ export class AxiomLab extends DurableObject {
     await sendQueueMessages(this.env.AXIOM_JOBS, jobs.map((job) => ({
       kind: "market-data.backfill-partition.v1", workspace_id: SINGLETON_NAME, backfill_id: backfillId, job,
     })));
+    recordHeartbeat(state, "queue", { status: "healthy", correlation_id: backfillId,
+      detail: { messages: jobs.length, kind: "market_backfill" } });
     recordMarketDataUsage(state, { queue_messages: jobs.length, d1_rows: jobs.length });
   }
 
@@ -1541,7 +1610,7 @@ export class AxiomLab extends DurableObject {
     if (existing?.status === "complete") {
       const progress = await this.syncBackfillProgress(state, backfillId);
       if (progress.complete === progress.total && progress.total > 0 && !state.marketData.backfill.dataset_id) {
-        const universe = await initialUniverseManifest();
+        const universe = await runtimeUniverseManifest(this.env);
         const calendar = await this.marketDataRepository.loadCalendar(job.calendar_id);
         if (!calendar) throw new Error("Sealed backfill calendar is unavailable for dataset finalization");
         await this.finalizeBackfillDataset(state, backfillId, universe, calendar,
@@ -1557,7 +1626,7 @@ export class AxiomLab extends DurableObject {
         // calendar by ID and verify its own hash through the stored manifest.
         if (!calendar?.sha256) throw new Error("Sealed backfill calendar is unavailable");
       }
-      const universe = await initialUniverseManifest();
+      const universe = await runtimeUniverseManifest(this.env);
       if (job.universe_hash !== universe.sha256) throw new Error("Backfill universe hash mismatch");
       const response = await this.gateways.marketData.fiveMinuteHistory(job.symbol, {
         start: `${job.start}T00:00:00Z`, end: `${nextIsoDate(job.end)}T00:00:00Z`,
@@ -1602,7 +1671,7 @@ export class AxiomLab extends DurableObject {
   async pollLiveMarketData(state, now, calendar) {
     const startedAt = Date.now();
     const bounds = livePollBounds(now);
-    const universe = await initialUniverseManifest();
+    const universe = await runtimeUniverseManifest(this.env);
     const bars = await this.gateways.marketData.recentMinuteBars(universe.symbols, bounds);
     const book = await this.marketDataRepository.loadLiveBook();
     const result = await applyLiveMinutePoll(book, bars, calendar.sessions, {
@@ -1630,6 +1699,15 @@ export class AxiomLab extends DurableObject {
         bucket_close: event.bucket_close, actionable: event.actionable, retroactive: event.retroactive,
         content_hash: event.content_hash })).slice(-80),
     };
+    const latestClose = result.events.at(-1)?.bucket_close;
+    const ingestionLag = latestClose ? Math.max(0, now.getTime() - new Date(latestClose).getTime()) : 0;
+    recordHeartbeat(state, "market_data", { status: result.health.status === "healthy" ? "healthy" : "degraded",
+      at: now, correlation_id: result.events.at(-1)?.id ?? null,
+      detail: { healthy_symbols: result.health.healthy_symbols, symbol_count: result.health.symbol_count,
+        coverage: result.health.coverage, ingestion_lag_ms: ingestionLag } });
+    incrementOperationalMetric(state, "market_data", "ingestion_lag_ms", ingestionLag, now);
+    incrementOperationalMetric(state, "market_data", "gap_symbols", Math.max(0, result.health.symbol_count - result.health.healthy_symbols), now);
+    incrementOperationalMetric(state, "market_data", "bar_revisions", result.events.filter((event) => event.retroactive).length, now);
     if (previousStatus && previousStatus !== result.health.status) {
       this.record(state, result.health.status === "healthy" ? "MARKET_DATA" : "MARKET_DATA_ERROR",
         `Live IEX data ${result.health.status}`, `${result.health.healthy_symbols}/${result.health.symbol_count} symbols healthy`);
@@ -1644,7 +1722,7 @@ export class AxiomLab extends DurableObject {
     const values = Object.fromEntries(dateParts.map((part) => [part.type, part.value]));
     const sessionDate = `${values.year}-${values.month}-${values.day}`;
     if (state.marketData.live?.last_reconciliation?.session_date === sessionDate) return { duplicate: true };
-    const universe = await initialUniverseManifest();
+    const universe = await runtimeUniverseManifest(this.env);
     const response = await this.gateways.marketData.fiveMinuteBars(universe.symbols, {
       start: `${sessionDate}T00:00:00Z`, end: `${nextIsoDate(sessionDate)}T00:00:00Z`,
     });
@@ -1742,7 +1820,7 @@ export class AxiomLab extends DurableObject {
   async sealMultiDataset(state, barsBySymbol, options = {}) {
     const available = Object.fromEntries(Object.entries(barsBySymbol ?? {})
       .filter(([, bars]) => Array.isArray(bars) && bars.length >= 400));
-    const universe = await initialUniverseManifest();
+    const universe = await runtimeUniverseManifest(this.env);
     const calendar = state.marketData?.calendar ?? {};
     const dataset = await makeMultiSymbolDataset(available, {
       timeframe: "5Min",
@@ -1818,7 +1896,12 @@ export class AxiomLab extends DurableObject {
     const pending = run.shards.filter((shard) => !run.receipts?.[shard.shard_id]).map((shard) => ({
       kind: "backtest.run-shard.v1", workspace_id: SINGLETON_NAME, run_id: run.run_id, shard_id: shard.shard_id,
     }));
-    if (pending.length) await sendQueueMessages(this.env.AXIOM_JOBS, pending);
+    if (pending.length) {
+      await sendQueueMessages(this.env.AXIOM_JOBS, pending);
+      recordHeartbeat(state, "queue", { status: "healthy", correlation_id: run.run_id,
+        detail: { messages: pending.length, kind: "backtest" } });
+      recordCostUsage(state, { queue_operations: pending.length });
+    }
     else await this.env.AXIOM_JOBS.send({ kind: "backtest.finalize-run.v1", workspace_id: SINGLETON_NAME,
       run_id: run.run_id }, { contentType: "json" });
     return run;
@@ -1914,6 +1997,14 @@ export class AxiomLab extends DurableObject {
       if (options.beforeDispatch) await options.beforeDispatch(shards.map((shard) => ({ job_id: shard.job_id, payload: shard.payload })));
       const responses = await Promise.all(shards.map(async (shard) => {
         const response = await this.gateways.research.run(shard.payload);
+        const transport = response._transport_telemetry ?? {};
+        recordCostUsage(state, { cloud_run_invocations: Number(transport.invocation_count ?? 1),
+          cloud_run_vcpu_seconds: Number(transport.elapsed_ms ?? 0) / 1000,
+          cloud_run_gib_seconds: Number(transport.elapsed_ms ?? 0) / 1000 * Number(transport.memory_gib ?? .5) });
+        recordHeartbeat(state, "backtester", { status: "healthy", correlation_id: shard.job_id,
+          detail: { phase, elapsed_ms: Number(transport.elapsed_ms ?? 0), engine: response.engine?.version ?? null } });
+        incrementOperationalMetric(state, "backtester", "job_latency_ms", Number(transport.elapsed_ms ?? 0));
+        incrementOperationalMetric(state, "backtester", "job_success", 1);
         if (response.job_id !== shard.job_id || response.phase !== phase) throw new Error("Backtest service provenance does not match the v2 request");
         if (response.schema_version !== "backtest-artifact-v2" || response.dataset?.sha256 !== shard.slice_hash
             || response.engine?.name !== "backtrader"
@@ -1944,6 +2035,14 @@ export class AxiomLab extends DurableObject {
     if (options.beforeDispatch) await options.beforeDispatch([{ job_id: payload.job_id, payload }]);
     const job_id = payload.job_id;
     const response = await this.gateways.research.run(payload);
+    const transport = response._transport_telemetry ?? {};
+    recordCostUsage(state, { cloud_run_invocations: Number(transport.invocation_count ?? 1),
+      cloud_run_vcpu_seconds: Number(transport.elapsed_ms ?? 0) / 1000,
+      cloud_run_gib_seconds: Number(transport.elapsed_ms ?? 0) / 1000 * Number(transport.memory_gib ?? .5) });
+    recordHeartbeat(state, "backtester", { status: "healthy", correlation_id: job_id,
+      detail: { phase, elapsed_ms: Number(transport.elapsed_ms ?? 0), engine: response.engine?.version ?? null } });
+    incrementOperationalMetric(state, "backtester", "job_latency_ms", Number(transport.elapsed_ms ?? 0));
+    incrementOperationalMetric(state, "backtester", "job_success", 1);
     if (response.job_id !== job_id || response.phase !== phase) throw new Error("Backtest service provenance does not match the request");
     if (response.dataset?.sha256 !== sliceHash || response.engine?.name !== "backtrader"
       || response.engine?.config_hash !== config_hash) {
@@ -2627,6 +2726,14 @@ export class AxiomLab extends DurableObject {
       if (request.method === "POST" && url.pathname === "/internal/orchestration/tick") {
         const body = await request.json().catch(() => ({}));
         const timestamp = body.scheduled_at ?? new Date().toISOString();
+        recordCostUsage(state, { worker_requests: 1, durable_object_requests: 1 }, timestamp);
+        const costPolicy = evaluateCostPolicy(state, this.env, timestamp);
+        recordHeartbeat(state, "scheduler", { status: "healthy", at: timestamp,
+          correlation_id: `tick:${timestamp}`, detail: { mode: orchestrationMode(this.env) } });
+        recordHeartbeat(state, "cost_telemetry", { status: ["telemetry_unavailable", "hard_stop"].includes(costPolicy.level) ? "blocked"
+          : ["optional_paused", "constrained"].includes(costPolicy.level) ? "degraded" : "healthy", at: timestamp,
+          correlation_id: `cost:${costPolicy.estimate.month}`, detail: { level: costPolicy.level,
+            projected_ratio: costPolicy.projected_ratio } });
         const results = await this.planAndSubmitOrchestration(state, timestamp, body.events ?? state.marketData?.live?.latest_events ?? []);
         await this.controlPlane.saveState(state);
         return json({ ok: true, results });

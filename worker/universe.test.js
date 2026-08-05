@@ -8,6 +8,7 @@ import {
   assertInitialUniverse,
   initialUniverseManifest,
   isInitialUniverseSymbol,
+  runtimeUniverseManifest,
 } from "./universe.js";
 
 test("initial IEX universe is a frozen diversified set of exactly 40 symbols", async () => {
@@ -27,4 +28,21 @@ test("universe manifest and membership are deterministic", async () => {
   assert.deepEqual(await initialUniverseManifest(), await initialUniverseManifest());
   assert.equal(isInitialUniverseSymbol("spy"), true);
   assert.equal(isInitialUniverseSymbol("BTCUSD"), false);
+});
+
+test("staging uses an explicitly distinct reduced universe", async () => {
+  const full = await initialUniverseManifest();
+  const staging = await runtimeUniverseManifest({ ENVIRONMENT: "staging", STAGING_SYMBOL_LIMIT: "5" });
+  assert.equal(staging.symbols.length, 5);
+  assert.equal(staging.staging_only, true);
+  assert.equal(staging.parent_universe_id, full.id);
+  assert.notEqual(staging.id, full.id);
+  assert.notEqual(staging.sha256, full.sha256);
+});
+
+test("production-paper always uses the complete frozen universe", async () => {
+  assert.deepEqual(
+    await runtimeUniverseManifest({ ENVIRONMENT: "production-paper", STAGING_SYMBOL_LIMIT: "5" }),
+    await initialUniverseManifest(),
+  );
 });

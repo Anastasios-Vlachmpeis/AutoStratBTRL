@@ -1,43 +1,30 @@
 {
   "$schema": "./node_modules/wrangler/config-schema.json",
-  "name": "axiom-strategy-foundry",
+  "name": "axiom-strategy-foundry-production-paper",
   "main": "worker/index.js",
   "compatibility_date": "2026-08-01",
-  "assets": {
-    "directory": "./public",
-    "binding": "ASSETS",
-    "run_worker_first": ["/api/*"]
-  },
-  "durable_objects": {
-    "bindings": [{ "name": "AXIOM_LAB", "class_name": "AxiomLab" }]
-  },
-  "exports": {
-    "AxiomLab": { "type": "durable-object", "storage": "sqlite" }
-  },
+  "assets": { "directory": "./public", "binding": "ASSETS", "run_worker_first": ["/api/*"] },
+  "durable_objects": { "bindings": [{ "name": "AXIOM_LAB", "class_name": "AxiomLab" }] },
+  "exports": { "AxiomLab": { "type": "durable-object", "storage": "sqlite" } },
   "d1_databases": [{
     "binding": "AXIOM_DB",
-    "database_name": "axiom-control",
-    "database_id": "REPLACE_WITH_D1_DATABASE_ID",
+    "database_name": "axiom-control-production-paper",
+    "database_id": "REPLACE_WITH_PRODUCTION_PAPER_D1_DATABASE_ID",
     "migrations_dir": "migrations"
   }],
   "r2_buckets": [{
     "binding": "AXIOM_ARTIFACTS",
-    "bucket_name": "axiom-private-artifacts",
-    "preview_bucket_name": "axiom-private-artifacts-preview"
+    "bucket_name": "axiom-private-artifacts-production-paper",
+    "preview_bucket_name": "axiom-private-artifacts-production-paper-preview"
   }],
   "queues": {
-    "producers": [{ "binding": "AXIOM_JOBS", "queue": "axiom-jobs" }],
-    "consumers": [{
-      "queue": "axiom-jobs",
-      "max_batch_size": 10,
-      "max_batch_timeout": 5,
-      "max_retries": 5,
-      "dead_letter_queue": "axiom-jobs-dlq"
-    }]
+    "producers": [{ "binding": "AXIOM_JOBS", "queue": "axiom-jobs-production-paper" }],
+    "consumers": [{ "queue": "axiom-jobs-production-paper", "max_batch_size": 10, "max_batch_timeout": 5,
+      "max_retries": 5, "dead_letter_queue": "axiom-jobs-production-paper-dlq" }]
   },
   "triggers": { "crons": ["* * * * *", "0 * * * *"] },
   "vars": {
-    "ENVIRONMENT": "staging",
+    "ENVIRONMENT": "production-paper",
     "ORCHESTRATION_MODE": "observe",
     "CONTROL_PLANE_MODE": "dual_write",
     "NORMALIZED_STORAGE_ENABLED": "true",
@@ -59,14 +46,13 @@
     "ALPACA_FLAT_TARGET_MINUTES": "5",
     "ALPACA_MAX_ORDER_PCT": "0.02",
     "BACKTEST_ENGINE": "shadow",
-    "BACKTEST_SERVICE_URL": "https://REPLACE_WITH_CLOUD_RUN_URL",
-    "BACKTEST_SERVICE_KEY_ID": "staging-current",
+    "BACKTEST_SERVICE_URL": "https://REPLACE_WITH_PRODUCTION_PAPER_CLOUD_RUN_URL",
+    "BACKTEST_SERVICE_KEY_ID": "production-paper-current",
     "BACKTEST_REQUIRE_IMAGE_DIGEST": "true",
     "COST_CONTROL_ENABLED": "true",
     "MONTHLY_BUDGET_LIMIT_USD": "50",
     "MONTHLY_FIXED_COST_USD": "0",
-    "COST_TELEMETRY_MAX_AGE_MS": "21600000",
-    "STAGING_SYMBOL_LIMIT": "5"
+    "COST_TELEMETRY_MAX_AGE_MS": "21600000"
   },
   "observability": { "enabled": true, "head_sampling_rate": 1 }
 }

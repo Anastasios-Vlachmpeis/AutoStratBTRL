@@ -1,4 +1,6 @@
 import { hashCanonical } from "./dsl.js";
+import { costPublicSummary } from "./cost-controller.js";
+import { operationalHealth } from "./observability.js";
 
 export const OPERATOR_READ_DTO_VERSION = "axiom.operator-read.v1";
 export const OPERATOR_PAGE_DTO_VERSION = "axiom.operator-page.v1";
@@ -106,13 +108,16 @@ export function buildOperationsReadModel(state, env = {}, architecture = {}, now
   const lossFraction = finite(state.alpaca?.risk_session?.loss_fraction);
   const incidents = incidentRows(state);
   const usage = state.marketData?.usage ?? {};
-  const configuredBudget = Number(env.MONTHLY_COST_ESTIMATE_USD);
+  const budgetSummary = costPublicSummary(state, env, now);
+  const health = operationalHealth(state, now);
   const attention = [...incidents.map((item) => ({ code: item.kind, severity: item.severity,
     strategy_id: item.strategy_id, summary: item.summary }))];
   if (String(universe.feed ?? env.ALPACA_DATA_FEED ?? "iex").toLowerCase() === "iex") attention.push({
     code: "iex_not_consolidated", severity: "info", summary: "IEX is not the consolidated SIP market feed." });
   for (const reason of reasons) attention.push({ code: reason, severity: reason.includes("disabled") ? "info" : "warning",
     summary: reason.replaceAll("_", " ") });
+  for (const alert of health.alerts) attention.push({ code: alert.code, severity: alert.severity,
+    summary: alert.summary, subsystem: alert.subsystem });
   return Object.freeze({ dto_version: OPERATOR_READ_DTO_VERSION, generated_at: iso(now), timezone: "America/New_York",
     mode: { code: mode, label: mode.replaceAll("_", " "), new_risk_possible: reasons.length === 0, blocked_reasons: reasons,
       orchestration: state.orchestration?.mode ?? String(env.ORCHESTRATION_MODE ?? "observe"),
@@ -131,15 +136,18 @@ export function buildOperationsReadModel(state, env = {}, architecture = {}, now
       last_poll_at: iso(live.last_poll_at), last_event_at: iso(live.last_event_at),
       revision_events: finite(live.revision_events), source: "Alpaca IEX 5-minute regular-session bars" },
     services: serviceSummary(state, env, architecture),
-    budget: { monthly_limit_usd: finite(env.MONTHLY_BUDGET_LIMIT_USD, 50),
-      estimated_monthly_usd: Number.isFinite(configuredBudget) ? configuredBudget : null,
-      estimate_status: Number.isFinite(configuredBudget) ? "operator_configured" : "not_configured",
+    budget: { monthly_limit_usd: budgetSummary.monthly_limit_usd,
+      estimated_monthly_usd: budgetSummary.projected_monthly_usd,
+      month_to_date_usd: budgetSummary.month_to_date_usd, projected_ratio: budgetSummary.projected_ratio,
+      level: budgetSummary.level, telemetry_status: budgetSummary.telemetry_status,
+      estimate_status: budgetSummary.telemetry_status === "disabled" ? "disabled" : budgetSummary.observed_days ? "measured_projection" : "telemetry_unavailable",
+      optional_research_allowed: budgetSummary.optional_research_allowed,
       usage: { alpaca_requests: finite(usage.alpaca_requests), queue_messages: finite(usage.queue_messages),
         d1_rows: finite(usage.d1_rows), r2_writes: finite(usage.r2_writes), worker_elapsed_ms: finite(usage.worker_elapsed_ms) } },
     research: { paused: Boolean(state.research?.paused), pause_reason: state.research?.pause_reason ?? null,
       population: state.research?.population?.length ?? 0, trials: Object.keys(state.research?.trials ?? {}).length,
       cohorts: state.research?.cohorts?.length ?? 0, novelty_archive: state.research?.novelty_archive?.dna_hashes?.length ?? 0 },
-    incidents, attention: attention.slice(0, 100),
+    incidents, attention: attention.slice(0, 100), observability: health,
     controls: { ...clone(state.orchestration?.controls ?? {}), release_paused: Boolean(state.orchestration?.controls?.release_paused) } });
 }
 
@@ -165,6 +173,10 @@ export function paginateOperatorItems(items, { cursor = null, limit = 50, kind =
 }
 
 export function operatorLogs(state) {
+  const structured = (state.observability?.events ?? []).map((item) => ({ id: item.event_id,
+    at: iso(item.at), category: item.subsystem, severity: item.severity, title: item.code,
+    detail: item.message, correlation_id: item.correlation_id ?? item.job_id ?? null,
+    strategy_id: item.strategy_id ?? null }));
   const events = (state.events ?? []).map((item, index) => ({ id: item.id ?? `event:${index}:${item.kind}`,
     at: iso(item.at), category: String(item.kind ?? item.type ?? "system").toLowerCase(), severity: item.kind?.includes("ERROR") ? "critical" : "info",
     title: item.title ?? item.kind ?? "System event", detail: item.detail ?? "", correlation_id: item.correlation_id ?? null,
@@ -177,7 +189,9 @@ export function operatorLogs(state) {
     at: iso(item.opened_at), category: "incident", severity: item.severity ?? "critical", title: item.kind ?? "Incident",
     detail: item.reason ?? item.message ?? "Operator attention required", correlation_id: item.command_id ?? null,
     strategy_id: item.strategy_id ?? null }));
-  return [...events, ...lifecycle, ...incidents].sort((a, b) => String(b.at ?? "").localeCompare(String(a.at ?? "")) || a.id.localeCompare(b.id));
+  const unique = new Map();
+  for (const item of [...structured, ...events, ...lifecycle, ...incidents]) if (!unique.has(item.id)) unique.set(item.id, item);
+  return [...unique.values()].sort((a, b) => String(b.at ?? "").localeCompare(String(a.at ?? "")) || a.id.localeCompare(b.id));
 }
 
 export function operatorTrials(state) {

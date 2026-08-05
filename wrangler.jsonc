@@ -26,6 +26,7 @@
     "crons": ["* * * * *", "0 * * * *"]
   },
   "vars": {
+    "ENVIRONMENT": "local",
     "ORCHESTRATION_MODE": "observe",
     "CONTROL_PLANE_MODE": "legacy",
     "NORMALIZED_STORAGE_ENABLED": "false",
@@ -47,13 +48,19 @@
     "ALPACA_FLAT_TARGET_MINUTES": "5",
     "ALPACA_MAX_ORDER_PCT": "0.02",
     "BACKTEST_ENGINE": "shadow",
+    "BACKTEST_SERVICE_KEY_ID": "local-current",
     "BACKTEST_REQUIRE_IMAGE_DIGEST": "false",
+    "COST_CONTROL_ENABLED": "false",
+    "MONTHLY_BUDGET_LIMIT_USD": "50",
+    "MONTHLY_FIXED_COST_USD": "0",
+    "COST_TELEMETRY_MAX_AGE_MS": "21600000",
     "RESEARCH_AUTORUN_ENABLED": "true",
     "RESEARCH_AUTORUN_SAMPLED_GENOMES": "32",
     "RESEARCH_AUTORUN_CHALLENGERS": "8",
     "RESEARCH_BUDGET_STATUS": "healthy"
   },
   "observability": {
-    "enabled": true
+    "enabled": true,
+    "head_sampling_rate": 1
   }
 }

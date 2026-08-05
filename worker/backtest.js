@@ -434,21 +434,27 @@ export async function signedBacktest(env, payload) {
     throw new Error("Backtest job ID is not bound to the canonical request payload");
   }
   const body = JSON.stringify(payload);
+  const startedAt = Date.now();
+  const keyId = String(env.BACKTEST_SERVICE_KEY_ID ?? "current");
+  if (!/^[A-Za-z0-9._:-]{1,64}$/.test(keyId)) throw new Error("Backtest service key ID is invalid");
   const timestamp = String(Math.floor(Date.now() / 1000));
   const signatureBytes = await crypto.subtle.sign("HMAC", await crypto.subtle.importKey(
     "raw", encoder.encode(env.BACKTEST_SERVICE_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]), encoder.encode(`${timestamp}.${payload.job_id}.${body}`));
   const signature = [...new Uint8Array(signatureBytes)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
   const response = await fetch(`${String(env.BACKTEST_SERVICE_URL).replace(/\/$/, "")}/v1/backtests/batch`, {
     method: "POST", headers: { "content-type": "application/json", "x-axiom-timestamp": timestamp,
-      "x-axiom-job-id": payload.job_id, "x-axiom-signature": signature }, body,
+      "x-axiom-job-id": payload.job_id, "x-axiom-key-id": keyId, "x-axiom-signature": signature }, body,
     signal: AbortSignal.timeout(Math.min(Math.max(Number(env.BACKTEST_TIMEOUT_MS || 290000), 1000), 300000)),
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(`Backtest service ${response.status}: ${result.error || result.detail || "request failed"}`);
   if (!Array.isArray(result.results)) throw new Error("Backtest service response is missing results");
-  return verifyBacktestResponse(payload, result, {
+  const verified = await verifyBacktestResponse(payload, result, {
     requireImageDigest: String(env.BACKTEST_REQUIRE_IMAGE_DIGEST ?? "true").toLowerCase() !== "false",
   });
+  Object.defineProperty(verified, "_transport_telemetry", { enumerable: false, configurable: false,
+    value: { invocation_count: 1, elapsed_ms: Math.max(0, Date.now() - startedAt), memory_gib: .5 } });
+  return verified;
 }
 
 export function normalizeMetrics(source = {}) {
