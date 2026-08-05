@@ -132,8 +132,11 @@ test("private cleanup removes Durable Object and mirrored R2 objects", async () 
   }, CONTROL_PLANE_WORKSPACE);
   await repository.putDatasetSlice("dataset-1", "development", [{ t: "2026-01-01T00:00:00Z" }]);
   await repository.putArtifact("artifact-1", { ok: true });
+  await repository.putResearchTrial("COH-1", "TR-1", { proposal: { dna: { safe: true } }, holdout_bars: [1] });
+  assert.deepEqual(await repository.getResearchTrial("COH-1", "TR-1"), { proposal: { dna: { safe: true } } });
   await repository.clear();
   assert.equal((await storage.list({ prefix: "bt:" })).size, 0);
+  assert.equal((await storage.list({ prefix: "research:" })).size, 0);
   assert.equal(bucket.objects.size, 0);
   assert.equal(database.artifacts.size, 0);
 });

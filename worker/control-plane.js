@@ -70,6 +70,10 @@ export class PrivateArtifactRepository {
     return `bt:dataset:${datasetId}:${phase}`;
   }
 
+  researchTrialStorageKey(cohortId, trialId) {
+    return `research:trial:${cohortId}:${trialId}`;
+  }
+
   r2Key(kind, id) {
     return `workspaces/${encoded(this.workspace)}/private/${kind}/${encoded(id)}.json`;
   }
@@ -126,6 +130,18 @@ export class PrivateArtifactRepository {
     return this.storage.get(this.datasetStorageKey(datasetId, phase));
   }
 
+  async putResearchTrial(cohortId, trialId, value, metadata = {}) {
+    const safe = redactPrivateBars(value);
+    await this.storage.put(this.researchTrialStorageKey(cohortId, trialId), safe);
+    const mirror = await this.mirror("research-trials", `${cohortId}-${trialId}`, safe,
+      { cohort_id: cohortId, trial_id: trialId, ...metadata });
+    return { value: safe, mirror };
+  }
+
+  async getResearchTrial(cohortId, trialId) {
+    return this.storage.get(this.researchTrialStorageKey(cohortId, trialId));
+  }
+
   async clear() {
     if (this.mode === "dual_write") {
       const prefix = `workspaces/${encoded(this.workspace)}/private/`;
@@ -147,6 +163,8 @@ export class PrivateArtifactRepository {
     // reset be retried instead of leaving state that references deleted evidence.
     const keys = await this.storage.list({ prefix: "bt:" });
     if (keys.size) await this.storage.delete([...keys.keys()]);
+    const researchKeys = await this.storage.list({ prefix: "research:" });
+    if (researchKeys.size) await this.storage.delete([...researchKeys.keys()]);
   }
 }
 

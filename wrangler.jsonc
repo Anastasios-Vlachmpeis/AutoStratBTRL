@@ -33,7 +33,11 @@
     "ALPACA_SHORT_TRADING_ENABLED": "false",
     "ALPACA_MAX_STRATEGY_PCT": "0.02",
     "ALPACA_MAX_PORTFOLIO_PCT": "0.20",
-    "BACKTEST_ENGINE": "shadow"
+    "BACKTEST_ENGINE": "shadow",
+    "RESEARCH_AUTORUN_ENABLED": "true",
+    "RESEARCH_AUTORUN_SAMPLED_GENOMES": "32",
+    "RESEARCH_AUTORUN_CHALLENGERS": "8",
+    "RESEARCH_BUDGET_STATUS": "healthy"
   },
   "observability": {
     "enabled": true

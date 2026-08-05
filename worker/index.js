@@ -5,7 +5,6 @@ import {
   advanceMarket,
   createDemoState,
   CURRENT_SCHEMA_VERSION,
-  generateBatch,
   migrateState,
   reproduce,
   reworkCandidates,
@@ -42,6 +41,13 @@ import {
   recordMarketDataUsage,
 } from "./market-data.js";
 import { initialUniverseManifest } from "./universe.js";
+import {
+  commitEvolutionaryResearch,
+  developmentOnlyDataset,
+  failEvolutionaryResearch,
+  prepareEvolutionaryResearch,
+} from "./research.js";
+import { dispatchExpensiveFinalists, pauseResearch, resumeResearch } from "./research-registry.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
@@ -146,6 +152,67 @@ async function validateWithAlpaca(env, stub) {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ legacy_bars: legacyBars, dsl_bars: dslBars }),
+  }));
+}
+
+const RESEARCH_PROBE_SYMBOLS = Object.freeze([
+  "SPY", "QQQ", "IWM", "TLT", "AAPL", "MSFT", "NVDA", "AMZN", "JPM", "XOM", "JNJ", "WMT",
+]);
+
+function newYorkClock(value = Date.now()) {
+  const parts = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
+    weekday: "short", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(new Date(value)).filter((part) => part.type !== "literal")
+    .map((part) => [part.type, part.value]));
+  return {
+    date: `${parts.year}-${parts.month}-${parts.day}`,
+    weekday: parts.weekday,
+    hour: Number(parts.hour),
+    minute: Number(parts.minute),
+  };
+}
+
+export function shouldRunPostCloseResearch(value = Date.now()) {
+  const clock = newYorkClock(value);
+  return !["Sat", "Sun"].includes(clock.weekday) && clock.hour === 17;
+}
+
+function boundedInt(value, fallback, low, high) {
+  const parsed = Number(value);
+  return Math.max(low, Math.min(high, Number.isFinite(parsed) ? Math.trunc(parsed) : fallback));
+}
+
+async function runEvolutionWithAlpaca(env, stub, options = {}) {
+  const current = await stateFrom(stub);
+  if (current.research?.paused) throw new Error(`Research is paused: ${current.research.pause_reason ?? "operator_paused"}`);
+  const raw = await createRuntimeGateways(env).marketData.dslResearchBars(RESEARCH_PROBE_SYMBOLS);
+  const development = developmentOnlyDataset(raw, .75);
+  const usableSymbols = Object.keys(development).filter((symbol) => development[symbol]?.length >= 120);
+  if (usableSymbols.length < 5) throw new Error("At least five symbols with sufficient 5-minute history are required");
+  const barsBySymbol = Object.fromEntries(usableSymbols.sort().map((symbol) => [symbol, development[symbol]]));
+  const datasetHash = await sha256(barsBySymbol);
+  const clock = newYorkClock(options.scheduled_at ?? Date.now());
+  const finalists = boundedInt(options.finalists, 6, 1, 12);
+  const sampled = boundedInt(options.sampled_genomes ?? env.RESEARCH_SAMPLED_GENOMES,
+    Math.max(16, finalists * 4), 1, 128);
+  const challengers = boundedInt(options.challengers ?? env.RESEARCH_CHALLENGERS,
+    Math.min(32, Math.max(4, finalists * 2)), 0, 32);
+  const seed = (Number(current.meta?.seed ?? 0) ^ Number(clock.date.replaceAll("-", ""))) >>> 0;
+  return stub.fetch(new Request("https://axiom.internal/internal/research/run", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      seed,
+      session_date: clock.date,
+      dataset_id: `alpaca-iex-5min-development-${datasetHash.slice(0, 24)}`,
+      dataset_hash: datasetHash,
+      dataset_scope: "development_only",
+      bars_by_symbol: barsBySymbol,
+      telemetry: { status: String(env.RESEARCH_BUDGET_STATUS ?? "healthy"), at: new Date().toISOString() },
+      config: { sampled_genomes: sampled, challengers, finalists, validation_slots: 3,
+        minimum_symbols: 5, maximum_symbol_concentration: .35 },
+    }),
   }));
 }
 
@@ -522,6 +589,35 @@ export class AxiomLab extends DurableObject {
     return { response, job_id, config_hash, dna, dataset };
   }
 
+  authorizeResearchDispatch(state, strategies, phase) {
+    const allowed = new Set(strategies.filter((strategy) => !strategy.trial_id).map((strategy) => strategy.id));
+    const byCohort = new Map();
+    for (const strategy of strategies.filter((item) => item.trial_id && item.cohort_id)) {
+      const group = byCohort.get(strategy.cohort_id) ?? [];
+      group.push(strategy);
+      byCohort.set(strategy.cohort_id, group);
+    }
+    for (const [cohortId, cohortStrategies] of byCohort) {
+      try {
+        const dispatched = dispatchExpensiveFinalists(state, {
+          cohort_id: cohortId,
+          trial_ids: cohortStrategies.map((strategy) => strategy.trial_id),
+          phase: phase === "holdout" ? "validation" : "development",
+        });
+        const trialIds = new Set(dispatched.map((trial) => trial.trial_id));
+        cohortStrategies.filter((strategy) => trialIds.has(strategy.trial_id))
+          .forEach((strategy) => allowed.add(strategy.id));
+        cohortStrategies.filter((strategy) => !trialIds.has(strategy.trial_id)).forEach((strategy) => {
+          this.record(state, "BACKTEST_ERROR", `${strategy.name} ${phase} deferred`, "Research dispatch quota or provenance record is unavailable");
+        });
+      } catch (error) {
+        cohortStrategies.forEach((strategy) => this.record(state, "BACKTEST_ERROR", `${strategy.name} ${phase} deferred`,
+          error instanceof Error ? error.message : String(error)));
+      }
+    }
+    return strategies.filter((strategy) => allowed.has(strategy.id));
+  }
+
   async reviewRemote(state, env, barsByFormat) {
     reworkCandidates(state);
     const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
@@ -547,8 +643,10 @@ export class AxiomLab extends DurableObject {
     }
     for (const { dataset, strategies } of byDataset.values()) {
       try {
-        const run = await this.invokeBacktrader(state, "development", strategies, dataset);
-        for (const strategy of strategies) {
+        const authorized = this.authorizeResearchDispatch(state, strategies, "development");
+        if (!authorized.length) continue;
+        const run = await this.invokeBacktrader(state, "development", authorized, dataset);
+        for (const strategy of authorized) {
           const strategyResult = run.response.results.find((item) => String(item.strategy_id ?? item.id) === strategy.id);
           if (strategyResult?.dna_hash !== strategy.dna_hash) throw new Error(`service returned mismatched DNA for ${strategy.id}`);
           if (strategy.strategy_format === "dsl-v1"
@@ -593,8 +691,10 @@ export class AxiomLab extends DurableObject {
     const groups = new Map();
     for (const strategy of candidates) { const dataset = state.datasets?.[strategy.dataset_id]; if (!dataset) { this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, "sealed dataset missing"); continue; } const groupKey = `${strategy.strategy_format ?? "legacy-archetype-v0"}:${dataset.id}`; const group = groups.get(groupKey) ?? { dataset, strategies: [] }; group.strategies.push(strategy); groups.set(groupKey, group); }
     for (const { dataset, strategies } of groups.values()) try {
-      const run = await this.invokeBacktrader(state, "holdout", strategies, dataset);
-      for (const strategy of strategies) {
+      const authorized = this.authorizeResearchDispatch(state, strategies, "holdout");
+      if (!authorized.length) continue;
+      const run = await this.invokeBacktrader(state, "holdout", authorized, dataset);
+      for (const strategy of authorized) {
         const strategyResult = run.response.results.find((item) => String(item.strategy_id ?? item.id) === strategy.id);
         if (strategyResult?.dna_hash !== strategy.dna_hash) throw new Error(`service returned mismatched DNA for ${strategy.id}`);
         if (strategy.strategy_format === "dsl-v1"
@@ -645,8 +745,17 @@ export class AxiomLab extends DurableObject {
       }
 
       if (request.method === "POST" && url.pathname === "/api/generate") {
-        const body = await request.json();
-        generateBatch(state, Math.max(1, Math.min(Number(body.count ?? 6), 12)));
+        return json({ error: "Generation requires a sealed development-only market dataset" }, 409);
+      }
+      if (request.method === "POST" && url.pathname === "/api/research/pause") {
+        const body = await request.json().catch(() => ({}));
+        pauseResearch(state, body.reason ?? "operator_paused");
+        this.record(state, "RESEARCH", "Evolutionary research paused", state.research.pause_reason);
+        return this.save(state);
+      }
+      if (request.method === "POST" && url.pathname === "/api/research/resume") {
+        resumeResearch(state);
+        this.record(state, "RESEARCH", "Evolutionary research resumed", "New cohorts may run within the daily budget.");
         return this.save(state);
       }
       if (request.method === "POST" && url.pathname === "/api/review") {
@@ -683,6 +792,32 @@ export class AxiomLab extends DurableObject {
         if (result.changed) await this.controlPlane.saveState(state);
         return json({ ok: true, ...result });
       }
+      if (request.method === "POST" && url.pathname === "/internal/research/run") {
+        const body = await request.json();
+        let prepared;
+        try {
+          prepared = prepareEvolutionaryResearch(state, body);
+          if (prepared.duplicate) return json(snapshot(state));
+          const artifactIds = {};
+          for (const artifact of prepared.trial_artifacts) {
+            const artifactId = `${artifact.cohort_id}:${artifact.trial_id}`;
+            await this.controlPlane.artifacts.putResearchTrial(artifact.cohort_id, artifact.trial_id, artifact, {
+              dataset_id: artifact.dataset_id, contract_hash: artifact.contract_hash,
+            });
+            artifactIds[artifact.trial_id] = artifactId;
+          }
+          const committed = commitEvolutionaryResearch(state, prepared, { artifact_ids: artifactIds });
+          this.record(state, "EVOLVE", `${committed.created.length} evolutionary finalists registered`,
+            `${prepared.screen.summary.attempted} attempts · ${prepared.screen.summary.eligible} eligible · development data only`);
+          return this.save(state);
+        } catch (error) {
+          if (prepared) failEvolutionaryResearch(state, prepared, error);
+          this.record(state, "BACKTEST_ERROR", "Evolutionary cohort deferred",
+            error instanceof Error ? error.message : String(error));
+          await this.controlPlane.saveState(state);
+          return json({ error: error instanceof Error ? error.message : "Evolutionary research failed" }, 503);
+        }
+      }
       if (request.method === "POST" && url.pathname === "/internal/review-live") {
         const body = await request.json();
         const legacyBars = body.legacy_bars ?? body.bars ?? {};
@@ -707,6 +842,7 @@ export class AxiomLab extends DurableObject {
           await this.reviewRemote(shadow, this.env, barsByFormat);
           state.datasets = shadow.datasets;
           state.backtestArtifacts = shadow.backtestArtifacts;
+          state.research = shadow.research;
           const backtraderDeferred = state.strategies.filter((item) => ["generated", "rework"].includes(item.state)
             && item.engine_family === "backtrader").map((item) => [item, item.state]);
           backtraderDeferred.forEach(([item]) => { item.state = "engine-deferred"; });
@@ -773,6 +909,7 @@ export class AxiomLab extends DurableObject {
           const awaiting = state.strategies.some((item) => item.state === "validation");
           await this.validateRemote(shadow, this.env, { includeShadow: true, advanceClock: false });
           state.backtestArtifacts = shadow.backtestArtifacts;
+          state.research = shadow.research;
           for (const strategy of state.strategies) {
             const remote = shadow.strategies.find((item) => item.id === strategy.id);
             if (!remote?.backtest_runs?.holdout) continue;
@@ -804,6 +941,12 @@ export class AxiomLab extends DurableObject {
         const id = decodeURIComponent(url.pathname.slice("/api/backtest-artifacts/".length));
         const artifact = await this.controlPlane.artifacts.getArtifact(id);
         return artifact ? json(artifact) : json({ error: "Artifact not found" }, 404);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/api/research-artifacts/")) {
+        const parts = url.pathname.slice("/api/research-artifacts/".length).split("/").map(decodeURIComponent);
+        if (parts.length !== 2 || !parts.every(Boolean)) return json({ error: "Cohort and trial IDs are required" }, 400);
+        const artifact = await this.controlPlane.artifacts.getResearchTrial(parts[0], parts[1]);
+        return artifact ? json(artifact) : json({ error: "Research artifact not found" }, 404);
       }
       if (request.method === "POST" && url.pathname === "/internal/alpaca-cycle") {
         const cycle = await request.json();
@@ -847,6 +990,10 @@ export default {
         if (request.method === "POST" && url.pathname === "/api/alpaca/portfolio") {
           return await refreshAlpacaPortfolio(env, stub);
         }
+        if (request.method === "POST" && url.pathname === "/api/generate") {
+          const body = await request.json().catch(() => ({}));
+          return await runEvolutionWithAlpaca(env, stub, { finalists: body.count });
+        }
         if (request.method === "POST" && url.pathname === "/api/review") {
           return await reviewWithAlpaca(env, stub);
         }
@@ -870,7 +1017,25 @@ export default {
     const work = [];
     if (controller.cron === "0 * * * *") {
       const bucket = new Date(controller.scheduledTime).toISOString().slice(0, 13);
-      work.push(synchronizeAlpaca(env, stub, bucket));
+      work.push((async () => {
+        await synchronizeAlpaca(env, stub, bucket);
+        if (String(env.RESEARCH_AUTORUN_ENABLED ?? "true").toLowerCase() === "true"
+            && shouldRunPostCloseResearch(controller.scheduledTime)) {
+          const current = await stateFrom(stub);
+          const sessionDate = newYorkClock(controller.scheduledTime).date;
+          if (!current.research?.paused && current.research?.last_completed_session !== sessionDate) {
+            const generated = await runEvolutionWithAlpaca(env, stub, {
+              scheduled_at: controller.scheduledTime,
+              finalists: 12,
+              sampled_genomes: env.RESEARCH_AUTORUN_SAMPLED_GENOMES ?? 32,
+              challengers: env.RESEARCH_AUTORUN_CHALLENGERS ?? 8,
+            });
+            if (!generated.ok) throw new Error(`Scheduled research failed: ${generated.status}`);
+            const reviewed = await reviewWithAlpaca(env, stub);
+            if (!reviewed.ok) throw new Error(`Scheduled finalist review failed: ${reviewed.status}`);
+          }
+        }
+      })());
     }
     if (marketDataMode(env) === "shadow" && controller.cron === "* * * * *") {
       work.push(tickMarketData(env, stub, controller.scheduledTime));

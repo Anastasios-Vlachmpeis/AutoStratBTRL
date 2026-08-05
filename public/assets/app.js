@@ -146,6 +146,11 @@ function renderSummary() {
   $("#count-validation").textContent = String(state.summary.validation || 0).padStart(2, "0");
   $("#count-released").textContent = String(state.summary.released).padStart(2, "0");
   $("#count-dropped").textContent = String(state.summary.dropped).padStart(2, "0");
+  const paused = Boolean(state.research?.paused);
+  $("#research-toggle-label").textContent = paused ? "Resume research" : "Pause research";
+  $("#research-toggle-button").title = paused
+    ? `Paused: ${state.research?.pause_reason || "operator_paused"}`
+    : "Pause autonomous evolutionary cohorts";
   $("#average-score").textContent = state.strategies.length ? number(state.summary.average_score, 1) : "—";
 }
 
@@ -1219,12 +1224,17 @@ async function animatedAction(kind, path, payload, successMessage, detail, strat
 $("#generate-button").addEventListener("click", () => {
   const count = Number($("#cohort-size").value);
   const existingIds = state.strategies.map((strategy) => strategy.id);
-  animatedAction("generate", "/api/generate", { count }, `${count} new strategy DNA${count === 1 ? "" : "s"} seeded.`, `${count} NEW GENOME${count === 1 ? "" : "S"}`, existingIds);
+  animatedAction("generate", "/api/generate", { count }, "Evolutionary cohort screened and finalists registered.", `${count} FINALIST SLOT${count === 1 ? "" : "S"}`, existingIds);
 });
 $("#review-button").addEventListener("click", () => {
   const candidates = state.strategies.filter((strategy) => ["generated", "rework"].includes(strategy.state));
   const count = candidates.length;
   animatedAction("review", "/api/review", {}, "Supervisor review cycle complete.", `${count} CANDIDATE${count === 1 ? "" : "S"}`, candidates.map((strategy) => strategy.id));
+});
+$("#research-toggle-button").addEventListener("click", () => {
+  const paused = Boolean(state.research?.paused);
+  action(paused ? "/api/research/resume" : "/api/research/pause",
+    paused ? {} : { reason: "operator_paused" }, paused ? "Evolutionary research resumed." : "Evolutionary research paused.");
 });
 $("#validate-button").addEventListener("click", () => {
   const candidates = state.strategies.filter((strategy) => strategy.state === "validation");

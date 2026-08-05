@@ -14,6 +14,7 @@ import {
   marketSeries,
   migrateState,
   reproduce,
+  registerResearchFinalists,
   reworkCandidates,
   reviewCandidates,
   reviewCandidatesWithBars,
@@ -291,6 +292,35 @@ test("schema 6 migration freezes legacy strategies while new cohorts remain DSL-
   assert.equal(newest.strategy_format, "dsl-v1");
   assert.ok(newest.strategy_dna);
   assert.equal(newest.legacy_dna ?? null, null);
+});
+
+test("schema 7 migration initializes private evolutionary state without changing strategies", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  const id = state.strategies[0].id;
+  state.schemaVersion = 7;
+  delete state.research;
+  const migrated = migrateState(state);
+  assert.equal(migrated.strategies[0].id, id);
+  assert.equal(migrated.research.total_trials, 0);
+  assert.equal(snapshot(migrated).research.population_size, 0);
+});
+
+test("only evolutionary finalists enter the lifecycle and private trials stay out of snapshots", () => {
+  const fixture = createDemoState();
+  generateBatch(fixture, 1);
+  const dna = structuredClone(fixture.strategies[0].strategy_dna);
+  const state = createDemoState();
+  state.research.trials.secret = { dna: { private: true } };
+  const original = JSON.stringify(dna);
+  const created = registerResearchFinalists(state, [{ trial_id: "TR-1", dna_hash: dna.dna_hash, dna,
+    selection_rank: 1, fitness: { sharpe_proxy: 1 }, behavior_hash: "b".repeat(64) }],
+  { cohort_id: "COH-1", attempted: 40 });
+  assert.equal(created.length, 1);
+  assert.equal(state.strategies.length, 1);
+  assert.equal(created[0].trial_id, "TR-1");
+  assert.equal(JSON.stringify(dna), original);
+  assert.equal("trials" in snapshot(state).research, false);
 });
 
 test("Alpaca cycles are idempotent and record managed symbols", () => {

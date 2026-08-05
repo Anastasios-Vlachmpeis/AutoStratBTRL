@@ -2,11 +2,12 @@
 
 import { evaluateLatestTarget, evaluateStrategyTargets } from "./dsl.js";
 import { DSL_FAMILIES, buildGeneratedStrategyDNA } from "./dsl-generation.js";
+import { emptyResearchState, ensureResearchState, publicResearchState } from "./research-contract.js";
 import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
 
 export const REGIMES = ["Expansion", "Compression", "Stress", "Recovery"];
 export const ASSETS = [...INITIAL_UNIVERSE_SYMBOLS];
-export const CURRENT_SCHEMA_VERSION = 7;
+export const CURRENT_SCHEMA_VERSION = 8;
 
 const NAMES = [
   "Orion Pulse", "Kestrel Drift", "Helix Break", "Cobalt Revert",
@@ -380,6 +381,69 @@ function newStrategy(state, parent = null, mutateParent = true) {
     rework: emptyRework(parent?.rework?.attempt ?? 0, parent?.rework?.history ?? []),
     monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
   };
+}
+
+function researchDisplayParams(dna) {
+  const windows = dna.features.map((node) => node.params?.window ?? node.params?.lag)
+    .filter((value) => Number.isFinite(value) && value > 0);
+  const constants = dna.features.filter((node) => node.op === "constant")
+    .map((node) => Number(node.params.value)).filter(Number.isFinite);
+  return {
+    position_size: Number(dna.target.position_size),
+    primary_lookback: Number(windows[0] ?? dna.warmup_bars ?? 0),
+    secondary_lookback: Number(windows[1] ?? windows[0] ?? dna.warmup_bars ?? 0),
+    decision_level: Number(constants.find((value) => value !== 0) ?? 0),
+  };
+}
+
+/** Materialize only selected evolutionary finalists into the existing lifecycle book. */
+export function registerResearchFinalists(state, finalists, cohort) {
+  const ordered = [...(finalists ?? [])].filter((item) => item?.dna)
+    .sort((left, right) => Number(left.selection_rank ?? 999) - Number(right.selection_rank ?? 999)
+      || String(left.dna_hash).localeCompare(String(right.dna_hash)));
+  if (!ordered.length) return [];
+  state.cycle += 1;
+  const created = ordered.map((trial, index) => {
+    const id = `AX-${String(state.cycle).padStart(2, "0")}-${String(state.nextId).padStart(3, "0")}`;
+    state.nextId += 1;
+    const dna = clone(trial.dna);
+    const symbols = dna.scope.symbols;
+    const assetIndex = Number.parseInt(dna.dna_hash.slice(0, 8), 16) % symbols.length;
+    return {
+      id,
+      name: `${NAMES[(state.nextId - 2 + index) % NAMES.length]} E${state.nextId % 10}`,
+      archetype: trial.behavior_cluster ? `Behavior ${trial.behavior_cluster}` : `Evolved ${trial.operator ?? "grammar"}`,
+      asset: symbols[assetIndex],
+      params: researchDisplayParams(dna),
+      state: "generated",
+      generation: Number(dna.lineage.generation),
+      parent: null,
+      trial_id: trial.trial_id,
+      cohort_id: cohort.cohort_id,
+      selection_rank: Number(trial.selection_rank ?? index + 1),
+      fitness: clone(trial.fitness ?? null),
+      behavior_hash: trial.behavior_hash ?? null,
+      backtests: 0,
+      metrics: null,
+      validation: null,
+      strategy_format: "dsl-v1",
+      strategy_dna: dna,
+      explanation: trial.explanation ?? null,
+      dna_hash: dna.dna_hash,
+      compiler: dna.compiler,
+      risk_multiplier: 1,
+      engine_family: null,
+      dataset_id: null,
+      backtest_runs: {},
+      rework: emptyRework(),
+      monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
+    };
+  });
+  state.strategies = [...created, ...state.strategies];
+  event(state, "EVOLVE", `${cohort.cohort_id} selected ${created.length} finalists`,
+    `${cohort.attempted ?? 0} attempts · development-only Pareto and novelty selection`);
+  state.marketClock += 3;
+  return created;
 }
 
 function refreshStrategyDNA(strategy, parent = null) {
@@ -893,6 +957,7 @@ export function createDemoState() {
     lastScheduledBucket: null,
     alpaca: { connected: false, managed_symbols: [], last_cycle_bucket: null, short_trading_enabled: false, safety_reasons: [] },
     marketData: {},
+    research: emptyResearchState(),
   };
 }
 
@@ -921,6 +986,7 @@ export function migrateState(state) {
   migrated.datasets ??= {};
   migrated.backtestArtifacts ??= {};
   migrated.marketData ??= {};
+  ensureResearchState(migrated);
   return migrated;
 }
 
@@ -962,6 +1028,7 @@ export function snapshot(state) {
       backfill: state.marketData?.backfill ?? null,
       live: state.marketData?.live ?? null,
     }),
+    research: publicResearchState(state.research),
     policy: {
       release_score: 61, min_sharpe: 0.55, max_drawdown: 0.20,
       validation_min_sharpe: 0.30, validation_max_drawdown: 0.20, monitor_window: 21,
