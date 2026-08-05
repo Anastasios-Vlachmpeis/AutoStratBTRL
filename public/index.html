@@ -83,6 +83,14 @@
         </section>
 
         <section class="portfolio-dashboard" id="portfolio-dashboard" aria-label="Alpaca portfolio monitor">
+          <section class="operations-center" id="operations-center" aria-label="Operator control plane">
+            <div class="operations-head">
+              <div><span class="section-kicker">CONTROL PLANE / FIVE-MINUTE SYSTEM</span><h2>Operations now</h2></div>
+              <div class="mode-lockup"><span id="ops-mode" class="status-badge">LOADING</span><small id="ops-generated-at">Awaiting operator read model</small></div>
+            </div>
+            <div class="operations-grid" id="operations-grid" aria-live="polite"></div>
+            <div class="operations-attention" id="operations-attention"></div>
+          </section>
           <article class="panel portfolio-summary-panel">
             <div class="panel-header">
               <div><span class="section-kicker">ALPACA PAPER ACCOUNT</span><h2>Portfolio monitor</h2><div class="selected-meta" id="portfolio-updated"></div></div>
@@ -115,8 +123,10 @@
               <div class="empty-state" id="orders-empty">Connect Alpaca to load open orders.</div>
             </article>
           </div>
-          <p class="portfolio-footnote">Position attribution is conservative: Alpaca combines all shares of the same symbol, so a symbol touched by both you and Axiom is marked mixed.</p>
+          <p class="portfolio-footnote">All execution shown here is Alpaca paper trading. IEX is a limited venue feed, not the consolidated SIP feed. Position attribution is conservative: Alpaca combines all shares of the same symbol, so a symbol touched by both you and Axiom is marked mixed.</p>
         </section>
+
+        <section class="desk-observer" id="desk-observer" hidden aria-label="Lifecycle evidence summary"></section>
 
         <section class="main-grid" id="strategy-overview" hidden>
           <article class="panel performance-panel">
@@ -146,8 +156,9 @@
           <article class="panel logs-panel">
             <div class="panel-header">
               <div><span class="section-kicker">SUPERVISOR TAPE</span><h2>System decision log</h2><div class="selected-meta"><span>GENERATION</span><span>REVIEW</span><span>VALIDATION</span><span>MARKET</span></div></div>
-              <div class="logs-header-meta"><strong id="log-count">0</strong><small>RECENT EVENTS</small><span class="live-marker"><i></i>LIVE</span></div>
+              <div class="logs-header-meta"><strong id="log-count">0</strong><small>EVENTS LOADED</small><span class="live-marker"><i></i>PRIVATE</span></div>
             </div>
+            <div class="log-controls"><label>TYPE <select id="log-category"><option value="">ALL</option><option value="lifecycle">LIFECYCLE</option><option value="incident">INCIDENT</option><option value="audit">AUDIT</option><option value="backtest_error">BACKTEST ERROR</option></select></label><button class="button compact" id="load-more-logs" hidden>Load more</button></div>
             <div class="audit-feed" id="audit-feed" aria-live="polite"></div>
           </article>
         </section>
@@ -171,6 +182,10 @@
 
         <section class="detail-grid" id="strategy-detail" hidden>
           <aside class="strategy-context-strip" id="strategy-context-strip" hidden></aside>
+          <article class="panel evidence-panel" id="strategy-evidence-panel">
+            <div class="panel-header simple"><div><span class="section-kicker">EVIDENCE CHAIN</span><h2>What this result actually means</h2></div><span class="mono" id="evidence-context">NO STRATEGY</span></div>
+            <div class="evidence-content" id="evidence-content"><div class="empty-state">Select a strategy to inspect its evidence and provenance.</div></div>
+          </article>
           <article class="panel dna-panel">
             <div class="panel-header simple"><div><span class="section-kicker">STRATEGY DNA</span><h2>Blueprint & lineage</h2></div><span class="mono" id="selected-id">—</span></div>
             <div id="dna-content" class="dna-content"></div>
@@ -184,6 +199,26 @@
       <footer><span>AXIOM v0.1 / DETERMINISTIC SEED <b id="seed-value">—</b></span><span>RESEARCH & PAPER SIMULATION ONLY — NOT INVESTMENT ADVICE</span></footer>
     </div>
   </div>
+  <aside class="safety-dock" id="safety-dock" aria-label="Persistent safety controls">
+    <div><span>SAFETY CONTROLS</span><small id="command-receipt">No command pending</small></div>
+    <button class="dock-button" id="ops-research-toggle" data-command="pause_research">Pause research</button>
+    <button class="dock-button" id="ops-release-toggle" data-command="pause_release">Pause release</button>
+    <button class="dock-button" id="ops-execution-toggle" data-command="pause_execution">Pause execution</button>
+    <button class="dock-button" id="ops-approval-button">Approve hash</button>
+    <button class="dock-button warning" id="ops-cancel-button" data-command="cancel_open_orders">Cancel orders</button>
+    <button class="dock-button danger" id="ops-flatten-button" data-command="flatten_all">Flatten managed</button>
+    <button class="dock-button danger solid" id="ops-kill-button" data-command="kill_switch">Kill + flatten</button>
+  </aside>
+  <dialog class="reset-dialog" id="reset-dialog" aria-labelledby="reset-title">
+    <form method="dialog" id="reset-form">
+      <header><span class="section-kicker">DESTRUCTIVE / NONPRODUCTION ONLY</span><h2 id="reset-title">Reset the entire workspace</h2></header>
+      <p>This deletes application state, snapshots and artifacts identified by a server-generated manifest. Production is blocked by the server.</p>
+      <label>Re-enter admin token<input type="password" id="reset-admin-token" autocomplete="current-password" required></label>
+      <div class="reset-manifest" id="reset-manifest">Prepare a manifest before execution.</div>
+      <label>Type <strong>RESET NONPRODUCTION WORKSPACE</strong><input id="reset-confirmation" autocomplete="off" required></label>
+      <div class="dialog-actions"><button class="button" value="cancel">Cancel</button><button class="button" type="button" id="prepare-reset-button">Prepare manifest</button><button class="button danger" type="button" id="execute-reset-button" disabled>Execute reset</button></div>
+    </form>
+  </dialog>
   <div class="operation-overlay" id="operation-overlay" role="dialog" aria-modal="true" aria-labelledby="operation-title" tabindex="-1" hidden>
     <section class="operation-terminal" id="operation-terminal">
       <div class="operation-scanline" aria-hidden="true"></div>

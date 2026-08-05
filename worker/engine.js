@@ -343,13 +343,16 @@ function aggregateResults(results) {
 }
 
 function event(state, kind, title, detail) {
+  const now = new Date();
   state.events.unshift({
+    id: `EV-${now.getTime()}-${Math.random().toString(36).slice(2, 7)}`,
     kind,
     title,
     detail,
-    time: new Date().toISOString().slice(11, 16),
+    time: now.toISOString().slice(11, 16),
+    at: now.toISOString(),
   });
-  state.events = state.events.slice(0, 28);
+  state.events = state.events.slice(0, 2048);
 }
 
 function parameters(archetype, rng) {

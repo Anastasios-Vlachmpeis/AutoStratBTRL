@@ -136,7 +136,9 @@ export class PrivateArtifactRepository {
     const found = id.startsWith("art-")
       ? await this.contentStore.get({ workspaceId: this.workspace, artifactId: id })
       : await this.contentStore.findLatest({ workspaceId: this.workspace, kind: "backtest.result", metadata: { legacy_id: id } });
-    return found ? JSON.parse(new TextDecoder().decode(found.bytes)) : undefined;
+    if (!found || found.manifest?.artifact_kind === "dataset.holdout.raw"
+        || found.manifest?.visibility === "sealed_holdout") return undefined;
+    return JSON.parse(new TextDecoder().decode(found.bytes));
   }
 
   async putDatasetSlice(datasetId, phase, bars, metadata = {}, provenance = {}) {

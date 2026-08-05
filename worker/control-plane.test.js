@@ -141,6 +141,13 @@ test("private cleanup removes Durable Object and mirrored R2 objects", async () 
   assert.equal(database.artifacts.size, 0);
 });
 
+test("generic artifact retrieval refuses sealed holdout objects even to authenticated admin routes", async () => {
+  const repository = new PrivateArtifactRepository(new MemoryStorage(), {});
+  repository.contentStore = { async get() { return { manifest: { artifact_kind: "dataset.holdout.raw",
+    visibility: "sealed_holdout" }, bytes: new TextEncoder().encode(JSON.stringify([{ secret: "bar" }])) }; } };
+  assert.equal(await repository.getArtifact("art-sealed"), undefined);
+});
+
 test("failed mirror cleanup preserves authoritative Durable Object evidence", async () => {
   const storage = new MemoryStorage();
   await storage.put("bt:artifact:artifact-1", { ok: true });

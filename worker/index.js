@@ -68,10 +68,12 @@ import {
   recordSealedHoldoutServiceStatus,
 } from "./research-contract.js";
 import { createEvaluationPolicy, decideHoldout, evaluationPolicyHash, replaySupervisorDecision, selectValidationCapacity, superviseDevelopment } from "./evaluation-policy.js";
-import { applyOrchestrationCommand, createOrchestrationCommand, ensureOrchestrationState, executeOrchestrationActionBatch, executionAllowed, orchestrationCommandDisposition, orchestrationMode, pipelineFollowups } from "./orchestration.js";
+import { applyOrchestrationCommand, claimOperatorIdempotency, createOrchestrationCommand, ensureOrchestrationState, executeOrchestrationActionBatch, executionAllowed, orchestrationCommandDisposition, orchestrationMode, pipelineFollowups } from "./orchestration.js";
 import { OrchestrationStore } from "./orchestration-store.js";
 import { planOrchestrationWork } from "./orchestration-schedule.js";
 import { applyLifecycleCommand, bindLifecycleProvenance, initialLifecycle, transitionId } from "./lifecycle.js";
+import { ADMIN_COMMAND_DTO_VERSION, buildOperationsReadModel, operatorArtifacts, operatorLogs,
+  operatorOrders, operatorTrades, operatorTrials, paginateOperatorItems, strategyEvidenceDto } from "./operator-api.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
@@ -454,11 +456,13 @@ export class AxiomLab extends DurableObject {
     return json(snapshot(state));
   }
 
-  record(state, type, title, detail) {
+  record(state, type, title, detail, metadata = {}) {
     const now = new Date();
     state.events.unshift({ id: `BT-${now.getTime()}-${Math.random().toString(36).slice(2, 7)}`,
-      kind: type, type, title, detail, time: now.toISOString().slice(11, 16), at: now.toISOString() });
-    state.events = state.events.slice(0, 28);
+      kind: type, type, title, detail, time: now.toISOString().slice(11, 16), at: now.toISOString(),
+      correlation_id: metadata.correlation_id ?? null, command_id: metadata.command_id ?? null,
+      strategy_id: metadata.strategy_id ?? null });
+    state.events = state.events.slice(0, 2048);
   }
 
   registerPartitionedDataset(state, loaded) {
@@ -1141,7 +1145,7 @@ export class AxiomLab extends DurableObject {
         const prepared = await this.buildWorkspaceResetSnapshot();
         const persisted = await this.persistWorkspaceResetManifest(prepared, command);
         orchestration.pending_reset = { schema_version: 1, manifest_hash: prepared.manifest_hash,
-          identity: prepared.identity, artifact_manifest: prepared.artifact_manifest,
+          identity: prepared.identity, artifact_manifest: prepared.artifact_manifest, counts: prepared.counts,
           manifest_object_key: persisted.object_key, manifest_content_hash: persisted.content_hash,
           requested_by: command.actor, prepared_at: command.timestamp };
         if (this.controlPlane.normalized) await this.controlPlane.normalized.prepareWorkspaceReset({
@@ -2256,6 +2260,80 @@ export class AxiomLab extends DurableObject {
     const state = await this.load();
 
     try {
+      if (request.method === "GET" && url.pathname === "/api/v1/operations") {
+        let architecture = {};
+        try { architecture = await this.controlPlane.health(true); } catch (error) {
+          architecture = { ready: false, error: error instanceof Error ? error.message : String(error) };
+        }
+        return json(buildOperationsReadModel(state, this.env, architecture));
+      }
+      if (request.method === "GET" && ["/api/v1/logs", "/api/v1/trials", "/api/v1/orders",
+        "/api/v1/trades", "/api/v1/artifacts"].includes(url.pathname)) {
+        const sources = { "/api/v1/logs": ["logs", operatorLogs], "/api/v1/trials": ["trials", operatorTrials],
+          "/api/v1/orders": ["orders", operatorOrders], "/api/v1/trades": ["trades", operatorTrades],
+          "/api/v1/artifacts": ["artifacts", operatorArtifacts] };
+        const [kind, factory] = sources[url.pathname];
+        let items = factory(state);
+        const category = url.searchParams.get("category"), strategyId = url.searchParams.get("strategy_id");
+        if (category) items = items.filter((item) => item.category === category || item.status === category || item.phase === category);
+        if (strategyId) items = items.filter((item) => item.strategy_id === strategyId || item.strategy_ids?.includes(strategyId));
+        try { return json(paginateOperatorItems(items, { kind, cursor: url.searchParams.get("cursor"),
+          limit: url.searchParams.get("limit") })); } catch (error) { return json({ error: error.message, code: "invalid_request" }, 400); }
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/api/v1/strategies/")
+          && url.pathname.endsWith("/evidence")) {
+        const id = decodeURIComponent(url.pathname.slice("/api/v1/strategies/".length, -"/evidence".length));
+        const evidence = strategyEvidenceDto(state.strategies.find((item) => item.id === id));
+        return evidence ? json(evidence) : json({ error: "Strategy not found", code: "artifact_not_found" }, 404);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/api/v1/commands/")) {
+        const id = decodeURIComponent(url.pathname.slice("/api/v1/commands/".length));
+        const result = state.orchestration?.command_results?.[id];
+        return result ? json({ dto_version: ADMIN_COMMAND_DTO_VERSION, command_id: id,
+          status: result.status, outcome: result, terminal: ["applied", "blocked", "failed"].includes(result.status) })
+          : json({ dto_version: ADMIN_COMMAND_DTO_VERSION, command_id: id, status: "pending", terminal: false }, 202);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/api/v1/artifacts/")
+          && url.pathname.endsWith("/download")) {
+        const id = decodeURIComponent(url.pathname.slice("/api/v1/artifacts/".length, -"/download".length));
+        const listed = operatorArtifacts(state).some((item) => item.id === id);
+        if (!listed) return json({ error: "Safe artifact not found", code: "artifact_not_found" }, 404);
+        const artifact = await this.controlPlane.artifacts.getArtifact(id);
+        if (!artifact) return json({ error: "Safe artifact not found", code: "artifact_not_found" }, 404);
+        this.record(state, "AUDIT", "Private operator artifact downloaded", `Authenticated read of ${id}`);
+        await this.controlPlane.saveState(state);
+        return new Response(JSON.stringify(artifact), { headers: { "content-type": "application/json",
+          "content-disposition": `attachment; filename="${id.replace(/[^A-Za-z0-9._-]/g, "_")}.json"`,
+          "cache-control": "no-store", "x-content-type-options": "nosniff" } });
+      }
+      if (request.method === "POST" && url.pathname === "/api/v1/admin/commands") {
+        const body = await request.json().catch(() => ({}));
+        const idempotencyKey = String(request.headers.get("idempotency-key") ?? body.idempotency_key ?? "");
+        if (!/^[A-Za-z0-9._:-]{8,160}$/.test(idempotencyKey)) {
+          return json({ error: "A valid 8-160 character idempotency key is required", code: "invalid_request" }, 400);
+        }
+        const command = createOrchestrationCommand({ kind: body.kind, strategy_id: body.strategy_id ?? null,
+          actor: "operator:admin", timestamp: new Date().toISOString(), correlation_id: body.correlation_id ?? idempotencyKey,
+          payload: body.payload ?? {} });
+        try { claimOperatorIdempotency(state, idempotencyKey, command.command_id); }
+        catch (error) { return json({ error: error.message, code: "idempotency_conflict" }, 409); }
+        const result = await this.submitOrchestrationCommand(state, command, {
+          forceDirect: ["prepare_workspace_reset", "execute_workspace_reset", "kill_switch", "flatten_all", "cancel_open_orders"].includes(body.kind),
+        });
+        this.record(state, "OPERATOR_COMMAND", `${body.kind} · ${result.queued ? "accepted" : result.status}`,
+          `Command ${command.command_id} ${result.queued ? "queued for durable execution" : "reached a terminal outcome"}`,
+          { correlation_id: command.correlation_id, command_id: command.command_id, strategy_id: body.strategy_id ?? null });
+        await this.controlPlane.saveState(state);
+        const resetManifest = body.kind === "prepare_workspace_reset" && state.orchestration?.pending_reset
+          ? { manifest_hash: state.orchestration.pending_reset.manifest_hash,
+            counts: state.orchestration.pending_reset.counts ?? null,
+            prepared_at: state.orchestration.pending_reset.prepared_at }
+          : null;
+        return json({ dto_version: ADMIN_COMMAND_DTO_VERSION, command_id: command.command_id,
+          correlation_id: command.correlation_id, idempotency_key: idempotencyKey,
+          status: result.queued ? "accepted" : result.status, terminal: !result.queued,
+          outcome: result.queued ? null : result, ...(resetManifest ? { reset_manifest: resetManifest } : {}) }, result.queued ? 202 : 200);
+      }
       if (request.method === "GET" && url.pathname === "/api/state") {
         if (String(this.env.NORMALIZED_READ_ENABLED ?? "false").toLowerCase() === "true") {
           const cutover = this.controlPlane.normalized
@@ -2583,7 +2661,7 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
-      if (["/api/backtest-artifacts/", "/api/research-artifacts/"].some((prefix) => url.pathname.startsWith(prefix))
+      if (["/api/backtest-artifacts/", "/api/research-artifacts/", "/api/v1/artifacts/"].some((prefix) => url.pathname.startsWith(prefix))
           && !isStrictlyAuthorized(request, env)) {
         return json({ error: "Configured admin token required for private artifacts" }, 401);
       }

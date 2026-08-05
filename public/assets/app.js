@@ -8,6 +8,12 @@ let deskOverview = true;
 let curveLegendVisible = false;
 let toastTimer = null;
 let adminToken = sessionStorage.getItem("axiom-admin-token") || "";
+let operationsState = null;
+let operationsError = null;
+let operatorLogsState = { items: [], next_cursor: null, total: 0, category: "" };
+const evidenceCache = new Map();
+const evidencePending = new Set();
+let resetManifest = null;
 
 const multiStrategyViews = new Set(["overview", "testing", "released"]);
 const activeFilters = { overview: "all", testing: "all", released: "all" };
@@ -41,7 +47,7 @@ const filterConfigs = {
 const statusLabels = {
   generated: "Generated", rework: "Rework", validation: "Validation", capacity_wait: "Capacity wait",
   development_reject: "Development reject", incubation: "Incubation", release_blocked_short: "Short release blocked", holdout_reject: "Holdout reject",
-  inconclusive: "Inconclusive", incubation_reject: "Incubation reject", released: "Released", healthy: "Healthy", watch: "Watch",
+  inconclusive: "Inconclusive", incubation_reject: "Incubation reject", released: "Released paper", healthy: "Healthy paper", watch: "Watch paper",
   quarantined: "Quarantined", retired: "Retired", operational_blocked: "Operational block",
   dropped: "Dropped", superseded: "Superseded"
 };
@@ -169,9 +175,98 @@ function renderView() {
   $("#portfolio-dashboard").hidden = !portfolio;
   $("#logs-dashboard").hidden = !logs;
   $("#release-pipeline").hidden = !strategyWorkspace;
+  $("#desk-observer").hidden = !strategyWorkspace;
   $("#strategy-overview").hidden = !strategyWorkspace;
   $("#strategy-roster").hidden = !strategyWorkspace;
   $("#strategy-detail").hidden = !strategyWorkspace;
+}
+
+function renderDeskObserver() {
+  const target = $("#desk-observer");
+  if (!target || ["portfolio", "logs"].includes(activeView)) return;
+  const research = state.research ?? {}, cohort = research.latest_cohort ?? {};
+  const visible = strategiesForView(), selected = getSelected();
+  const card = (label, value, detail) => `<div class="desk-observer-card"><span>${escapeHtml(label)}</span><strong>${escapeHtml(value)}</strong><small title="${escapeHtml(detail)}">${escapeHtml(detail)}</small></div>`;
+  if (activeView === "overview") {
+    target.innerHTML = [
+      card("LATEST COHORT", cohort.status ? String(cohort.status).toUpperCase() : "NONE", cohort.cohort_id || "No cohort completed"),
+      card("EVOLUTION TRIALS", String(research.total_trials ?? 0), `${cohort.valid ?? 0} valid · ${cohort.duplicates ?? 0} duplicate in latest cohort`),
+      card("EXPENSIVE DISPATCHES", String(research.total_expensive_dispatches ?? 0), `${research.budget?.expensive_dispatches ?? 0} in current session budget`),
+      card("DIVERSE POPULATION", String(research.population_size ?? 0), `${research.novelty_archive_size ?? 0} immutable DNA hashes archived`),
+      card("FINALISTS", String(cohort.finalists ?? 0), `${cohort.attempted ?? 0} attempted · typed DSL only for new strategies`),
+    ].join("");
+    return;
+  }
+  if (activeView === "testing") {
+    const validation = visible.filter((item) => item.state === "validation").length;
+    const rejected = state.strategies.filter((item) => ["development_reject", "holdout_reject", "inconclusive"].includes(item.state)).length;
+    const backtrader = visible.filter((item) => item.engine_family === "backtrader").length;
+    const folds = selected?.backtest_runs?.development?.folds?.length ?? (selected?.backtests ? Math.min(selected.backtests, 3) : 0);
+    target.innerHTML = [
+      card("EVIDENCE TYPE", selected ? "EXACT HISTORICAL" : "DEVELOPMENT QUEUE", "Next-bar-open fills; vector screening is not counted here"),
+      card("ROLLING FOLDS", String(folds || "—"), selected ? `${selected.id} development provenance` : "Three rolling development folds per finalist"),
+      card("ENGINE ASSIGNMENT", `${backtrader}/${visible.length}`, "Backtrader assignments; one engine family per release decision"),
+      card("SEALED VALIDATION", String(validation), `${research.holdout?.pending ?? 0} one-use authorizations pending · no raw bars exposed`),
+      card("TERMINAL REJECTIONS", String(rejected), "Quality gates only; infrastructure failures remain retryable"),
+    ].join("");
+    return;
+  }
+  const incubating = visible.filter((item) => item.state === "incubation").length;
+  const paper = visible.filter((item) => ["released", "healthy", "watch", "quarantined"].includes(item.state)).length;
+  const watch = visible.filter((item) => item.state === "watch").length;
+  const blocked = visible.filter((item) => item.operational_status === "operational_blocked" || item.state === "release_blocked_short").length;
+  target.innerHTML = [
+    card("LIVE SHADOW", String(incubating), "Future 5-minute evidence; no candidate orders reach Alpaca"),
+    card("RELEASED PAPER", String(paper), "Paper positions only; this does not represent real money"),
+    card("WATCH", String(watch), "Reduced risk overlay; frozen DNA is unchanged"),
+    card("OPERATIONAL BLOCKS", String(blocked), "Service faults block risk without becoming alpha evidence"),
+    card("PORTFOLIO OVERLAY", pct(state.portfolio_health?.gross_before_netting && state.alpaca?.account?.equity ? state.portfolio_health.gross_before_netting / state.alpaca.account.equity : 0, 2), "Gross before netting; 10% portfolio cap"),
+  ].join("");
+}
+
+function renderOperations() {
+  const grid = $("#operations-grid");
+  const attention = $("#operations-attention");
+  if (!grid || !attention) return;
+  if (!operationsState) {
+    $("#ops-mode").textContent = "UNAVAILABLE";
+    $("#ops-mode").className = "status-badge operational_blocked";
+    $("#ops-generated-at").textContent = operationsError || "Operator read model is unavailable";
+    grid.innerHTML = '<div class="operations-card"><span>CONTROL PLANE</span><strong class="bad">NO READ MODEL</strong><small>Safety commands remain available. No operational status is inferred.</small></div>';
+    attention.innerHTML = '<span class="attention-chip critical">operator view unavailable</span>';
+    return;
+  }
+  const ops = operationsState;
+  const blocked = !ops.mode.new_risk_possible;
+  $("#ops-mode").textContent = String(ops.mode.code).replaceAll("_", " ").toUpperCase();
+  $("#ops-mode").className = `status-badge ${blocked ? "watch" : "healthy"}`;
+  $("#ops-generated-at").textContent = `As of ${localTime(ops.generated_at)} · ${ops.timezone}`;
+  const dailyUsed = ops.risk.daily_loss_limit > 0 ? ops.risk.daily_loss_fraction / ops.risk.daily_loss_limit : 0;
+  const grossUsed = ops.risk.portfolio_gross_limit > 0 ? ops.risk.portfolio_gross_fraction / ops.risk.portfolio_gross_limit : 0;
+  const queue = ops.services.queue, backtester = ops.services.backtester, broker = ops.services.broker;
+  const cost = ops.budget.estimated_monthly_usd == null ? "NOT ESTIMATED" : usd(ops.budget.estimated_monthly_usd);
+  grid.innerHTML = [
+    ["MARKET / NEXT", ops.market.session_status.toUpperCase(), `${ops.market.next_action.label} · ${ops.market.feed} (not SIP)`, ops.market.session_status === "open" ? "good" : ""],
+    ["ALPACA PAPER", ops.account.connected ? usd(ops.account.equity) : "DISCONNECTED", `${usd(ops.account.cash)} cash · ${usd(ops.account.buying_power)} buying power`, ops.account.connected ? "good" : "warn"],
+    ["DAILY LOSS", pct(ops.risk.daily_loss_fraction, 2), `${Math.round(dailyUsed * 100)}% of ${pct(ops.risk.daily_loss_limit, 2)} halt`, ops.risk.daily_loss_halted ? "bad" : dailyUsed >= .8 ? "warn" : "good"],
+    ["PORTFOLIO GROSS", pct(ops.risk.portfolio_gross_fraction, 2), `${Math.round(grossUsed * 100)}% of ${pct(ops.risk.portfolio_gross_limit, 0)} cap · ${usd(ops.account.net_exposure_usd)} net`, grossUsed >= 1 ? "bad" : grossUsed >= .8 ? "warn" : "good"],
+    ["DATA / 40 SYMBOLS", `${ops.data.healthy_symbols}/${ops.data.expected_symbols} ${String(ops.data.status).toUpperCase()}`, `${pct(ops.data.coverage, 0)} coverage · ${ops.data.revision_events} revisions`, ops.data.status === "healthy" && ops.data.coverage >= .9 ? "good" : "warn"],
+    ["JOBS / COST", `${queue.research_pending} QUEUED · ${backtester.active_runs} RUNS`, `${queue.status} queue · ${broker.mode} broker · ${cost}/${usd(ops.budget.monthly_limit_usd)} limit`, cost === "NOT ESTIMATED" ? "warn" : ""],
+  ].map(([label, value, detail, tone]) => `<div class="operations-card"><span>${escapeHtml(label)}</span><strong class="${tone}">${escapeHtml(value)}</strong><small>${escapeHtml(detail)}</small></div>`).join("");
+  attention.innerHTML = ops.attention.length
+    ? ops.attention.slice(0, 12).map((item) => `<span class="attention-chip ${escapeHtml(item.severity)}" title="${escapeHtml(item.summary)}">${escapeHtml(item.code)}</span>`).join("")
+    : '<span class="attention-chip">No operator attention items</span>';
+  const controls = ops.controls ?? {};
+  setDockToggle("#ops-research-toggle", Boolean(controls.research_paused || ops.research.paused), "research");
+  setDockToggle("#ops-release-toggle", Boolean(controls.release_paused), "release");
+  setDockToggle("#ops-execution-toggle", Boolean(controls.execution_paused), "execution");
+}
+
+function setDockToggle(selector, paused, noun) {
+  const button = $(selector);
+  if (!button) return;
+  button.dataset.command = paused ? `resume_${noun}` : `pause_${noun}`;
+  button.textContent = `${paused ? "Resume" : "Pause"} ${noun}`;
 }
 
 function rollingSharpe(history) {
@@ -190,6 +285,13 @@ function rollingSharpe(history) {
     result.push({ timestamp: history[index].timestamp, value: deviation > 1e-9 ? average / deviation * Math.sqrt(252) : 0 });
   }
   return result;
+}
+
+function deterministicDisplaySeries(values, limit = 240) {
+  if (values.length <= limit) return values;
+  const sampled = [];
+  for (let index = 0; index < limit; index += 1) sampled.push(values[Math.round(index * (values.length - 1) / (limit - 1))]);
+  return sampled;
 }
 
 function renderAccountSeries(svgId, points, { formatAxis, emptyText }) {
@@ -318,7 +420,7 @@ function renderChart(strategy) {
   $("#market-chart-legend").hidden = true;
   $("#curve-legend-button").hidden = true;
   $("#curve-legend-button").setAttribute("aria-expanded", "false");
-  const values = strategy?.metrics?.curve || [1, 1, 1, 1];
+  const values = deterministicDisplaySeries(strategy?.metrics?.curve || [1, 1, 1, 1]);
   const width = 900, height = 255, left = 18, right = 64, top = 14, bottom = 30;
   const min = Math.min(...values, 0.96), max = Math.max(...values, 1.04);
   const spread = Math.max(max - min, 0.04);
@@ -349,13 +451,15 @@ function focusStrategy(strategyId) {
 function renderCombinedChart(strategies, chartTitle) {
   const svg = $("#equity-chart");
   const palette = ["#a8f05a", "#70a7ee", "#a28bdd", "#e9b655", "#ee736a", "#70d7c7", "#d99fe8", "#c7d36f"];
-  const curves = strategies.map((strategy, index) => ({
+  const renderedStrategies = strategies.slice(0, 120);
+  const curves = renderedStrategies.map((strategy, index) => ({
     strategy,
     color: palette[index % palette.length],
-    values: (strategy.metrics?.curve ?? []).map(Number).filter(Number.isFinite),
+    values: deterministicDisplaySeries((strategy.metrics?.curve ?? []).map(Number).filter(Number.isFinite)),
   })).filter((item) => item.values.length >= 2);
   $("#chart-title").textContent = chartTitle;
-  $("#chart-delta").textContent = `${curves.length} CURVE${curves.length === 1 ? "" : "S"}`;
+  $("#chart-delta").textContent = strategies.length > renderedStrategies.length
+    ? `${curves.length}/${strategies.length} CURVES DISPLAYED` : `${curves.length} CURVE${curves.length === 1 ? "" : "S"}`;
   const legend = $("#market-chart-legend");
   legend.hidden = curves.length === 0 || !curveLegendVisible;
   legend.innerHTML = curves.map(({ strategy, color }) => `<button type="button" data-strategy-id="${escapeHtml(strategy.id)}"><i style="background:${color}"></i><span>${escapeHtml(strategy.name)}</span><small>${escapeHtml(strategy.asset)}</small></button>`).join("");
@@ -397,7 +501,7 @@ function renderDeskOverview() {
   const desks = {
     overview: { name: "Foundry strategy book", empty: "No strategies in the foundry", chart: "ALL FOUNDRY EQUITY CURVES", noun: "research strategy" },
     testing: { name: "Testing strategy queue", empty: "No strategies in testing", chart: "ALL TEST EQUITY CURVES", noun: "testing strategy" },
-    released: { name: "Released strategy book", empty: "No released strategies", chart: "ALL RELEASED EQUITY CURVES", noun: "released strategy" },
+    released: { name: "Paper market strategy book", empty: "No paper-released strategies", chart: "ALL PAPER-MARKET EQUITY CURVES", noun: "paper-released strategy" },
   };
   const desk = desks[activeView] || desks.overview;
   const metrics = strategies.map((strategy) => strategy.metrics).filter(Boolean);
@@ -431,6 +535,50 @@ function renderDeskOverview() {
   contextStrip.innerHTML = "";
   $("#dna-content").innerHTML = `<div class="empty-state">Select a ${desk.noun} to inspect its DNA and lineage.</div>`;
   $("#regime-content").innerHTML = `<div class="empty-state">Select a ${desk.noun} to inspect its regime fitness.</div>`;
+  renderEvidence(null);
+}
+
+async function operatorRequest(path, { body = null, token = adminToken, allowAuthRetry = true } = {}) {
+  const headers = body ? { "Content-Type": "application/json" } : {};
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(path, { method: body ? "POST" : "GET", headers, body: body ? JSON.stringify(body) : null });
+  const result = await response.json().catch(() => ({ error: "Invalid service response" }));
+  if (response.status === 401 && allowAuthRetry) {
+    const supplied = window.prompt("Enter the Cloudflare ADMIN_TOKEN for this deployment:");
+    if (!supplied) throw new Error("Admin token required");
+    adminToken = supplied.trim();
+    sessionStorage.setItem("axiom-admin-token", adminToken);
+    return operatorRequest(path, { body, token: adminToken, allowAuthRetry: false });
+  }
+  if (!response.ok) throw new Error(result.error || "Operator request failed");
+  return result;
+}
+
+async function loadOperations() {
+  try {
+    operationsState = await operatorRequest("/api/v1/operations");
+    operationsError = null;
+  } catch (error) {
+    operationsState = null;
+    operationsError = error.message;
+  }
+  renderOperations();
+}
+
+async function loadOperatorLogs({ append = false } = {}) {
+  const category = $("#log-category")?.value ?? operatorLogsState.category;
+  const params = new URLSearchParams({ limit: "50" });
+  if (category) params.set("category", category);
+  if (append && operatorLogsState.next_cursor) params.set("cursor", operatorLogsState.next_cursor);
+  try {
+    const page = await operatorRequest(`/api/v1/logs?${params}`);
+    operatorLogsState = { items: append ? [...operatorLogsState.items, ...page.items] : page.items,
+      next_cursor: page.next_cursor, total: page.total, category };
+  } catch (error) {
+    if (!append) operatorLogsState = { items: [], next_cursor: null, total: 0, category };
+    showToast(error.message, true);
+  }
+  renderAudit();
 }
 
 function renderSelected() {
@@ -458,6 +606,7 @@ function renderSelected() {
     contextStrip.innerHTML = "";
     $("#dna-content").innerHTML = '<div class="empty-state">No strategy DNA yet.</div>';
     $("#regime-content").innerHTML = '<div class="empty-state">No regime evidence yet.</div>';
+    renderEvidence(null);
     return;
   }
   const metrics = strategy.metrics;
@@ -488,6 +637,75 @@ function renderSelected() {
   renderStrategyContext(strategy);
   renderDNA(strategy);
   renderRegimes(strategy);
+  renderEvidence(evidenceCache.get(strategy.id) ?? { strategy_id: strategy.id, loading: true });
+  loadStrategyEvidence(strategy.id);
+}
+
+async function loadStrategyEvidence(strategyId) {
+  if (evidenceCache.has(strategyId) || evidencePending.has(strategyId)) return;
+  evidencePending.add(strategyId);
+  try {
+    const evidence = await operatorRequest(`/api/v1/strategies/${encodeURIComponent(strategyId)}/evidence`);
+    evidenceCache.set(strategyId, evidence);
+    if (selectedId === strategyId) renderEvidence(evidence);
+  } catch (error) {
+    evidenceCache.set(strategyId, { strategy_id: strategyId, error: error.message });
+    if (selectedId === strategyId) renderEvidence(evidenceCache.get(strategyId));
+  } finally { evidencePending.delete(strategyId); }
+}
+
+function artifactLink(id, label) {
+  return id ? `<button type="button" data-artifact-id="${escapeHtml(id)}">${escapeHtml(label)}</button>` : "";
+}
+
+async function downloadPrivateArtifact(id, button) {
+  button.disabled = true;
+  try {
+    const artifact = await operatorRequest(`/api/v1/artifacts/${encodeURIComponent(id)}/download`);
+    const url = URL.createObjectURL(new Blob([JSON.stringify(artifact, null, 2)], { type: "application/json" }));
+    const link = document.createElement("a");
+    link.href = url; link.download = `${id.replace(/[^A-Za-z0-9._-]/g, "_")}.json`; link.click();
+    URL.revokeObjectURL(url);
+  } catch (error) { showToast(error.message, true); }
+  finally { button.disabled = false; }
+}
+
+function renderEvidence(evidence) {
+  const context = $("#evidence-context"), content = $("#evidence-content");
+  if (!context || !content) return;
+  if (!evidence) {
+    context.textContent = "NO STRATEGY";
+    content.innerHTML = '<div class="empty-state">Select a strategy to inspect its evidence and provenance.</div>';
+    return;
+  }
+  if (evidence.loading) {
+    context.textContent = "LOADING";
+    content.innerHTML = '<div class="empty-state">Loading the private evidence chain…</div>';
+    return;
+  }
+  if (evidence.error) {
+    context.textContent = "UNAVAILABLE";
+    content.innerHTML = `<div class="empty-state">Evidence could not be loaded: ${escapeHtml(evidence.error)}</div>`;
+    return;
+  }
+  const labels = {
+    hypothetical_vector_screen: ["HYPOTHETICAL VECTOR SCREEN", "Cheap evolutionary screening only; this is not an exact historical backtest."],
+    exact_historical_backtest: ["EXACT HISTORICAL BACKTEST", "Development folds use the assigned engine and next-bar-open execution."],
+    sealed_validation_pending: ["SEALED VALIDATION", "The untouched holdout is isolated and has not been revealed to research."],
+    live_shadow: ["LIVE SHADOW", "Future five-minute bars are observed without candidate orders reaching Alpaca."],
+    alpaca_paper_monitoring: ["ALPACA PAPER", "Released means paper-released. No real-money execution is represented."],
+  };
+  const [contextLabel, contextDetail] = labels[evidence.evidence_context] ?? [String(evidence.evidence_context).toUpperCase(), "Evidence context reported by the control plane."];
+  context.textContent = contextLabel;
+  const dev = evidence.provenance?.development, validation = evidence.provenance?.validation;
+  const supervisor = evidence.decisions?.supervisor, validationDecision = evidence.decisions?.validation;
+  const laterDecision = evidence.decisions?.health ?? evidence.decisions?.incubation;
+  content.innerHTML = `<div class="evidence-column"><span>CURRENT CONTEXT</span><strong>${escapeHtml(contextLabel)}</strong><small>${escapeHtml(contextDetail)}</small></div>
+    <div class="evidence-column"><span>PROVENANCE</span><strong>${escapeHtml(evidence.provenance?.engine_family || "UNASSIGNED ENGINE")}</strong><small>DNA ${escapeHtml(evidence.provenance?.dna_hash || "not frozen")}<br>Development ${escapeHtml(dev?.result_hash || "not completed")}<br>Validation ${escapeHtml(validation?.access_status || "not consumed")} · raw bars never exposed</small><div class="evidence-links">${artifactLink(dev?.artifact_id, "Development artifact")}${artifactLink(validation?.artifact_id, "Validation artifact")}</div></div>
+    <div class="evidence-column"><span>GATE DECISIONS</span><strong>${escapeHtml(supervisor?.outcome || "SUPERVISOR PENDING")}</strong><small>${escapeHtml((supervisor?.reasons || []).join(", ") || "No supervisor reason recorded")}<br>${escapeHtml(validationDecision?.outcome || "Validation pending")}<br>${escapeHtml(laterDecision?.outcome || "Future-market evidence pending")}</small></div>
+    <div class="evidence-column"><span>OPERATOR ACTIONS</span><strong>${evidence.release_label === "released_paper" ? "RELEASED PAPER" : escapeHtml(evidence.state.toUpperCase())}</strong><small>Commands are idempotent, auditable and never reinterpret infrastructure failure as strategy quality.</small><div class="evidence-links"><button class="dock-button" data-strategy-command="retry_operational" data-strategy-id="${escapeHtml(evidence.strategy_id)}">Retry fault</button><button class="dock-button warning" data-strategy-command="quarantine_strategy" data-strategy-id="${escapeHtml(evidence.strategy_id)}">Quarantine</button><button class="dock-button danger" data-strategy-command="retire_strategy" data-strategy-id="${escapeHtml(evidence.strategy_id)}">Retire</button></div></div>`;
+  $$('[data-strategy-command]').forEach((button) => button.addEventListener("click", () => runOperatorCommand(button.dataset.strategyCommand, { strategy_id: button.dataset.strategyId, button })));
+  $$('[data-artifact-id]').forEach((button) => button.addEventListener("click", () => downloadPrivateArtifact(button.dataset.artifactId, button)));
 }
 
 function labelParam(key) {
@@ -779,9 +997,13 @@ function renderRegimes(strategy) {
 }
 
 function renderAudit() {
-  $("#log-count").textContent = String(state.events.length);
-  $("#audit-feed").innerHTML = state.events.length
-    ? state.events.map((event) => `<article class="audit-item"><span class="audit-time">${escapeHtml(event.time)}</span><div class="audit-copy"><strong><i class="event-dot ${escapeHtml(event.kind)}"></i>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.detail)}</p></div></article>`).join("")
+  const fallback = (state?.events ?? []).map((event, index) => ({ id: event.id ?? `legacy-${index}`, at: event.at, time: event.time,
+    category: String(event.kind ?? "system").toLowerCase(), severity: "info", title: event.title, detail: event.detail }));
+  const events = operatorLogsState.items.length || operatorLogsState.category ? operatorLogsState.items : fallback;
+  $("#log-count").textContent = operatorLogsState.total ? `${events.length}/${operatorLogsState.total}` : String(events.length);
+  $("#load-more-logs").hidden = !operatorLogsState.next_cursor;
+  $("#audit-feed").innerHTML = events.length
+    ? events.map((event) => `<article class="audit-item"><span class="audit-time">${escapeHtml(event.at ? localTime(event.at) : event.time || "—")}</span><div class="audit-copy"><strong><i class="event-dot ${escapeHtml(String(event.category).toUpperCase())}"></i>${escapeHtml(event.title)}</strong><p>${escapeHtml(event.detail)}${event.correlation_id ? `<br>CORRELATION ${escapeHtml(event.correlation_id)}` : ""}${event.strategy_id ? ` · STRATEGY ${escapeHtml(event.strategy_id)}` : ""}</p></div></article>`).join("")
     : '<div class="empty-state">No supervisor decisions yet.</div>';
 }
 
@@ -812,7 +1034,7 @@ function renderStrategyFilters() {
 
 function renderTable() {
   const strategies = filteredStrategies();
-  const titles = { overview: "All research units", testing: "Generation & rework queue", released: "Released market book" };
+  const titles = { overview: "All research units", testing: "Generation & rework queue", released: "Alpaca paper market book" };
   $("#roster-title").textContent = titles[activeView] || titles.overview;
   renderStrategyFilters();
   const scored = strategies.map((strategy) => strategy.metrics?.score).filter(Number.isFinite);
@@ -846,7 +1068,9 @@ function render() {
   ensureSelection();
   renderView();
   renderSummary();
+  renderDeskObserver();
   renderPortfolio();
+  renderOperations();
   renderSelected();
   renderAudit();
   renderTable();
@@ -926,6 +1150,45 @@ function resetOperationCurveChart(kind, candidateCount) {
   chart.innerHTML = `${grid}<line class="operation-curve-baseline" x1="12" y1="106" x2="350" y2="106"/>
     <text class="operation-curve-wait" x="181" y="111" text-anchor="middle">AWAITING BACKTEST OUTPUT</text>`;
   caption.textContent = `0 / ${candidateCount} ACTUAL CURVES`;
+}
+
+function idempotencyKey(kind) {
+  const suffix = globalThis.crypto?.randomUUID?.() ?? `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return `ui:${kind}:${suffix}`;
+}
+
+async function runOperatorCommand(kind, { strategy_id = null, payload = {}, button = null, token = adminToken, skipConfirm = false } = {}) {
+  const confirmations = {
+    cancel_open_orders: "Cancel all open orders managed by Axiom? Manual orders are excluded.",
+    flatten_all: "Flatten every Axiom-managed paper position?",
+    kill_switch: "Activate the kill switch, cancel managed orders, and flatten managed paper positions?",
+    quarantine_strategy: "Quarantine this strategy and block new risk?",
+    retire_strategy: "Retire this strategy? This lifecycle action is not an infrastructure retry.",
+  };
+  if (!skipConfirm && confirmations[kind] && !window.confirm(confirmations[kind])) return null;
+  const key = idempotencyKey(kind), receipt = $("#command-receipt");
+  if (button) { button.disabled = true; button.setAttribute("aria-busy", "true"); }
+  receipt.textContent = `${kind} · submitting`;
+  try {
+    let result = await operatorRequest("/api/v1/admin/commands", { body: { kind, strategy_id, payload,
+      idempotency_key: key, correlation_id: key }, token });
+    receipt.textContent = `${result.command_id} · ${result.status}`;
+    showToast(`Command ${result.command_id}: ${result.status}.`);
+    for (let attempt = 0; result.terminal === false && attempt < 12; attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+      result = await operatorRequest(`/api/v1/commands/${encodeURIComponent(result.command_id)}`, { token });
+      receipt.textContent = `${result.command_id} · ${result.status}`;
+    }
+    if (result.terminal === false) showToast(`${result.command_id} is still queued; its receipt remains available.`, true);
+    await Promise.allSettled([api("/api/state", null, false), loadOperations(), loadOperatorLogs()]);
+    return result;
+  } catch (error) {
+    receipt.textContent = `${kind} · failed`;
+    showToast(error.message, true);
+    throw error;
+  } finally {
+    if (button) { button.disabled = false; button.removeAttribute("aria-busy"); }
+  }
 }
 
 function landscapeParameterKeys(strategy) {
@@ -1331,7 +1594,56 @@ $("#reproduce-button").addEventListener("click", async () => {
     showToast(`Child DNA created from ${parent.id}.`);
   } catch (_) { /* handled */ }
 });
-$("#reset-button").addEventListener("click", () => action("/api/reset", {}, "Strategy workspace cleared."));
+$$('#safety-dock [data-command]').forEach((button) => button.addEventListener("click", () =>
+  runOperatorCommand(button.dataset.command, { button }).catch(() => {})));
+$("#ops-approval-button").addEventListener("click", () => {
+  const kind = window.prompt("Approval type: configuration, universe, or policy", "configuration")?.trim().toLowerCase();
+  const commands = { configuration: "approve_configuration", universe: "approve_universe", policy: "approve_policy" };
+  if (!commands[kind]) { if (kind) showToast("Approval type must be configuration, universe, or policy.", true); return; }
+  const subjectHash = window.prompt(`Paste the exact SHA-256 hash to approve for ${kind}:`)?.trim().toLowerCase();
+  if (!/^[a-f0-9]{64}$/.test(subjectHash || "")) { showToast("Approval requires an exact 64-character SHA-256 hash.", true); return; }
+  if (!window.confirm(`Approve ${kind} hash ${subjectHash}?`)) return;
+  runOperatorCommand(commands[kind], { button: $("#ops-approval-button"), skipConfirm: true,
+    payload: { subject_hash: subjectHash } }).catch(() => {});
+});
+$("#log-category").addEventListener("change", () => loadOperatorLogs());
+$("#load-more-logs").addEventListener("click", () => loadOperatorLogs({ append: true }));
+
+$("#reset-button").addEventListener("click", () => {
+  resetManifest = null;
+  $("#reset-form").reset();
+  $("#reset-manifest").textContent = "Prepare a manifest before execution.";
+  $("#execute-reset-button").disabled = true;
+  $("#reset-dialog").showModal();
+});
+$("#prepare-reset-button").addEventListener("click", async () => {
+  const token = $("#reset-admin-token").value.trim();
+  if (!token) { showToast("Re-enter the admin token first.", true); return; }
+  const button = $("#prepare-reset-button");
+  try {
+    const result = await runOperatorCommand("prepare_workspace_reset", { token, button, skipConfirm: true });
+    resetManifest = result?.reset_manifest ?? null;
+    if (!resetManifest) throw new Error("The server did not return a reset manifest summary");
+    const counts = resetManifest.counts ?? {};
+    $("#reset-manifest").textContent = `MANIFEST ${resetManifest.manifest_hash} · ${counts.d1 ?? "?"} D1 targets · ${counts.r2 ?? "?"} R2 targets · ${counts.durable_object ?? "?"} Durable Object keys · prepared ${localTime(resetManifest.prepared_at)}`;
+    $("#execute-reset-button").disabled = false;
+  } catch (_) { resetManifest = null; $("#execute-reset-button").disabled = true; }
+});
+$("#execute-reset-button").addEventListener("click", async () => {
+  const token = $("#reset-admin-token").value.trim();
+  const confirmation = $("#reset-confirmation").value;
+  if (!resetManifest || confirmation !== "RESET NONPRODUCTION WORKSPACE") {
+    showToast("Prepare the manifest and type the exact confirmation phrase.", true); return;
+  }
+  if (!window.confirm("Execute this exact reset manifest now? This cannot be undone.")) return;
+  try {
+    await runOperatorCommand("execute_workspace_reset", { token, button: $("#execute-reset-button"), skipConfirm: true,
+      payload: { manifest_hash: resetManifest.manifest_hash, confirmation } });
+    $("#reset-dialog").close();
+    evidenceCache.clear();
+    showToast("Nonproduction workspace reset completed.");
+  } catch (_) { /* command helper surfaced the failure */ }
+});
 
 $$(".rail-button").forEach((button) => button.addEventListener("click", () => {
   activeView = button.dataset.view;
@@ -1345,4 +1657,7 @@ $$(".rail-button").forEach((button) => button.addEventListener("click", () => {
   render();
 }));
 
-api("/api/state").catch(() => {});
+api("/api/state").then(() => Promise.allSettled([loadOperations(), loadOperatorLogs()])).catch(() => {
+  operationsError = "Application state could not be loaded";
+  renderOperations();
+});

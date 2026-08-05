@@ -17,7 +17,7 @@ export const ROUTINE_COMMANDS = Object.freeze([
 export const OPERATOR_COMMANDS = Object.freeze([
   "global_pause", "global_resume", "kill_switch", "clear_kill_switch", "flatten_all",
   "pause_research", "resume_research", "pause_ingestion", "resume_ingestion", "pause_release", "resume_release",
-  "pause_execution", "resume_execution", "retry_operational", "quarantine_strategy", "retire_strategy",
+  "pause_execution", "resume_execution", "cancel_open_orders", "retry_operational", "quarantine_strategy", "retire_strategy",
   "pause_strategy", "resume_strategy",
   "reset_daily_loss_halt", "run_broker_canary",
   "reset_nonproduction_workspace",
@@ -46,6 +46,7 @@ export function emptyOrchestrationState(mode = "observe") {
     completed_intent_ids: [], command_results: {}, latest_command_id: null, latest_watchdog_at: null,
     active_session_date: null,
     valid_day_ledgers: {}, approvals: {}, incidents: [],
+    operator_idempotency: {},
   };
 }
 
@@ -59,7 +60,23 @@ export function ensureOrchestrationState(state, mode = "observe") {
   current.completed_intent_ids ??= []; current.command_results ??= {}; current.valid_day_ledgers ??= {};
   current.active_session_date ??= null;
   current.approvals ??= {}; current.incidents ??= [];
+  current.operator_idempotency ??= {};
   return current;
+}
+
+export function claimOperatorIdempotency(state, key, commandId) {
+  const current = ensureOrchestrationState(state, state?.orchestration?.mode);
+  const normalized = String(key ?? ""), id = String(commandId ?? "");
+  if (!/^[A-Za-z0-9._:-]{8,160}$/.test(normalized) || !/^ORC-[a-f0-9]{32}$/.test(id)) {
+    throw new TypeError("Invalid operator idempotency claim");
+  }
+  const prior = current.operator_idempotency[normalized];
+  if (prior && prior !== id) throw new TypeError("Idempotency key was already used for a different command payload");
+  if (!prior) {
+    current.operator_idempotency[normalized] = id;
+    current.operator_idempotency = Object.fromEntries(Object.entries(current.operator_idempotency).slice(-512));
+  }
+  return { command_id: id, duplicate: Boolean(prior) };
 }
 
 export function orchestrationCommandId(command) {
@@ -144,6 +161,7 @@ function operatorActions(current, command) {
       return result(command, "applied", [{ kind: "broker.cancel_unsafe_orders", payload }, { kind: "broker.flatten_all", payload }]);
     case "clear_kill_switch": controls.kill_switch = false; return result(command, "applied");
     case "flatten_all": controls.flatten_requested = true; return result(command, "applied", [{ kind: "broker.flatten_all", payload }]);
+    case "cancel_open_orders": return result(command, "applied", [{ kind: "broker.cancel_unsafe_orders", payload }]);
     case "pause_research": controls.research_paused = true; return result(command, "applied");
     case "resume_research": controls.research_paused = false; return result(command, "applied");
     case "pause_ingestion": controls.ingestion_paused = true; return result(command, "applied");

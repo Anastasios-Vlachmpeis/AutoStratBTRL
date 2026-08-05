@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyOrchestrationCommand, createOrchestrationCommand, emptyOrchestrationState, ensureOrchestrationState, executeOrchestrationActionBatch, executionAllowed, orchestrationCommandDisposition, orchestrationMode, pipelineFollowups, publicOrchestrationState } from "./orchestration.js";
+import { applyOrchestrationCommand, claimOperatorIdempotency, createOrchestrationCommand, emptyOrchestrationState, ensureOrchestrationState, executeOrchestrationActionBatch, executionAllowed, orchestrationCommandDisposition, orchestrationMode, pipelineFollowups, publicOrchestrationState } from "./orchestration.js";
 
 const at = "2026-08-05T12:00:00.000Z";
 const command = (kind, values = {}) => createOrchestrationCommand({ kind, timestamp: at,
@@ -14,6 +14,16 @@ test("duplicate commands return the prior result without advancing state", () =>
   assert.deepEqual(second.result, first.result);
 });
 
+test("operator idempotency keys replay one exact command and reject payload conflicts", () => {
+  const state = { orchestration: emptyOrchestrationState() };
+  const first = command("pause_research", { actor: "operator:admin", correlation_id: "ui:pause:12345678" });
+  const duplicate = claimOperatorIdempotency(state, "ui:pause:12345678", first.command_id);
+  assert.equal(duplicate.duplicate, false);
+  assert.equal(claimOperatorIdempotency(state, "ui:pause:12345678", first.command_id).duplicate, true);
+  const conflict = command("resume_research", { actor: "operator:admin", correlation_id: "ui:pause:12345678" });
+  assert.throws(() => claimOperatorIdempotency(state, "ui:pause:12345678", conflict.command_id), /different command payload/);
+});
+
 test("kill switch blocks new target intents even when an old message arrives later", () => {
   const killed = applyOrchestrationCommand(emptyOrchestrationState(), command("kill_switch", { actor: "operator:admin" }));
   assert.equal(killed.state.controls.flatten_requested, true);
@@ -22,6 +32,14 @@ test("kill switch blocks new target intents even when an old message arrives lat
   const blocked = applyOrchestrationCommand(killed.state, stale);
   assert.equal(executionAllowed({ orchestration: blocked.state }), false); assert.equal(blocked.result.status, "blocked");
   assert.equal(blocked.result.reason, "kill_switch"); assert.deepEqual(blocked.result.actions, []);
+});
+
+test("operator can cancel only framework-managed open orders without enabling execution", () => {
+  const cancelled = applyOrchestrationCommand(emptyOrchestrationState(), command("cancel_open_orders", {
+    actor: "operator:admin", correlation_id: "cancel:test",
+  }));
+  assert.equal(cancelled.result.actions[0].kind, "broker.cancel_unsafe_orders");
+  assert.equal(cancelled.state.controls.execution_paused, false);
 });
 
 test("entry cutoff keeps released reconciliation reduce-only while pausing incubation", () => {
