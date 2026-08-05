@@ -95,8 +95,10 @@ const clusterBySymbol = Object.freeze(Object.fromEntries(Object.entries(INITIAL_
 function strategyMultiplier(strategy) {
   const state = String(strategy?.state ?? "");
   if (["dropped", "retired", "quarantined", "operator_paused"].includes(state)) return 0;
-  const health = state === "watch" ? .5 : 1;
-  return clamp(finite(strategy?.risk_multiplier, 1), 0, 1) * health;
+  if (strategy?.operational_status === "operational_blocked") return 0;
+  const health = finite(strategy?.risk_overlay?.health_multiplier, state === "watch" ? .5 : 1);
+  const portfolio = finite(strategy?.risk_overlay?.portfolio_multiplier, 1);
+  return clamp(finite(strategy?.risk_multiplier, 1), 0, 1) * clamp(health, 0, 1) * clamp(portfolio, 0, 1);
 }
 
 function scaleContributions(contributions, selector, limit) {

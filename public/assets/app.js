@@ -17,8 +17,8 @@ const filterConfigs = {
     { id: "generated", label: "Generated", states: ["generated"] },
     { id: "rework", label: "Rework", states: ["rework"] },
     { id: "validation", label: "Validation", states: ["validation", "capacity_wait"] },
-    { id: "market", label: "Market", states: ["incubation", "release_blocked_short", "released", "healthy", "watch", "adjusted"] },
-    { id: "retired", label: "Retired", states: ["development_reject", "holdout_reject", "inconclusive", "incubation_reject", "dropped", "superseded"] },
+    { id: "market", label: "Market", states: ["incubation", "release_blocked_short", "released", "healthy", "watch", "quarantined"] },
+    { id: "retired", label: "Retired", states: ["development_reject", "holdout_reject", "inconclusive", "incubation_reject", "retired", "dropped", "superseded"] },
   ],
   testing: [
     { id: "all", label: "All" },
@@ -33,14 +33,16 @@ const filterConfigs = {
     { id: "released", label: "New", states: ["released"] },
     { id: "healthy", label: "Healthy", states: ["healthy"] },
     { id: "watch", label: "Watch", states: ["watch"] },
-    { id: "adjusted", label: "Adjusted", states: ["adjusted"] },
+    { id: "quarantined", label: "Quarantined", states: ["quarantined"] },
+    { id: "operational", label: "Operational block", operational: "operational_blocked" },
   ],
 };
 
 const statusLabels = {
   generated: "Generated", rework: "Rework", validation: "Validation", capacity_wait: "Capacity wait",
   development_reject: "Development reject", incubation: "Incubation", release_blocked_short: "Short release blocked", holdout_reject: "Holdout reject",
-  inconclusive: "Inconclusive", incubation_reject: "Incubation reject", released: "Released", healthy: "Healthy", watch: "Watch", adjusted: "Adjusted",
+  inconclusive: "Inconclusive", incubation_reject: "Incubation reject", released: "Released", healthy: "Healthy", watch: "Watch",
+  quarantined: "Quarantined", retired: "Retired", operational_blocked: "Operational block",
   dropped: "Dropped", superseded: "Superseded"
 };
 
@@ -101,7 +103,7 @@ async function api(path, body = null, allowAuthRetry = true) {
 function strategiesForView(view = activeView) {
   if (!state) return [];
   if (view === "testing") return state.strategies.filter((item) => ["generated", "rework", "validation", "capacity_wait"].includes(item.state));
-  if (view === "released") return state.strategies.filter((item) => ["incubation", "release_blocked_short", "released", "healthy", "watch", "adjusted"].includes(item.state));
+  if (view === "released") return state.strategies.filter((item) => ["incubation", "release_blocked_short", "released", "healthy", "watch", "quarantined"].includes(item.state));
   return state.strategies;
 }
 
@@ -110,6 +112,7 @@ function filteredStrategies() {
   const config = filterConfigs[activeView];
   if (!config) return strategies;
   const selectedFilter = config.find((filter) => filter.id === activeFilters[activeView]) || config[0];
+  if (selectedFilter.operational) return strategies.filter((strategy) => strategy.operational_status === selectedFilter.operational);
   return selectedFilter.states ? strategies.filter((strategy) => selectedFilter.states.includes(strategy.state)) : strategies;
 }
 
@@ -132,7 +135,7 @@ function ensureSelection() {
     return;
   }
   if (!state.strategies.some((item) => item.id === selectedId)) {
-    const best = state.strategies.find((item) => ["healthy", "released", "watch", "adjusted", "incubation", "release_blocked_short"].includes(item.state));
+    const best = state.strategies.find((item) => ["healthy", "released", "watch", "quarantined", "incubation", "release_blocked_short"].includes(item.state));
     selectedId = (best || state.strategies[0])?.id || null;
   }
   if (visible.length && !visible.some((item) => item.id === selectedId)) selectedId = visible[0].id;
@@ -466,10 +469,12 @@ function renderSelected() {
   const shadow = strategy.backtest_runs?.shadow || strategy.backtest_runs?.shadow_validation ? "<span>SHADOW COMPARED</span>" : "";
   $("#selected-meta").innerHTML = `<span>${escapeHtml(strategy.archetype)}</span><span>${escapeHtml(strategy.asset)}</span><span>GEN ${strategy.generation}</span><span>${escapeHtml(engineName + engineVersion)} ENGINE</span>${shadow}${attempt}`;
   const status = $("#selected-status");
-  status.textContent = statusLabels[strategy.state] || strategy.state;
-  status.className = `status-badge ${strategy.state}`;
+  const displayedState = strategy.operational_status === "operational_blocked"
+    ? "operational_blocked" : strategy.state;
+  status.textContent = statusLabels[displayedState] || displayedState;
+  status.className = `status-badge ${displayedState}`;
   $("#selected-id").textContent = strategy.id;
-  const allowed = ["released", "healthy", "watch", "adjusted"].includes(strategy.state);
+  const allowed = ["released", "healthy", "watch", "quarantined"].includes(strategy.state);
   $("#reproduce-button").disabled = !allowed;
   $("#show-all-curves-button").hidden = !multiStrategyViews.has(activeView);
   $("#metric-row").innerHTML = [
@@ -510,7 +515,7 @@ function renderStrategyContext(strategy) {
   const strip = $("#strategy-context-strip");
   const monitor = strategy.monitor ?? {};
   const rework = strategy.rework ?? {};
-  const activeMarketState = ["incubation", "release_blocked_short", "released", "healthy", "watch", "adjusted"].includes(strategy.state);
+  const activeMarketState = ["incubation", "release_blocked_short", "released", "healthy", "watch", "quarantined"].includes(strategy.state);
   const hasMarketHistory = activeMarketState
     || (monitor.returns?.length ?? 0) > 0
     || Number(monitor.adjustments ?? 0) > 0;
@@ -539,19 +544,39 @@ function renderStrategyContext(strategy) {
     return;
   }
 
+  if (strategy.operational_status === "operational_blocked") {
+    const findings = strategy.health?.decision?.findings ?? ["monitoring evidence unavailable"];
+    strip.className = "strategy-context-strip operational";
+    strip.innerHTML = `<span class="context-marker" aria-hidden="true">||</span>
+      <div class="context-copy"><span class="context-kicker">OPERATIONAL BLOCK</span><strong>New risk is paused; strategy quality is unchanged</strong><small>${escapeHtml(findings.map(labelParam).join(", "))}. A complete fault-free session is required before risk resumes.</small></div>
+      <div class="context-metrics"><div class="context-metric"><span>QUALITY</span><strong>${escapeHtml(statusLabels[strategy.state] || strategy.state)}</strong><small>PRESERVED</small></div><div class="context-metric"><span>RISK OVERLAY</span><strong>0%</strong><small>FAULT PAUSE</small></div></div>`;
+    strip.hidden = false;
+    return;
+  }
+
+  if (strategy.state === "quarantined") {
+    const findings = strategy.health?.decision?.findings ?? ["hard release-health breach"];
+    const summary = strategy.health?.summary ?? {};
+    strip.className = "strategy-context-strip quarantine";
+    strip.innerHTML = `<span class="context-marker" aria-hidden="true">Q</span>
+      <div class="context-copy"><span class="context-kicker">QUARANTINED</span><strong>No new risk; shadow observation continues</strong><small>${escapeHtml(findings.map(labelParam).join(", "))}. DNA remains frozen${strategy.health_challenger_id ? `; challenger ${escapeHtml(strategy.health_challenger_id)} must repeat every gate` : ""}.</small></div>
+      <div class="context-metrics"><div class="context-metric failed"><span>ROLLING DD</span><strong>${pct(summary.drawdown)}</strong><small>HEALTH WINDOW</small></div><div class="context-metric"><span>TRADES</span><strong>${Number(summary.trades ?? 0)}</strong><small>OBSERVED</small></div><div class="context-metric"><span>RISK OVERLAY</span><strong>0%</strong><small>FLATTEN</small></div></div>`;
+    strip.hidden = false;
+    return;
+  }
+
   if (strategy.state === "watch") {
+    const summary = strategy.health?.summary ?? {};
+    const reasons = strategy.health?.decision?.findings ?? ["persistent daily evidence is weak or uncertain"];
     const checks = [
-      { label: "ROLLING SHARPE", value: monitor.sharpe == null ? "PENDING" : number(monitor.sharpe), failed: monitor.sharpe != null && monitor.sharpe < .30, limit: "MIN 0.30" },
-      { label: "DRAWDOWN", value: monitor.drawdown == null ? "PENDING" : pct(monitor.drawdown), failed: monitor.drawdown != null && monitor.drawdown > .08, limit: "MAX 8.0%" },
-      { label: "EDGE RATIO", value: monitor.ratio == null ? "PENDING" : number(monitor.ratio), failed: monitor.ratio != null && monitor.ratio < .45, limit: "MIN 0.45" },
+      { label: "DAILY SHARPE", value: summary.daily_sharpe == null ? "PENDING" : number(summary.daily_sharpe), failed: reasons.some((item) => item.includes("sharpe")), limit: "DISTRIBUTION" },
+      { label: "DRAWDOWN", value: summary.drawdown == null ? "PENDING" : pct(summary.drawdown), failed: reasons.some((item) => item.includes("drawdown")), limit: "ROLLING" },
+      { label: "EXPECTANCY", value: summary.expectancy == null ? "PENDING" : signedPct(summary.expectancy), failed: reasons.some((item) => item.includes("expectancy")), limit: "TRADE WINDOW" },
+      { label: "RISK OVERLAY", value: pct(strategy.risk_overlay?.effective_multiplier ?? .5, 0), failed: false, limit: "NO DNA CHANGE" },
     ];
-    const reasons = checks.filter((check) => check.failed).map((check) => `${check.label.toLowerCase()} failed its ${check.limit.toLowerCase()} gate`);
-    const explanation = reasons.length
-      ? `${reasons.join("; ")}. A second weak monitor window will reduce position size automatically.`
-      : "The latest monitor window failed a live-performance gate. A second weak window will reduce position size automatically.";
     strip.className = "strategy-context-strip watch";
     strip.innerHTML = `<span class="context-marker" aria-hidden="true">!</span>
-      <div class="context-copy"><span class="context-kicker">MARKET WATCH</span><strong>Why ${escapeHtml(strategy.name)} is being watched</strong><small>${escapeHtml(explanation)}</small></div>
+      <div class="context-copy"><span class="context-kicker">MARKET WATCH</span><strong>Why ${escapeHtml(strategy.name)} is being watched</strong><small>${escapeHtml(reasons.map(labelParam).join(", "))}. Recovery requires sustained healthy daily evidence; DNA is unchanged.</small></div>
       <div class="context-metrics">${checks.map((check) => `<div class="context-metric ${check.failed ? "failed" : "passed"}"><span>${check.label}</span><strong>${check.value}</strong><small>${check.limit}</small></div>`).join("")}</div>`;
     strip.hidden = false;
     return;
@@ -796,13 +821,15 @@ function renderTable() {
   $("#empty-state").textContent = strategiesForView().length ? "No strategies match this filter." : "No strategies match this desk.";
   $("#strategy-table").innerHTML = strategies.map((strategy) => {
     const m = strategy.metrics;
+    const displayedState = strategy.operational_status === "operational_blocked"
+      ? "operational_blocked" : strategy.state;
     const incubationProgress = strategy.incubation
       ? `${Number(strategy.incubation.valid_trading_days ?? 0)}/10 days · ${Number(strategy.incubation.eligible_trades ?? 0)}/67 trades`
       : null;
     return `<tr data-id="${escapeHtml(strategy.id)}" class="${strategy.id === selectedId ? "selected" : ""}">
       <td class="unit-cell"><strong>${escapeHtml(strategy.name)}</strong><span>${escapeHtml(strategy.id)}${strategy.parent ? ` · CHILD OF ${escapeHtml(strategy.parent)}` : ""}${strategy.rework?.attempt ? ` · TRY ${strategy.rework.attempt}/${strategy.rework.max_attempts || 3}` : ""}</span></td>
       <td class="archetype-cell"><strong>${escapeHtml(strategy.archetype)}</strong><span>${escapeHtml(strategy.asset)}</span></td>
-      <td><span class="status-badge ${strategy.state}">${escapeHtml(statusLabels[strategy.state] || strategy.state)}</span></td>
+      <td><span class="status-badge ${displayedState}">${escapeHtml(statusLabels[displayedState] || displayedState)}</span></td>
       <td>${incubationProgress ?? (strategy.backtests ? `${Math.min(strategy.backtests, 3)} dev${strategy.validation ? " · 1 unseen" : ""}` : "not tested")}</td><td>${m ? number(m.sharpe) : "—"}</td><td>${m ? pct(m.drawdown) : "—"}</td>
       <td class="score-cell">${m ? number(m.score, 1) : "—"}${m ? `<div class="score-bar"><i style="width:${Math.min(m.score, 100)}%"></i></div>` : ""}</td><td class="row-arrow">›</td></tr>`;
   }).join("");

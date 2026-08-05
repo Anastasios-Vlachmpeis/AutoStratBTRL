@@ -5,8 +5,8 @@
 import { hashCanonical } from "./dsl.js";
 
 export const LIFECYCLE_SCHEMA_VERSION = 1;
-export const QUALITY_STATES = Object.freeze(["proposed", "compiled", "screened", "development", "supervisor_approved", "sealed_validation", "incubation", "released_paper", "watch", "quarantined", "retired", "structural_reject", "development_reject", "holdout_reject", "inconclusive", "superseded", "capacity_wait", "release_blocked_short", "operator_paused"]);
-export const OPERATIONAL_STATES = Object.freeze(["ready", "queued", "running", "retry_wait", "service_unavailable", "data_blocked", "broker_blocked", "dead_lettered"]);
+export const QUALITY_STATES = Object.freeze(["proposed", "compiled", "screened", "development", "supervisor_approved", "sealed_validation", "incubation", "released_paper", "healthy", "watch", "quarantined", "retired", "structural_reject", "development_reject", "holdout_reject", "inconclusive", "superseded", "capacity_wait", "release_blocked_short", "operator_paused"]);
+export const OPERATIONAL_STATES = Object.freeze(["ready", "queued", "running", "retry_wait", "service_unavailable", "data_blocked", "broker_blocked", "operational_blocked", "dead_lettered"]);
 
 const TERMINAL = new Set(["structural_reject", "development_reject", "holdout_reject", "inconclusive", "superseded", "retired"]);
 const ACTIVE = QUALITY_STATES.filter((state) => !TERMINAL.has(state) && !["operator_paused", "quarantined"].includes(state));
@@ -15,8 +15,9 @@ const direct = {
   screened: ["development", "structural_reject"], development: ["supervisor_approved", "development_reject"],
   supervisor_approved: ["sealed_validation", "capacity_wait"], capacity_wait: ["sealed_validation"],
   sealed_validation: ["incubation", "holdout_reject", "inconclusive"], incubation: ["released_paper", "release_blocked_short", "development", "development_reject"],
-  release_blocked_short: ["released_paper", "development_reject"], released_paper: ["watch"],
-  watch: ["quarantined", "retired"], quarantined: ["retired"], operator_paused: [],
+  release_blocked_short: ["released_paper", "development_reject"], released_paper: ["healthy", "watch", "quarantined"],
+  healthy: ["watch", "quarantined", "retired"], watch: ["healthy", "quarantined", "retired"],
+  quarantined: ["retired"], operator_paused: [],
 };
 /** Immutable, explicit quality transition table.  Pause/resume is expanded below. */
 export const QUALITY_TRANSITIONS = Object.freeze(Object.fromEntries(QUALITY_STATES.map((from) => {
@@ -30,11 +31,12 @@ export const QUALITY_TRANSITIONS = Object.freeze(Object.fromEntries(QUALITY_STAT
   return [from, Object.freeze([...targets].sort())];
 })));
 const operationalDirect = {
-  ready: ["queued", "data_blocked", "broker_blocked", "service_unavailable", "dead_lettered"],
-  queued: ["running", "retry_wait", "data_blocked", "broker_blocked", "service_unavailable", "dead_lettered"],
-  running: ["ready", "retry_wait", "data_blocked", "broker_blocked", "service_unavailable", "dead_lettered"],
-  retry_wait: ["queued", "dead_lettered"], service_unavailable: ["queued", "dead_lettered"],
-  data_blocked: ["queued", "dead_lettered"], broker_blocked: ["queued", "dead_lettered"],
+  ready: ["queued", "data_blocked", "broker_blocked", "service_unavailable", "operational_blocked", "dead_lettered"],
+  queued: ["running", "retry_wait", "data_blocked", "broker_blocked", "service_unavailable", "operational_blocked", "dead_lettered"],
+  running: ["ready", "retry_wait", "data_blocked", "broker_blocked", "service_unavailable", "operational_blocked", "dead_lettered"],
+  retry_wait: ["queued", "operational_blocked", "dead_lettered"], service_unavailable: ["queued", "operational_blocked", "dead_lettered"],
+  data_blocked: ["queued", "operational_blocked", "dead_lettered"], broker_blocked: ["queued", "operational_blocked", "dead_lettered"],
+  operational_blocked: ["ready", "queued", "dead_lettered"],
   dead_lettered: ["queued"],
 };
 export const OPERATIONAL_TRANSITIONS = Object.freeze(Object.fromEntries(OPERATIONAL_STATES.map((from) => [from,

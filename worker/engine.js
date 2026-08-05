@@ -4,6 +4,7 @@ import { buildStrategyDNA, evaluateLatestTarget, evaluateStrategyTargets, hashCa
 import { DSL_FAMILIES, buildGeneratedStrategyDNA } from "./dsl-generation.js";
 import { createEvaluationPolicy, evaluationPolicyHash } from "./evaluation-policy.js";
 import { publicIncubationState } from "./incubation.js";
+import { createHealthPolicy, publicHealthState } from "./monitoring.js";
 import { applyLifecycleCommand, initialLifecycle, transitionId } from "./lifecycle.js";
 import { emptyOrchestrationState, ensureOrchestrationState, publicOrchestrationState } from "./orchestration.js";
 import { emptyResearchState, ensureResearchState, publicResearchState } from "./research-contract.js";
@@ -11,7 +12,7 @@ import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
 
 export const REGIMES = ["Expansion", "Compression", "Stress", "Recovery"];
 export const ASSETS = [...INITIAL_UNIVERSE_SYMBOLS];
-export const CURRENT_SCHEMA_VERSION = 12;
+export const CURRENT_SCHEMA_VERSION = 13;
 
 const NAMES = [
   "Orion Pulse", "Kestrel Drift", "Helix Break", "Cobalt Revert",
@@ -19,14 +20,15 @@ const NAMES = [
   "Aster Signal", "Parallax Run", "Ion Cascade", "Morrow Wave",
 ];
 const ARCHETYPES = DSL_FAMILIES;
-const ACTIVE_STATES = new Set(["released", "healthy", "watch", "adjusted"]);
+const ACTIVE_STATES = new Set(["released", "healthy", "watch", "quarantined"]);
 const ZERO_HASH = "0".repeat(64);
 
 function lifecycleQuality(state) {
   return ({ generated: "screened", rework: "development", validation: "sealed_validation", capacity_wait: "capacity_wait",
     incubation: "incubation", release_blocked_short: "incubation",
-    released: "released_paper", healthy: "released_paper", adjusted: "released_paper",
-    watch: "watch", development_reject: "development_reject", holdout_reject: "holdout_reject",
+    released: "released_paper", healthy: "healthy", adjusted: "watch",
+    watch: "watch", quarantined: "quarantined", retired: "retired",
+    development_reject: "development_reject", holdout_reject: "holdout_reject",
     inconclusive: "inconclusive", incubation_reject: "development_reject",
     superseded: "superseded", dropped: "retired" })[state] ?? "proposed";
 }
@@ -438,6 +440,9 @@ function newStrategy(state, parent = null, mutateParent = true) {
     backtest_runs: {},
     rework: emptyRework(parent?.rework?.attempt ?? 0, parent?.rework?.history ?? []),
     monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
+    health: null,
+    risk_overlay: { health_multiplier: 1, portfolio_multiplier: 1,
+      effective_multiplier: 1, reason_codes: [], updated_at: null },
   };
   strategy.lifecycle = strategyLifecycle(strategy, { configurationHash: hashCanonical({ source: "generated-dsl", compiler: strategy.compiler }) });
   return strategy;
@@ -503,6 +508,9 @@ export function registerResearchFinalists(state, finalists, cohort) {
       backtest_runs: {},
       rework: emptyRework(),
       monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
+      health: null,
+      risk_overlay: { health_multiplier: 1, portfolio_multiplier: 1,
+        effective_multiplier: 1, reason_codes: [], updated_at: null },
     };
     strategy.lifecycle = strategyLifecycle(strategy, { datasetHash: cohort.contract?.dataset_hash,
       configurationHash: cohort.contract_hash ?? hashCanonical(cohort.contract ?? {}) });
@@ -860,6 +868,7 @@ export function reproduce(state, strategyId) {
   const changed = Object.keys(child.params).filter((key) => child.params[key] !== parent.params[key]);
   event(state, "REPRODUCE", `${child.name} born from ${parent.name}`, `Lineage ${parent.id} · mutated ${changed.join(", ")}.`);
   state.marketClock += 2;
+  return child;
 }
 
 export function advanceMarket(state, periods = 1, bootstrap = false) {
@@ -887,67 +896,16 @@ export function advanceMarket(state, periods = 1, bootstrap = false) {
       const expected = Math.max((strategy.metrics?.annualized ?? 0.03) / 252, 0.0001);
       const ratio = mean(observed) / expected;
       Object.assign(monitor, { sharpe: round(sharpe, 2), drawdown: round(drawdown, 4), ratio: round(ratio, 2) });
-      const failing = sharpe < 0.30 || drawdown > 0.08 || ratio < 0.45;
-      monitor.streak = failing ? monitor.streak + 1 : 0;
-
-      if (drawdown > 0.12 || (monitor.streak >= 2 && (sharpe < -0.50 || ratio < 0.10)) || monitor.adjustments >= 3) {
-        strategy.state = "dropped";
-        event(state, "DROP", `${strategy.name} retired`, `monitor Sharpe ${sharpe.toFixed(2)} · rolling DD ${(drawdown * 100).toFixed(1)}%`);
-      } else if (monitor.streak >= 2) {
-        strategy.state = "adjusted";
-        if (strategyFormat(strategy) === "dsl-v1") strategy.risk_multiplier = round(Number(strategy.risk_multiplier ?? 1) * 0.80, 4);
-        else strategy.params.position_size = round(strategy.params.position_size * 0.80, 2);
-        monitor.adjustments += 1;
-        monitor.streak = 0;
-        event(state, "ADJUST", `${strategy.name} risk reduced`, "position size cut 20% after two weak monitor windows.");
-      } else if (failing) {
-        strategy.state = "watch";
-      } else {
-        if (strategy.state !== "healthy") event(state, "HEALTHY", `${strategy.name} cleared monitor`, `rolling Sharpe ${sharpe.toFixed(2)} · DD ${(drawdown * 100).toFixed(1)}%`);
-        strategy.state = "healthy";
-      }
+      // This button produces display-only synthetic evidence. Autonomous
+      // lifecycle decisions are made only from canonical five-minute events
+      // and completed daily health ledgers in monitoring.js.
     }
   }
   if (evaluatedIds.size && !bootstrap) {
-    event(state, "MARKET", `Paper market advanced ${periods * 21} sessions`, `Supervisor evaluated ${evaluatedIds.size} released strategies.`);
+    event(state, "MARKET", `Paper simulation advanced ${periods} windows`,
+      `Recorded display evidence for ${evaluatedIds.size} strategies; no release-health decision was made.`);
   } else if (!evaluatedIds.size && !bootstrap) {
     event(state, "MARKET", "No strategies in market", "Release a candidate before advancing the paper market.");
-  }
-}
-
-function monitorStrategy(state, strategy, newReturns) {
-  const monitor = strategy.monitor;
-  monitor.returns = [...monitor.returns, ...newReturns].slice(-63);
-  const observed = monitor.returns.slice(-42);
-  const sharpe = mean(observed) / Math.max(stdev(observed), 0.0001) * Math.sqrt(252);
-  let equity = 1;
-  let peak = 1;
-  let drawdown = 0;
-  for (const value of observed) {
-    equity *= 1 + value;
-    peak = Math.max(peak, equity);
-    drawdown = Math.max(drawdown, 1 - equity / peak);
-  }
-  const expected = Math.max((strategy.metrics?.annualized ?? 0.03) / 252, 0.0001);
-  const ratio = mean(observed) / expected;
-  Object.assign(monitor, { sharpe: round(sharpe, 2), drawdown: round(drawdown, 4), ratio: round(ratio, 2) });
-  const failing = sharpe < 0.30 || drawdown > 0.08 || ratio < 0.45;
-  monitor.streak = failing ? monitor.streak + 1 : 0;
-  if (drawdown > 0.12 || (monitor.streak >= 2 && (sharpe < -0.50 || ratio < 0.10)) || monitor.adjustments >= 3) {
-    strategy.state = "dropped";
-    event(state, "DROP", `${strategy.name} retired`, `Alpaca monitor Sharpe ${sharpe.toFixed(2)} · rolling DD ${(drawdown * 100).toFixed(1)}%`);
-  } else if (monitor.streak >= 2) {
-    strategy.state = "adjusted";
-    if (strategyFormat(strategy) === "dsl-v1") strategy.risk_multiplier = round(Number(strategy.risk_multiplier ?? 1) * 0.80, 4);
-    else strategy.params.position_size = round(strategy.params.position_size * 0.80, 2);
-    monitor.adjustments += 1;
-    monitor.streak = 0;
-    event(state, "ADJUST", `${strategy.name} risk reduced`, "position size cut 20% after two weak live-data windows.");
-  } else if (failing) {
-    strategy.state = "watch";
-  } else {
-    if (strategy.state !== "healthy") event(state, "HEALTHY", `${strategy.name} cleared Alpaca monitor`, `rolling Sharpe ${sharpe.toFixed(2)} · DD ${(drawdown * 100).toFixed(1)}%`);
-    strategy.state = "healthy";
   }
 }
 
@@ -983,8 +941,7 @@ export function applyAlpacaCycle(state, cycle) {
   const hasNewMarketData = latestBarTime != null && latestBarTime !== state.alpaca?.last_bar_time;
   for (const strategy of state.strategies) {
     const evaluation = cycle.evaluations?.[strategy.id];
-    if (evaluation && ["released", "healthy", "watch", "adjusted"].includes(strategy.state)) {
-      if (hasNewMarketData) monitorStrategy(state, strategy, evaluation.returns ?? []);
+    if (evaluation && ["released", "healthy", "watch", "quarantined"].includes(strategy.state)) {
       strategy.live = {
         signal: evaluation.signal,
         latest_price: evaluation.latest_price,
@@ -1106,6 +1063,11 @@ export function migrateState(state) {
     explanation: strategy.explanation ?? null,
     compiler: strategy.compiler ?? strategy.strategy_dna?.compiler ?? null,
     risk_multiplier: Number(strategy.risk_multiplier ?? 1),
+    health: strategy.health ?? null,
+    operational_status: strategy.operational_status ?? "ready",
+    risk_overlay: strategy.risk_overlay ?? { health_multiplier: strategy.state === "watch" ? .5 : 1,
+      portfolio_multiplier: 1, effective_multiplier: strategy.state === "watch" ? .5 : 1,
+      reason_codes: strategy.state === "adjusted" ? ["legacy_adjustment_migrated"] : [], updated_at: null },
     rework: strategy.rework ?? emptyRework(),
     dna_hash: strategy.dna_hash ?? null,
     engine_family: strategy.engine_family ?? null,
@@ -1113,11 +1075,19 @@ export function migrateState(state) {
     backtest_runs: strategy.backtest_runs ?? {},
     lineage_id: strategy.lineage_id ?? strategy.strategy_dna?.lineage?.parent_strategy_id ?? strategy.strategy_dna?.strategy_id ?? strategy.id,
     };
+    if (upgraded.state === "adjusted") upgraded.state = "watch";
     upgraded.lifecycle ??= strategyLifecycle(upgraded, {
       datasetHash: migrated.datasets?.[strategy.dataset_id]?.sha256 ?? migrated.datasets?.[strategy.dataset_id]?.development_hash,
       configurationHash: strategy.backtest_runs?.development?.config_hash ?? ZERO_HASH,
       policyHash: strategy.supervision?.policy_hash ?? evaluationPolicyHash(createEvaluationPolicy()),
     });
+    const migratedQuality = lifecycleQuality(upgraded.state);
+    if (version < 13 && upgraded.lifecycle?.quality?.state === "released_paper"
+        && ["healthy", "watch"].includes(migratedQuality)) {
+      // Schema migration aligns old monitor labels without inventing a market
+      // evidence event or changing the immutable lifecycle provenance.
+      upgraded.lifecycle.quality = { ...upgraded.lifecycle.quality, state: migratedQuality };
+    }
     return upgraded;
   });
   migrated.datasets ??= {};
@@ -1132,6 +1102,7 @@ export function snapshot(state) {
   const strategies = clone(state.strategies);
   for (const strategy of strategies) {
     if (strategy.incubation) strategy.incubation = publicIncubationState(strategy.incubation);
+    if (strategy.health) strategy.health = publicHealthState(strategy.health);
   }
   const released = strategies.filter((item) => ACTIVE_STATES.has(item.state));
   const scored = strategies.filter((item) => item.metrics);
@@ -1140,6 +1111,7 @@ export function snapshot(state) {
     ? 100000 * product(released.map((item) => 1 + clamp(mean(item.monitor.returns), -0.02, 0.02)))
     : 100000;
   const capital = state.alpaca?.connected ? Number(state.alpaca.account?.equity ?? simulatedCapital) : simulatedCapital;
+  const healthPolicy = createHealthPolicy();
   return {
     meta: {
       cycle: state.cycle,
@@ -1154,7 +1126,7 @@ export function snapshot(state) {
       testing: strategies.filter((item) => item.state === "rework").length,
       validation: strategies.filter((item) => item.state === "validation" || item.state === "capacity_wait").length,
       released: released.length,
-      dropped: strategies.filter((item) => ["development_reject", "holdout_reject", "inconclusive", "incubation_reject", "dropped"].includes(item.state)).length,
+      dropped: strategies.filter((item) => ["development_reject", "holdout_reject", "inconclusive", "incubation_reject", "retired", "dropped"].includes(item.state)).length,
       average_score: round(averageScore, 1),
       capital: round(capital, 2),
     },
@@ -1173,7 +1145,13 @@ export function snapshot(state) {
     orchestration: publicOrchestrationState(state.orchestration),
     policy: {
       release_score: 61, min_sharpe: 0.55, max_drawdown: 0.20,
-      validation_min_sharpe: 0.30, validation_max_drawdown: 0.20, monitor_window: 21,
+      validation_min_sharpe: 0.30, validation_max_drawdown: 0.20,
+      monitoring_bar_minutes: 5, monitoring_decision_cadence: "daily",
+      monitor_window: healthPolicy.windows.rolling_sessions,
+      watch_weak_sessions: healthPolicy.windows.watch_weak_sessions,
+      quarantine_weak_sessions: healthPolicy.windows.quarantine_weak_sessions,
+      recovery_sessions: healthPolicy.windows.recovery_sessions,
+      retirement_weak_sessions: healthPolicy.windows.retirement_weak_sessions,
     },
   };
 }

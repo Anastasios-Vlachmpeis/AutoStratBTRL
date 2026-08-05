@@ -23,6 +23,9 @@ import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-pl
 import { createIncubationPolicy, evaluateIncubationGate, finalizeIncubationSession,
   recordIncubationEvent, startIncubation } from "./incubation.js";
 import { IncubationStore } from "./incubation-store.js";
+import { championReplacementAssessment, createHealthPolicy, finalizeHealthSession,
+  healthMultiplier, portfolioRiskOverlays, recordHealthObservation, startReleaseMonitoring } from "./monitoring.js";
+import { HealthStore } from "./health-store.js";
 import { createRuntimeGateways } from "./gateways.js";
 import { BrokerStore } from "./broker-store.js";
 import { canReleaseStrategyToPaper } from "./alpaca.js";
@@ -393,6 +396,8 @@ export class AxiomLab extends DurableObject {
     this.brokerStore = env.AXIOM_DB ? new BrokerStore(env.AXIOM_DB) : null;
     this.incubationStore = env.AXIOM_DB && String(env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true"
       ? new IncubationStore(env.AXIOM_DB) : null;
+    this.healthStore = env.AXIOM_DB && String(env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true"
+      ? new HealthStore(env.AXIOM_DB) : null;
     this.marketDataRepository = new MarketDataRepository(ctx.storage, env, SINGLETON_NAME);
     this.orchestrationStore = env.AXIOM_DB ? new OrchestrationStore(env.AXIOM_DB, {
       queue: env.AXIOM_JOBS, artifacts: env.AXIOM_ARTIFACTS,
@@ -809,7 +814,8 @@ export class AxiomLab extends DurableObject {
         "Evidence is frozen; paper release waits only for the independent short-execution switch.");
       return "release_blocked_short";
     }
-    strategy.state = "released"; strategy.incubation.status = "released_paper";
+    strategy.state = "released"; strategy.released_at ??= command.timestamp;
+    strategy.incubation.status = "released_paper";
     strategy.release_blocked_reason = null;
     if (this.incubationStore) {
       await this.incubationStore.persistEvidence({ workspaceId: SINGLETON_NAME, strategy });
@@ -823,9 +829,179 @@ export class AxiomLab extends DurableObject {
         explanation: `${decision.summary.valid_trading_days} valid days and ${decision.summary.eligible_trades} eligible trades`,
         correlation_id: decision.decision_id, timestamp: command.timestamp });
     }
+    startReleaseMonitoring(strategy, { releaseId: strategy.release_id,
+      startedAt: command.timestamp, policy: createHealthPolicy() });
+    if (this.healthStore) await this.healthStore.persistPolicy({ workspaceId: SINGLETON_NAME,
+      evidence: strategy.health });
+    if (strategy.health_challenger?.champion_id) {
+      const champion = state.strategies.find((item) => item.id === strategy.health_challenger.champion_id);
+      const replacement = championReplacementAssessment(strategy, champion);
+      strategy.health_challenger.replacement_assessment = replacement;
+      if (replacement.eligible && champion) {
+        champion.state = "retired"; champion.retired_at = command.timestamp;
+        champion.replaced_by = strategy.id;
+        champion.risk_overlay = { health_multiplier: 0, portfolio_multiplier: 0,
+          effective_multiplier: 0, reason_codes: ["champion_replaced"], updated_at: command.timestamp };
+        if (champion.health) champion.health.status = "retired";
+        if (champion.lifecycle?.quality?.state !== "retired") transitionStrategyLifecycle(champion,
+          "retired", { trigger: "champion_replacement", artifact_id: artifactId,
+            event_id: command.command_id, reason_code: "superior_challenger_released",
+            explanation: `${strategy.id} passed every gate and improved frozen portfolio evidence`,
+            correlation_id: decision.decision_id, timestamp: command.timestamp });
+        if (this.healthStore) await this.healthStore.persistRetirement({ workspaceId: SINGLETON_NAME,
+          strategy: champion, reason: "superior_challenger_released", endedAt: command.timestamp });
+      } else {
+        strategy.state = "retired"; strategy.retired_at = command.timestamp;
+        strategy.health.status = "retired";
+        strategy.risk_overlay = { health_multiplier: 0, portfolio_multiplier: 0,
+          effective_multiplier: 0, reason_codes: ["challenger_not_selected", ...replacement.reason_codes],
+          updated_at: command.timestamp };
+        if (strategy.lifecycle?.quality?.state !== "retired") transitionStrategyLifecycle(strategy,
+          "retired", { trigger: "challenger_assessment", artifact_id: artifactId,
+            event_id: command.command_id, reason_code: "challenger_not_selected",
+            explanation: replacement.reason_codes.join(", ") || "Challenger did not improve portfolio evidence",
+            correlation_id: decision.decision_id, timestamp: command.timestamp });
+        state.research?.novelty_archive?.dna_hashes?.push(strategy.dna_hash);
+        if (state.research?.novelty_archive?.dna_hashes) {
+          state.research.novelty_archive.dna_hashes = [...new Set(state.research.novelty_archive.dna_hashes)].sort();
+        }
+        if (this.healthStore) await this.healthStore.persistRetirement({ workspaceId: SINGLETON_NAME,
+          strategy, reason: "challenger_not_selected", endedAt: command.timestamp });
+        this.record(state, "CHALLENGER_REJECT", `${strategy.name} kept out of paper allocation`,
+          replacement.reason_codes.join(", ") || "Portfolio evidence did not improve.");
+        return "challenger_not_selected";
+      }
+    }
     this.record(state, "RELEASE", `${strategy.name} released to paper`,
       "Frozen live-incubation evidence passed; risk becomes eligible on the next safe canonical bar.");
     return "released_paper";
+  }
+
+  async persistHealthDecisionArtifact(state, strategy, decision, timestamp) {
+    if (strategy.health?.decision_artifact_id
+        && strategy.health?.artifact_decision_id === decision.decision_id) {
+      return strategy.health.decision_artifact_id;
+    }
+    const legacyId = `health-${decision.decision_id}`;
+    const content = { schema_version: 1, kind: "release.health-decision", strategy_id: strategy.id,
+      release_id: strategy.health.release_id, decision, evidence: strategy.health,
+      created_at: timestamp };
+    const resultHash = await sha256(content);
+    const stored = await this.controlPlane.artifacts.putArtifact(legacyId, content, {
+      phase: "release_monitoring", strategy_id: strategy.id, decision_id: decision.decision_id,
+    }, this.controlPlane.artifacts.contentStore ? {
+      strategyId: strategy.id, policyVersionId: this.healthStore?.policyVersionId(strategy.health) ?? null,
+      resultHash, redactionClass: "private",
+    } : {});
+    const artifactId = stored.mirror?.artifact_id ?? legacyId;
+    strategy.health.decision_artifact_id = artifactId;
+    strategy.health.artifact_decision_id = decision.decision_id;
+    state.healthArtifacts ??= {};
+    state.healthArtifacts[artifactId] = { id: artifactId, strategy_id: strategy.id,
+      release_id: strategy.health.release_id, decision_id: decision.decision_id,
+      outcome: decision.outcome, created_at: timestamp };
+    return artifactId;
+  }
+
+  async applyHealthDecision(state, strategy, decision, command) {
+    const priorQuality = strategy.health.status;
+    if (this.healthStore) await this.healthStore.persistPolicy({ workspaceId: SINGLETON_NAME,
+      evidence: strategy.health });
+    const artifactId = await this.persistHealthDecisionArtifact(state, strategy, decision, command.timestamp);
+    const quality = decision.quality_outcome;
+    const operational = decision.operational_outcome;
+    if (operational === "operational_blocked") {
+      strategy.operational_status = "operational_blocked";
+      strategy.health.operational_status = "operational_blocked";
+      if (strategy.lifecycle?.operational?.state !== "operational_blocked") {
+        transitionStrategyLifecycle(strategy, "operational_blocked", { kind: "operational",
+          trigger: "release_health", artifact_id: artifactId, event_id: command.command_id,
+          reason_code: decision.findings[0] ?? "operational_blocked",
+          explanation: decision.findings.join(", ") || "Monitoring evidence is operationally blocked",
+          correlation_id: decision.decision_id, timestamp: command.timestamp, actor: command.actor });
+      }
+    } else {
+      if (strategy.lifecycle?.operational?.state === "operational_blocked") {
+        transitionStrategyLifecycle(strategy, "ready", { kind: "operational",
+          trigger: "release_health_recovery", artifact_id: artifactId, event_id: command.command_id,
+          reason_code: "operational_recovered", explanation: "A complete fault-free health session restored monitoring",
+          correlation_id: decision.decision_id, timestamp: command.timestamp, actor: command.actor });
+      }
+      strategy.operational_status = "ready"; strategy.health.operational_status = "ready";
+    }
+    if (["healthy", "watch", "quarantined", "retired"].includes(quality)) {
+      strategy.health.status = quality;
+      if (quality !== priorQuality && strategy.lifecycle?.quality?.state !== quality) {
+        transitionStrategyLifecycle(strategy, quality, { trigger: "release_health",
+          artifact_id: artifactId, event_id: command.command_id,
+          reason_code: decision.findings[0] ?? quality,
+          explanation: decision.findings.join(", ") || `Release health changed to ${quality}`,
+          correlation_id: decision.decision_id, timestamp: command.timestamp, actor: command.actor });
+      }
+      strategy.state = quality;
+    }
+    const healthValue = healthMultiplier(decision, strategy.health.policy);
+    const portfolioValue = Number(strategy.risk_overlay?.portfolio_multiplier ?? 1);
+    strategy.risk_overlay = { health_multiplier: healthValue, portfolio_multiplier: portfolioValue,
+      effective_multiplier: healthValue * portfolioValue, reason_codes: [...decision.findings],
+      updated_at: command.timestamp, decision_id: decision.decision_id };
+    const summary = decision.summary ?? {};
+    strategy.monitor ??= { returns: [], streak: 0, adjustments: 0 };
+    Object.assign(strategy.monitor, { sharpe: summary.daily_sharpe ?? null,
+      drawdown: summary.drawdown ?? null, ratio: summary.expectancy ?? null,
+      adjustments: strategy.health.risk_overlay_history?.length ?? 0 });
+    strategy.health.risk_overlay_history.push({ at: command.timestamp,
+      multiplier: strategy.risk_overlay.effective_multiplier, reason_codes: decision.findings,
+      decision_id: decision.decision_id });
+    if (quality === "quarantined" && priorQuality !== "quarantined") {
+      strategy.health.quarantine_count = Number(strategy.health.quarantine_count ?? 0) + 1;
+      if (strategy.strategy_format === "dsl-v1" && !strategy.health_challenger_id) {
+        const child = reproduce(state, strategy.id);
+        child.health_challenger = { champion_id: strategy.id, source_release_id: strategy.health.release_id,
+          source_decision_id: decision.decision_id, diagnostics: [...decision.findings],
+          created_at: command.timestamp };
+        strategy.health_challenger_id = child.id;
+      }
+    }
+    if (quality === "retired") {
+      strategy.retired_at = command.timestamp;
+      state.research?.novelty_archive?.dna_hashes?.push(strategy.dna_hash);
+      if (state.research?.novelty_archive?.dna_hashes) {
+        state.research.novelty_archive.dna_hashes = [...new Set(state.research.novelty_archive.dna_hashes)].sort();
+      }
+      if (this.healthStore) await this.healthStore.persistRetirement({ workspaceId: SINGLETON_NAME,
+        strategy, reason: decision.findings[0] ?? "persistent_degradation", endedAt: command.timestamp,
+        actor: command.actor });
+    }
+    if (this.healthStore) await this.healthStore.persistDecision({ workspaceId: SINGLETON_NAME,
+      strategy, decision, artifactId, observedAt: command.timestamp, actor: command.actor });
+    if (this.healthStore && operational === "ready") await this.healthStore.resolveOperationalIncidents({
+      workspaceId: SINGLETON_NAME, strategy, resolvedAt: command.timestamp });
+    this.record(state, operational === "operational_blocked" ? "OPERATIONAL_BLOCK"
+      : quality === "retired" ? "RETIRE" : quality === "quarantined" ? "QUARANTINE"
+        : quality === "watch" ? "WATCH" : "HEALTHY",
+    `${strategy.name} · ${operational === "operational_blocked" ? "risk paused" : quality}`,
+    decision.findings.join(", ") || "Frozen release-health policy evaluated");
+    return decision.outcome;
+  }
+
+  async applyPortfolioHealthOverlays(state, command) {
+    const strategies = state.strategies.filter((item) => ["released", "healthy", "watch", "quarantined"].includes(item.state));
+    const overlays = portfolioRiskOverlays(strategies, state.alpaca?.allocation ?? {}, createHealthPolicy());
+    for (const strategy of strategies) {
+      const overlay = overlays[strategy.id] ?? { multiplier: 1, reason_codes: [] };
+      strategy.risk_overlay ??= { health_multiplier: 1 };
+      strategy.risk_overlay.portfolio_multiplier = overlay.multiplier;
+      strategy.risk_overlay.effective_multiplier = Number(strategy.risk_overlay.health_multiplier ?? 1) * overlay.multiplier;
+      strategy.risk_overlay.reason_codes = [...new Set([...(strategy.risk_overlay.reason_codes ?? []), ...overlay.reason_codes])];
+      strategy.risk_overlay.updated_at = command.timestamp;
+      if (this.healthStore) await this.healthStore.persistPortfolioOverlay({ workspaceId: SINGLETON_NAME,
+        strategy, sessionDate: command.payload?.session_date ?? command.timestamp.slice(0, 10),
+        overlay, decidedAt: command.timestamp });
+    }
+    state.portfolio_health = { evaluated_at: command.timestamp,
+      overlays: Object.fromEntries(Object.entries(overlays).map(([id, value]) => [id, value])),
+      gross_before_netting: state.alpaca?.allocation?.gross_before_netting ?? 0 };
   }
 
   async executeOrchestrationActions(state, command, result) {
@@ -916,9 +1092,28 @@ export class AxiomLab extends DurableObject {
       } else if (["strategy.pause", "strategy.resume", "strategy.quarantine", "strategy.retire"].includes(action.kind)) {
         const strategy = state.strategies.find((item) => item.id === action.strategy_id);
         if (!strategy) throw new Error(`Unknown strategy ${action.strategy_id}`);
+        if (["strategy.quarantine", "strategy.retire"].includes(action.kind)) {
+          if (!["released", "healthy", "watch", "quarantined"].includes(strategy.state)) {
+            throw new Error(`Strategy ${strategy.id} is not an active immutable paper release`);
+          }
+          startReleaseMonitoring(strategy, { releaseId: strategy.release_id,
+            startedAt: strategy.released_at ?? command.timestamp, policy: createHealthPolicy() });
+          const quality = action.kind === "strategy.quarantine" ? "quarantined" : "retired";
+          const decision = { schema_version: 1, decision_id: `health-operator-${command.command_id}`,
+            release_id: strategy.health.release_id, policy_hash: strategy.health.policy_hash,
+            provenance_hash: strategy.health.provenance_hash, outcome: quality, quality_outcome: quality,
+            operational_outcome: "ready", findings: [action.kind],
+            summary: { operator_decision: true }, evidence_event_id: command.command_id };
+          strategy.health.decision = decision;
+          if (!strategy.health.decision_history.some((item) => item.decision_id === decision.decision_id)) {
+            strategy.health.decision_history.push(decision);
+          }
+          await this.applyHealthDecision(state, strategy, decision, command);
+          strategy.operator_action = { kind: action.kind, command_id: command.command_id, at: command.timestamp };
+          return;
+        }
         const lifecycleTarget = action.kind === "strategy.pause" ? "operator_paused"
-          : action.kind === "strategy.resume" ? strategy.lifecycle?.paused_from
-            : action.kind === "strategy.quarantine" ? "quarantined" : "retired";
+          : strategy.lifecycle?.paused_from;
         if (!lifecycleTarget) throw new Error(`Strategy ${strategy.id} has no paused lifecycle to resume`);
         if (strategy.lifecycle && strategy.lifecycle.quality.state !== lifecycleTarget) {
           transitionStrategyLifecycle(strategy, lifecycleTarget, { trigger: "operator_command",
@@ -929,10 +1124,10 @@ export class AxiomLab extends DurableObject {
         if (action.kind === "strategy.pause") {
           strategy.operator_pause = { previous_state: strategy.state, command_id: command.command_id, at: command.timestamp };
           strategy.state = "operator_paused";
-        } else if (action.kind === "strategy.resume") {
+        } else {
           strategy.state = strategy.operator_pause?.previous_state ?? "generated";
           strategy.operator_pause = null;
-        } else strategy.state = action.kind === "strategy.quarantine" ? "watch" : "dropped";
+        }
         strategy.operator_action = { kind: action.kind, command_id: command.command_id, at: command.timestamp };
       } else if (action.kind === "approval.persist" && this.orchestrationStore) {
         const approval = action.approval;
@@ -1023,6 +1218,21 @@ export class AxiomLab extends DurableObject {
             blockNewRisk: Boolean(action.block_new_risk) });
         if (action.scope === "released") {
           applyAlpacaCycle(state, cycle);
+          const sessionDate = action.payload?.session_date
+            ?? newYorkClock(action.payload?.bucket_close ?? command.timestamp).date;
+          const monitored = state.strategies.filter((item) =>
+            ["released", "healthy", "watch", "quarantined"].includes(item.state));
+          for (const strategy of monitored) {
+            if (!cycle.evaluations?.[strategy.id]) continue;
+            startReleaseMonitoring(strategy, { releaseId: strategy.release_id,
+              startedAt: strategy.released_at ?? command.timestamp, policy: createHealthPolicy() });
+            const recorded = recordHealthObservation(strategy, cycle, {
+              eventId: action.payload?.event_id ?? bucket, sessionDate,
+              observedAt: action.payload?.bucket_close ?? command.timestamp });
+            if (!recorded.duplicate && this.healthStore) await this.healthStore.persistObservation({
+              workspaceId: SINGLETON_NAME, strategy, observation: recorded.observation });
+            if (recorded.decision) await this.applyHealthDecision(state, strategy, recorded.decision, command);
+          }
         } else {
           if ((cycle.submitted_orders ?? []).length) throw new Error("Incubation must never submit broker orders");
           orchestration.latest_targets ??= {};
@@ -1048,7 +1258,7 @@ export class AxiomLab extends DurableObject {
             });
             if (!recorded.duplicate && recorded.closed_trades > 0) {
               const peers = state.strategies.filter((item) => item.id !== strategy.id
-                && ["released", "healthy", "watch", "adjusted"].includes(item.state))
+                && ["released", "healthy", "watch", "quarantined"].includes(item.state))
                 .map((item) => item.behavior_hash ?? item.research?.behavior_hash).filter(Boolean);
               const decision = evaluateIncubationGate(strategy.incubation, { releasedBehaviorHashes: peers });
               await this.applyIncubationDecision(state, strategy, decision, command);
@@ -1061,6 +1271,24 @@ export class AxiomLab extends DurableObject {
           throw new Error(`Monitoring evidence is unavailable until target cycle ${bucket} completes`);
         }
         orchestration.latest_monitoring_at = command.timestamp;
+        if (!bucket && action.payload?.session_date) {
+          const open = action.payload?.session_open, close = action.payload?.session_close;
+          const minutes = (value) => { const [hour, minute] = String(value ?? "").split(":").map(Number);
+            return Number.isFinite(hour + minute) ? hour * 60 + minute : null; };
+          const expectedEvents = minutes(open) !== null && minutes(close) !== null
+            ? Math.max(1, Math.floor((minutes(close) - minutes(open)) / 5)) : 78;
+          for (const strategy of state.strategies.filter((item) =>
+            ["released", "healthy", "watch", "quarantined"].includes(item.state))) {
+            startReleaseMonitoring(strategy, { releaseId: strategy.release_id,
+              startedAt: strategy.released_at ?? command.timestamp, policy: createHealthPolicy() });
+            const operationalFaults = orchestration.incidents.filter((item) => !item.resolved_at
+              && item.strategy_id === strategy.id && item.severity === "critical").map((item) => item.kind);
+            const healthDecision = finalizeHealthSession(strategy, action.payload.session_date,
+              { expectedEvents, operationalFaults });
+            await this.applyHealthDecision(state, strategy, healthDecision, command);
+          }
+          await this.applyPortfolioHealthOverlays(state, command);
+        }
       } else if (action.kind === "pipeline.incubation") {
         const candidates = state.strategies.filter((strategy) => strategy.state === "incubation");
         const sessionDate = action.payload?.session_date ?? newYorkClock(command.timestamp).date;
@@ -1081,7 +1309,7 @@ export class AxiomLab extends DurableObject {
           && ((item.state === "incubation" && item.release_blocked_reason === "release_paused")
             || (item.state === "release_blocked_short" && canReleaseStrategyToPaper(this.env, item))))) {
           const peers = state.strategies.filter((item) => item.id !== strategy.id
-            && ["released", "healthy", "watch", "adjusted"].includes(item.state))
+            && ["released", "healthy", "watch", "quarantined"].includes(item.state))
             .map((item) => item.behavior_hash ?? item.research?.behavior_hash).filter(Boolean);
           const decision = evaluateIncubationGate(strategy.incubation, { releasedBehaviorHashes: peers });
           if (decision.outcome !== "released_paper") throw new Error(`Frozen incubation replay changed for ${strategy.id}`);
@@ -1092,7 +1320,7 @@ export class AxiomLab extends DurableObject {
         const date = action.payload?.session_date ?? command.timestamp.slice(0, 10);
         state.operational_reports.daily[date] = { generated_at: command.timestamp,
           strategies: state.strategies.length,
-          active: state.strategies.filter((item) => ["released", "healthy", "watch", "adjusted"].includes(item.state)).length,
+          active: state.strategies.filter((item) => ["released", "healthy", "watch", "quarantined"].includes(item.state)).length,
           incidents: orchestration.incidents.filter((item) => !item.resolved_at).length,
           market_data_status: state.marketData?.live?.status ?? "unknown" };
       } else if (action.kind === "review.weekly") {

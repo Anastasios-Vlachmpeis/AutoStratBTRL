@@ -15,6 +15,7 @@ export const DEFAULT_CLOSE_PHASES = Object.freeze({
   close_valid_day_ledger: -15,
   pipeline_incubation: -16,
   pipeline_release: -17,
+  pipeline_monitor: -18,
   generate_daily_report: -20,
   schedule_bounded_research: -25,
   run_daily_cohort: -30,
@@ -144,6 +145,7 @@ export function planOrchestrationTick({ calendar, now, completed_intent_ids, del
   addWhenDue("close_valid_day_ledger", phases.close_valid_day_ledger);
   addWhenDue("pipeline_incubation", phases.pipeline_incubation);
   addWhenDue("pipeline_release", phases.pipeline_release);
+  addWhenDue("pipeline_monitor", phases.pipeline_monitor);
   addWhenDue("generate_daily_report", phases.generate_daily_report);
   addWhenDue("schedule_bounded_research", phases.schedule_bounded_research,
     { preconditions: ["valid_day_ledger_closed", "data_health_permits", "research_not_paused"] });

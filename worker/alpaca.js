@@ -443,7 +443,7 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
   const requestedFlatten = Boolean(options.safetyFlatten || controls.flatten_requested || controls.kill_switch);
   let forceFlatten = requestedFlatten || dailyRisk.halted || sessionRisk.force_flatten;
   const permittedStates = options.scope === "incubation"
-    ? new Set(["incubation"]) : new Set(["released", "healthy", "watch", "adjusted"]);
+    ? new Set(["incubation"]) : new Set(["released", "healthy", "watch", "quarantined"]);
   const active = (forceFlatten && options.scope !== "incubation") || options.canary ? []
     : appState.strategies.filter((strategy) => permittedStates.has(strategy.state));
   const scoped = new Map(active.map((strategy) => [strategy.id, strategySymbols(strategy)]));

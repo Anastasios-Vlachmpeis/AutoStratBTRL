@@ -6,6 +6,8 @@
  * can persist transactionally in a later integration step.
  */
 import { canonicalJson, hashCanonical, sha256 } from "./dsl.js";
+import { publicIncubationState } from "./incubation.js";
+import { createHealthPolicy, publicHealthState } from "./monitoring.js";
 
 export const STATE_MIGRATION_SCHEMA_VERSION = 1;
 export const NORMALIZED_STATE_SCHEMA_VERSION = 8;
@@ -16,7 +18,7 @@ export const MIGRATION_STEPS = Object.freeze([
 
 const ZERO_HASH = "0".repeat(64);
 const HASH = /^[a-f0-9]{64}$/;
-const ACTIVE_STATES = new Set(["released", "healthy", "watch", "adjusted"]);
+const ACTIVE_STATES = new Set(["released", "healthy", "watch", "quarantined"]);
 const RAW_KEYS = new Set(["bars", "raw_bars", "development_bars", "holdout_bars", "validation_bars",
   "bars_by_symbol", "development", "holdout", "sealed_bars", "body", "payload_bytes"]);
 const ARTIFACT_BODY_KEYS = new Set(["equity_curve", "exposure_curve", "signed_exposure_curve", "curves",
@@ -180,8 +182,8 @@ function normalizeRuns(strategy) {
 function normalizeLifecycle(strategy) {
   const lifecycle = metadataOnly(strategy.lifecycle ?? {});
   const fallback = ({ generated: "screened", rework: "development", validation: "sealed_validation",
-    capacity_wait: "capacity_wait", incubation: "incubation", released: "released_paper", healthy: "released_paper",
-    adjusted: "released_paper", watch: "watch", development_reject: "development_reject",
+    capacity_wait: "capacity_wait", incubation: "incubation", released: "released_paper", healthy: "healthy",
+    adjusted: "watch", watch: "watch", quarantined: "quarantined", retired: "retired", development_reject: "development_reject",
     holdout_reject: "holdout_reject", inconclusive: "inconclusive", superseded: "superseded", dropped: "retired" })[strategy.state] ?? "proposed";
   return {
     schema_version: finite(lifecycle.schema_version, 1), strategy_id: String(strategy.id),
@@ -204,6 +206,8 @@ export function normalizeLegacyExport(bundle) {
   const strategies = [], strategyDna = [], lineages = [], transitions = [], operational = [];
   for (const raw of sorted(source.strategies ?? [], "id")) {
     const strategy = metadataOnly(raw);
+    if (raw.incubation) strategy.incubation = publicIncubationState(raw.incubation);
+    if (raw.health) strategy.health = publicHealthState(raw.health);
     const strategy_id = requireId(String(strategy.id ?? ""), "strategy.id");
     const runs = normalizeRuns(strategy);
     const lifecycle = normalizeLifecycle(strategy);
@@ -348,6 +352,7 @@ export function rebuildNormalizedReadModel(value) {
   const simulated = released.length ? 100000 * product(released.map((item) => 1 + clamp(mean(item.monitor?.returns ?? []), -.02, .02))) : 100000;
   const alpaca = copy(value.workspace.alpaca ?? { connected: false });
   const capital = alpaca.connected ? finite(alpaca.account?.equity, simulated) : simulated;
+  const healthPolicy = createHealthPolicy();
   return {
     meta: { cycle: finite(value.workspace.cycle), clock: finite(value.workspace.market_clock),
       environment: alpaca.connected ? "ALPACA PAPER" : "PAPER SIM", schema_version: value.workspace.source_schema_version,
@@ -356,7 +361,7 @@ export function rebuildNormalizedReadModel(value) {
       testing: strategies.filter((item) => item.state === "rework").length,
       validation: strategies.filter((item) => ["validation", "capacity_wait"].includes(item.state)).length,
       released: released.length,
-      dropped: strategies.filter((item) => ["development_reject", "holdout_reject", "inconclusive", "dropped"].includes(item.state)).length,
+      dropped: strategies.filter((item) => ["development_reject", "holdout_reject", "inconclusive", "retired", "dropped"].includes(item.state)).length,
       average_score: round(mean(scored.map((item) => item.metrics.score)), 1), capital: round(capital, 2) },
     strategies, events: copy(value.events), alpaca,
     market_data: { schema_version: value.workspace.market_data?.schema_version ?? 1,
@@ -365,7 +370,13 @@ export function rebuildNormalizedReadModel(value) {
       live: value.workspace.market_data?.live ?? null },
     research: publicResearch(value.workspace.research), orchestration: copy(value.workspace.orchestration ?? {}),
     policy: { release_score: 61, min_sharpe: .55, max_drawdown: .20,
-      validation_min_sharpe: .30, validation_max_drawdown: .20, monitor_window: 21 },
+      validation_min_sharpe: .30, validation_max_drawdown: .20,
+      monitoring_bar_minutes: 5, monitoring_decision_cadence: "daily",
+      monitor_window: healthPolicy.windows.rolling_sessions,
+      watch_weak_sessions: healthPolicy.windows.watch_weak_sessions,
+      quarantine_weak_sessions: healthPolicy.windows.quarantine_weak_sessions,
+      recovery_sessions: healthPolicy.windows.recovery_sessions,
+      retirement_weak_sessions: healthPolicy.windows.retirement_weak_sessions },
   };
 }
 

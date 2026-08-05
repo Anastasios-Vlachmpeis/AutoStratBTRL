@@ -87,9 +87,10 @@ main { min-width: 0; padding: 0 clamp(18px, 3vw, 44px) 36px; max-width: 1760px; 
 .panel-actions { display: flex; align-items: center; gap: 8px; }
 .status-badge, .live-marker { border: 1px solid var(--line-bright); padding: 5px 7px; color: var(--muted); font: 500 9px var(--mono); text-transform: uppercase; }
 .status-badge.healthy, .status-badge.released, .status-badge.incubation { color: var(--green); border-color: rgba(168,240,90,.4); background: var(--green-soft); }
-.status-badge.watch, .status-badge.adjusted, .status-badge.rework, .status-badge.capacity_wait, .status-badge.inconclusive { color: var(--amber); border-color: rgba(233,182,85,.4); }
+.status-badge.watch, .status-badge.rework, .status-badge.capacity_wait, .status-badge.inconclusive { color: var(--amber); border-color: rgba(233,182,85,.4); }
 .status-badge.validation { color: var(--violet); border-color: rgba(162,139,221,.45); background: rgba(162,139,221,.08); }
-.status-badge.dropped, .status-badge.development_reject, .status-badge.holdout_reject { color: var(--red); border-color: rgba(238,115,106,.35); }
+.status-badge.dropped, .status-badge.development_reject, .status-badge.holdout_reject, .status-badge.quarantined, .status-badge.retired { color: var(--red); border-color: rgba(238,115,106,.35); }
+.status-badge.operational_blocked { color: var(--amber); border-color: rgba(233,182,85,.4); background: rgba(233,182,85,.08); }
 .status-badge.superseded { color: var(--dim); border-color: var(--line-bright); }
 .live-marker { border: 0; color: var(--green); display: flex; align-items: center; gap: 6px; }
 .live-marker i { width: 5px; height: 5px; border-radius: 50%; background: var(--green); }
@@ -119,7 +120,7 @@ main { min-width: 0; padding: 0 clamp(18px, 3vw, 44px) 36px; max-width: 1760px; 
 .strategy-filter small { min-width: 14px; padding: 2px 4px; background: var(--surface-2); color: var(--dim); font: inherit; text-align: center; }
 .strategy-filter:hover { border-color: var(--line-bright); color: var(--ink); }
 .strategy-filter.active { border-color: var(--green); background: var(--green-soft); color: var(--green); }
-.strategy-filter[data-filter="watch"].active, .strategy-filter[data-filter="adjusted"].active, .strategy-filter[data-filter="rework"].active, .strategy-filter[data-filter="capacity_wait"].active { border-color: var(--amber); background: rgba(233,182,85,.06); color: var(--amber); }
+.strategy-filter[data-filter="watch"].active, .strategy-filter[data-filter="rework"].active, .strategy-filter[data-filter="capacity_wait"].active { border-color: var(--amber); background: rgba(233,182,85,.06); color: var(--amber); }
 .strategy-filter[data-filter="validation"].active { border-color: var(--violet); background: rgba(162,139,221,.08); color: var(--violet); }
 .strategy-filter[data-filter="retired"].active { border-color: var(--red); background: rgba(238,115,106,.06); color: var(--red); }
 
@@ -183,7 +184,9 @@ tbody tr.selected { box-shadow: inset 2px 0 var(--green); }
 .detail-grid { margin-top: 16px; display: grid; grid-template-columns: minmax(270px, .72fr) minmax(0, 1.28fr); gap: 16px; }
 .strategy-context-strip { grid-column: 1 / -1; min-width: 0; display: grid; grid-template-columns: 28px minmax(190px, 1fr) auto; align-items: center; gap: 11px; padding: 9px 12px; border: 1px solid rgba(233,182,85,.28); border-left: 2px solid var(--amber); background: linear-gradient(90deg, rgba(233,182,85,.075), rgba(233,182,85,.015)); }
 .strategy-context-strip.watch { border-color: rgba(233,182,85,.35); border-left-color: var(--amber); }.strategy-context-strip.rework { border-color: rgba(162,139,221,.26); border-left-color: var(--violet); background: linear-gradient(90deg, rgba(162,139,221,.07), rgba(162,139,221,.012)); }
+.strategy-context-strip.quarantine { border-color: rgba(238,115,106,.35); border-left-color: var(--red); background: linear-gradient(90deg, rgba(238,115,106,.08), rgba(238,115,106,.012)); }.strategy-context-strip.operational { border-style: dashed; }
 .context-marker { display: grid; place-items: center; width: 26px; height: 26px; border: 1px solid currentColor; border-radius: 50%; color: var(--amber); font: 600 10px var(--mono); box-shadow: 0 0 16px rgba(233,182,85,.08); }.rework .context-marker { color: var(--violet); box-shadow: 0 0 16px rgba(162,139,221,.08); }
+.quarantine .context-marker, .quarantine .context-kicker { color: var(--red); }
 .context-copy { min-width: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: baseline; column-gap: 8px; row-gap: 3px; }.context-kicker { color: var(--amber); font: 7px var(--mono); letter-spacing: .08em; white-space: nowrap; }.rework .context-kicker { color: var(--violet); }.context-copy strong { min-width: 0; overflow: hidden; color: var(--ink); font: 500 10px var(--sans); text-overflow: ellipsis; white-space: nowrap; }.context-copy small { grid-column: 1 / -1; overflow: hidden; color: var(--muted); font: 8px/1.35 var(--mono); text-overflow: ellipsis; white-space: nowrap; }
 .context-metrics { display: flex; align-items: stretch; justify-content: flex-end; gap: 5px; }.context-metric { min-width: 76px; padding: 5px 7px; border-left: 1px solid var(--line-bright); }.context-metric span, .context-metric small { display: block; color: var(--dim); font: 6px var(--mono); white-space: nowrap; }.context-metric strong { display: block; margin: 2px 0; color: var(--ink); font: 400 9px var(--mono); white-space: nowrap; }.context-metric.failed strong { color: var(--amber); }.context-metric.passed { opacity: .58; }.context-metric.changed strong { color: var(--violet); }
 .dna-content, .regime-content { padding: 14px 16px; min-height: 190px; }

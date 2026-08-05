@@ -47,7 +47,7 @@ function proposalForRegistry(proposal) {
 }
 
 function researchParents(state) {
-  const permittedStates = new Set(["generated", "validation", "released", "healthy", "watch", "adjusted"]);
+  const permittedStates = new Set(["generated", "validation", "released", "healthy", "watch", "quarantined"]);
   return (state.strategies ?? []).filter((strategy) => strategy.strategy_format === "dsl-v1"
     && strategy.strategy_dna && strategy.fitness
     && (permittedStates.has(strategy.state)

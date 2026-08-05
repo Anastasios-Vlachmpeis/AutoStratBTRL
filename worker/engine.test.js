@@ -152,7 +152,7 @@ test("live monitoring measures signed short exposure", () => {
 test("market advance records monitoring evidence", () => {
   const state = createDemoState();
   addReleasedStrategy(state);
-  const active = state.strategies.filter((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
+  const active = state.strategies.filter((strategy) => ["released", "healthy", "watch", "quarantined"].includes(strategy.state));
   advanceMarket(state);
   for (const prior of active) {
     const current = state.strategies.find((strategy) => strategy.id === prior.id);
@@ -348,6 +348,22 @@ test("schema 10 migration initializes durable orchestration and strategy lifecyc
   assert.equal(migrated.strategies[0].lifecycle.quality.state, "screened");
   assert.equal(migrated.strategies[0].lifecycle.operational.state, "ready");
   assert.equal(snapshot(migrated).orchestration.controls.kill_switch, false);
+});
+
+test("schema 13 migration converts legacy adjusted releases into immutable watch overlays", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  const strategy = state.strategies[0];
+  strategy.state = "adjusted"; strategy.lifecycle.quality = { state: "released_paper", version: 7 };
+  delete strategy.health; delete strategy.risk_overlay;
+  state.schemaVersion = 12;
+  const migrated = migrateState(state), current = migrated.strategies[0];
+  assert.equal(current.state, "watch");
+  assert.equal(current.lifecycle.quality.state, "watch");
+  assert.equal(current.lifecycle.quality.version, 7);
+  assert.equal(current.risk_overlay.effective_multiplier, 1);
+  assert.deepEqual(current.risk_overlay.reason_codes, ["legacy_adjustment_migrated"]);
+  assert.equal(current.strategy_dna.dna_hash, strategy.strategy_dna.dna_hash);
 });
 
 test("only evolutionary finalists enter the lifecycle and private trials stay out of snapshots", () => {
