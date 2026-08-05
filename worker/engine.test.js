@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { validateStrategyDNA } from "./dsl.js";
 
 import {
   applyAlpacaCycle,
@@ -72,6 +73,7 @@ test("reproduction preserves lineage and mutates DNA", () => {
   reproduce(state, parent.id);
   const child = state.strategies[0];
   assert.equal(child.parent, parent.id);
+  assert.equal(child.lineage_id, parent.lineage_id);
   assert.equal(child.generation, parent.generation + 1);
   assert.notDeepEqual(child.params, parent.params);
   assert.equal(child.state, "generated");
@@ -84,6 +86,7 @@ test("rework archives the parent and creates one audited DNA change", () => {
   const [child] = reworkCandidates(state);
   assert.equal(parent.state, "superseded");
   assert.equal(child.parent, parent.id);
+  assert.equal(child.lineage_id, parent.lineage_id);
   assert.equal(child.state, "generated");
   assert.equal(child.rework.attempt, 1);
   assert.equal(child.rework.history.length, 1);
@@ -317,6 +320,18 @@ test("schema 8 migration preserves evolutionary state for multi-symbol execution
   assert.equal(migrated.datasets.sealed.symbol_count, 40);
 });
 
+test("schema 9 migration initializes sealed holdout provenance without exposing it", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  state.schemaVersion = 9;
+  delete state.research.holdout_burn_ledger;
+  delete state.strategies[0].lineage_id;
+  const migrated = migrateState(state);
+  assert.equal(migrated.strategies[0].lineage_id, migrated.strategies[0].strategy_dna.strategy_id);
+  assert.equal(migrated.research.holdout_burn_ledger.total_burns, 0);
+  assert.equal("holdout_burn_ledger" in snapshot(migrated).research, false);
+});
+
 test("only evolutionary finalists enter the lifecycle and private trials stay out of snapshots", () => {
   const fixture = createDemoState();
   generateBatch(fixture, 1);
@@ -332,6 +347,27 @@ test("only evolutionary finalists enter the lifecycle and private trials stay ou
   assert.equal(created[0].trial_id, "TR-1");
   assert.equal(JSON.stringify(dna), original);
   assert.equal("trials" in snapshot(state).research, false);
+});
+
+test("development rework creates a valid DSL child for an evolutionary finalist", () => {
+  const source = createDemoState();
+  generateBatch(source, 1);
+  const dna = structuredClone(source.strategies[0].strategy_dna);
+  const state = createDemoState();
+  const [parent] = registerResearchFinalists(state, [{ trial_id: "TR-RW", dna_hash: dna.dna_hash, dna,
+    selection_rank: 1, fitness: {}, behavior_hash: "c".repeat(64), behavior_cluster: "cluster-a" }],
+  { cohort_id: "COH-RW", attempted: 40 });
+  parent.state = "rework";
+  parent.metrics = { score: 55, sharpe: .4, drawdown: .1, trades: 30, robustness: .5 };
+  parent.validation = { sharpe: -99, return: -99, drawdown: 1 };
+  parent.rework = { attempt: 0, max_attempts: 3, diagnosis: "development only", source_stage: "development", change: null, history: [] };
+  const [child] = reworkCandidates(state);
+  assert.equal(parent.state, "superseded");
+  assert.equal(child.lineage_id, parent.lineage_id);
+  assert.notEqual(child.dna_hash, parent.dna_hash);
+  assert.equal(child.validation, null);
+  assert.equal(child.rework.history[0].source_stage, "development");
+  assert.doesNotThrow(() => validateStrategyDNA(child.strategy_dna));
 });
 
 test("Alpaca cycles are idempotent and record managed symbols", () => {

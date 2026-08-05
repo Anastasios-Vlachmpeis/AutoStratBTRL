@@ -6,12 +6,13 @@ import os
 import time
 from datetime import datetime, timedelta, timezone
 
+import pytest
 from fastapi.testclient import TestClient
 
 os.environ["AXIOM_BACKTEST_SECRET"] = "test-secret"
 from app.dsl import legacy_strategy_to_dsl  # noqa: E402
 from app.main import DSLStrategyDNA, ExecutionConfig, StrategyDNA, app, digest, run_window, strategy_signal  # noqa: E402
-from app.v2 import BacktestRequestV2, V2Window, digest as digest_v2, simulate_v2  # noqa: E402
+from app.v2 import BacktestRequestV2, V2Window, digest as digest_v2, run_v2, simulate_v2  # noqa: E402
 
 client = TestClient(app)
 
@@ -283,3 +284,63 @@ def test_v2_flat_strategy_has_finite_no_trade_artifact():
     run = simulate_v2(request.strategies[0].dna, {"SPY": [x.model_dump(exclude_none=True) for x in request.bars_by_symbol["SPY"]]}, request.windows[0], request.execution)
     assert not run["closed_trades"]
     assert all(math.isfinite(float(value)) for value in run["metrics"].values() if isinstance(value, (int, float)))
+
+
+def v2_development_payload():
+    body = v2_payload()
+    market = body["bars_by_symbol"]["SPY"]
+    body["phase"] = "development"
+    body["windows"] = [
+        {"id": "anchored-1", "start": market[0]["t"], "end": market[35]["t"]},
+        {"id": "anchored-2", "start": market[0]["t"], "end": market[52]["t"]},
+        {"id": "anchored-3", "start": market[0]["t"], "end": (datetime.fromisoformat(market[-1]["t"].replace("Z", "+00:00")) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")},
+        {"id": "rolling-1", "start": market[20]["t"], "end": market[55]["t"]},
+        {"id": "rolling-2", "start": market[15]["t"], "end": market[65]["t"]},
+        {"id": "rolling-3", "start": market[10]["t"], "end": (datetime.fromisoformat(market[-1]["t"].replace("Z", "+00:00")) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")},
+    ]
+    return body
+
+
+def test_v2_development_folds_are_purged_reset_and_deterministic():
+    request = BacktestRequestV2.model_validate(v2_development_payload())
+    engine = {"version": "test", "configuration_hash": digest_v2(request.execution.model_dump(mode="json")), "image_digest": "test"}
+    first = run_v2(request, engine=engine)
+    second = run_v2(request, engine=engine)
+    assert first["result_hash"] == second["result_hash"]
+    windows = first["results"][0]["windows"]
+    assert all(item["fold_manifest"]["purge_bars"] == item["fold_manifest"]["warmup_bars"] for item in windows)
+    assert all(item["fold_manifest"]["state_reset"]["portfolio"] for item in windows)
+    final_effective = V2Window(**windows[-1]["fold_manifest"]["effective"])
+    isolated = simulate_v2(request.strategies[0].dna,
+        {symbol: [row.model_dump(exclude_none=True) for row in rows] for symbol, rows in request.bars_by_symbol.items()},
+        final_effective, request.execution)
+    assert isolated["equity_curve"] == windows[-1]["ideal"]["equity_curve"]
+    evidence = windows[-1]["development_evidence"]
+    assert evidence["protocol"]["candidate_dna_mutated"] is False
+    assert evidence["moderate_gap_stress"]["gap_schedule"]
+    assert evidence["permuted_return_null"]["seed_hash"]
+    assert evidence["parameter_perturbations"]
+    assert all(item["original_dna_hash"] == request.strategies[0].dna_hash for item in evidence["parameter_perturbations"])
+    assert all(item["variant_dna_hash"] != request.strategies[0].dna_hash for item in evidence["parameter_perturbations"])
+    assert evidence["hash"]
+
+
+def test_v2_rejects_development_window_too_short_for_purge_and_embargo():
+    body = v2_development_payload()
+    body["windows"][0]["end"] = body["bars_by_symbol"]["SPY"][10]["t"]
+    with pytest.raises(ValueError, match="too short"):
+        BacktestRequestV2.model_validate(body)
+
+
+def test_v2_holdout_has_no_adaptive_perturbation_and_flat_evidence_is_finite():
+    body = v2_payload(("SPY",))
+    frozen = legacy_strategy_to_dsl({"id": "flat-holdout", "asset": "SPY", "archetype": "Momentum",
+                                     "params": {"fast": 2, "slow": 4, "threshold": 10, "position_size": 1}}, symbols=["SPY"])
+    body["strategies"][0].update({"dna": frozen, "dna_hash": frozen["dna_hash"]})
+    request = BacktestRequestV2.model_validate(body)
+    engine = {"version": "test", "configuration_hash": digest_v2(request.execution.model_dump(mode="json")), "image_digest": "test"}
+    result = run_v2(request, engine=engine)
+    window = result["results"][0]["windows"][0]
+    assert window["holdout_evidence"]["adaptive_robustness"] is False
+    assert "parameter_perturbations" not in window["holdout_evidence"]
+    assert math.isfinite(window["holdout_evidence"]["base"]["metrics"]["net_return"])

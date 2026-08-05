@@ -12,6 +12,7 @@ import hashlib
 import hmac
 import math
 from collections import defaultdict
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from statistics import median
 from typing import Any, Literal
@@ -19,7 +20,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import backtrader as bt
 
-from .dsl import TargetStateMachine, canonical_json, validate_strategy_dna
+from .dsl import OPS, TargetStateMachine, build_strategy_dna, canonical_json, validate_strategy_dna
 from .metrics import compute_metrics
 from .replay import ARTIFACT_SCHEMA_VERSION, build_replay_metadata
 
@@ -214,7 +215,7 @@ class BacktestRequestV2(BaseModel):
     strategies: list[V2Strategy] = Field(min_length=1, max_length=12)
     dataset: DatasetManifestV2
     bars_by_symbol: dict[str, list[V2Bar]]
-    windows: list[V2Window] = Field(min_length=1, max_length=3)
+    windows: list[V2Window] = Field(min_length=1, max_length=6)
     # The caller must freeze the execution policy in every request so its
     # signed wire hash is a complete replay identity, never an implicit local
     # default that could drift between deployments.
@@ -258,8 +259,11 @@ class BacktestRequestV2(BaseModel):
         ids = [window.id for window in self.windows]
         if len(set(ids)) != len(ids):
             raise ValueError("window ids must be unique")
-        if self.phase == "development" and len(self.windows) != 3:
-            raise ValueError("development requires exactly three windows")
+        if self.phase == "development":
+            anchored = sorted(window.id for window in self.windows if window.id.startswith("anchored-"))
+            rolling = sorted(window.id for window in self.windows if window.id.startswith("rolling-"))
+            if len(self.windows) != 6 or anchored != ["anchored-1", "anchored-2", "anchored-3"] or rolling != ["rolling-1", "rolling-2", "rolling-3"]:
+                raise ValueError("development requires exactly three anchored-* and three rolling-* windows")
         if self.phase == "holdout" and len(self.windows) != 1:
             raise ValueError("holdout requires exactly one sealed window")
         all_stamps = [row.t for rows in self.bars_by_symbol.values() for row in rows]
@@ -271,12 +275,20 @@ class BacktestRequestV2(BaseModel):
             if iso(window.start) != min(map(iso, all_stamps)) or iso(window.end) <= max(map(iso, all_stamps)):
                 raise ValueError("holdout window must cover the complete sealed slice")
         available = set(self.bars_by_symbol)
+        required_warmup = 0
         for strategy in self.strategies:
             frozen = validate_strategy_dna(strategy.dna)
+            required_warmup = max(required_warmup, int(frozen.warmup_bars) + self.execution.warmup_safety_bars)
             if frozen.scope["universe_id"] != self.dataset.universe_id or frozen.scope["universe_sha256"] != self.dataset.universe_sha256:
                 raise ValueError("strategy scope does not match immutable dataset universe")
             if not set(frozen.scope["symbols"]).issubset(available):
                 raise ValueError("strategy scope contains a symbol missing from immutable dataset")
+        if self.phase == "development":
+            minimum = 2 * required_warmup + 2
+            for window in self.windows:
+                observations = sum(1 for stamp in sorted(set(all_stamps), key=iso) if iso(window.start) <= iso(stamp) < iso(window.end))
+                if observations < minimum:
+                    raise ValueError(f"development window {window.id} is too short for purge/embargo and dynamic warmup")
         return self
 
 
@@ -386,7 +398,7 @@ def _sample_curve(points: list[dict[str, Any]], limit: int) -> list[dict[str, An
     return sampled
 
 
-def _simulate_v2_ledger(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window, config: ExecutionConfigV2, *, stress: bool = False) -> dict[str, Any]:
+def _simulate_v2_ledger(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window, config: ExecutionConfigV2, *, stress: bool = False, target_multiplier: float = 1.0, gap_stress: bool = False) -> dict[str, Any]:
     frozen = validate_strategy_dna(dna)
     symbols = sorted(set(frozen.scope["symbols"]) & set(bars_by_symbol))
     machines = {symbol: TargetStateMachine(frozen) for symbol in symbols}
@@ -420,6 +432,7 @@ def _simulate_v2_ledger(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict
         bar_range = max(0.0, (float(row["h"]) - float(row["l"])) / float(row["c"]))
         slippage = slip_scale * (config.base_slippage_bps / 10_000 + config.range_slippage_multiplier * bar_range
                                  + config.participation_slippage_multiplier * participation * .0001)
+        if gap_stress: slippage += .001
         price = float(row["c"]) * (1 + (1 if size > 0 else -1) * slippage)
         commission = abs(size * price) * config.costs.commission_bps / 10_000
         cash -= size * price + commission; symbol_cash[symbol] -= size * price + commission
@@ -497,6 +510,7 @@ def _simulate_v2_ledger(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict
             participation = abs(fill_size) / max(float(row["v"]), 1)
             bar_range = max(0.0, (float(row["h"]) - float(row["l"])) / float(row["o"]))
             slippage = slip_scale * (config.base_slippage_bps / 10_000 + config.range_slippage_multiplier * bar_range + config.participation_slippage_multiplier * participation * 0.0001)
+            if gap_stress: slippage += .001
             price = float(row["o"]) * (1 + (1 if fill_size > 0 else -1) * slippage)
             order_num += 1; ref = f"v2-order-{order_num}"
             commission = abs(fill_size * price) * config.costs.commission_bps / 10_000
@@ -545,10 +559,14 @@ def _simulate_v2_ledger(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict
         unavailable_gross = sum(abs(positions[symbol] * decision_marks[symbol]) for symbol in symbols
                                 if symbol not in available) / max(decision_value, 1)
         available_budget = max(0.0, config.strategy_gross_limit - unavailable_gross)
-        gross = sum(abs(target) for target, _ in desired.values())
+        # Apply execution sensitivity before collective normalisation so a
+        # 1.10 scenario can never exceed the immutable 0.5% gross cap.
+        gross = sum(abs(target * target_multiplier) for target, _ in desired.values())
         scale = min(1.0, available_budget / gross) if gross else 1.0
         for symbol, (target, reason) in sorted(desired.items()):
-            normalized = target * scale
+            # Robustness changes execution sizing only; the frozen DSL graph
+            # and DNA hash are never modified.
+            normalized = target * target_multiplier * scale
             target_state = (round(normalized, 10), reason)
             if last_target.get(symbol) != target_state:
                 targets.append({"t": stamp, "symbol": symbol, "target": target_state[0], "reason": reason,
@@ -649,23 +667,218 @@ class _V2PortfolioAdapter(bt.Strategy):
     capped by each bar's participation volume.  It is invoked from ``stop``
     after the exact feed run, so a custom fill does not bypass the engine run.
     """
-    params = (("dna", None), ("bars_by_symbol", None), ("window", None), ("config", None), ("stress", False))
+    params = (("dna", None), ("bars_by_symbol", None), ("window", None), ("config", None), ("stress", False), ("target_multiplier", 1.0), ("gap_stress", False))
     def __init__(self) -> None: self.result: dict[str, Any] | None = None
     def stop(self) -> None:
-        self.result = _simulate_v2_ledger(self.p.dna, self.p.bars_by_symbol, self.p.window, self.p.config, stress=self.p.stress)
+        self.result = _simulate_v2_ledger(self.p.dna, self.p.bars_by_symbol, self.p.window, self.p.config, stress=self.p.stress, target_multiplier=self.p.target_multiplier, gap_stress=self.p.gap_stress)
 
 
-def simulate_v2(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window, config: ExecutionConfigV2, *, stress: bool = False) -> dict[str, Any]:
+def simulate_v2(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window, config: ExecutionConfigV2, *, stress: bool = False, target_multiplier: float = 1.0, gap_stress: bool = False) -> dict[str, Any]:
     """Run the sealed multi-data request through Backtrader's authoritative lifecycle."""
     cerebro = bt.Cerebro(stdstats=False)
     for symbol in sorted(bars_by_symbol):
         rows = [row for row in bars_by_symbol[symbol] if iso(row["t"]) >= iso(window.start) and iso(row["t"]) < iso(window.end)]
         if rows: cerebro.adddata(_V2BarFeed(bars=rows), name=symbol)
-    cerebro.addstrategy(_V2PortfolioAdapter, dna=dna, bars_by_symbol=bars_by_symbol, window=window, config=config, stress=stress)
+    cerebro.addstrategy(_V2PortfolioAdapter, dna=dna, bars_by_symbol=bars_by_symbol, window=window, config=config, stress=stress, target_multiplier=target_multiplier, gap_stress=gap_stress)
     result = cerebro.run(runonce=False, preload=True)[0].result
     if result is None: raise RuntimeError("Backtrader v2 adapter produced no artifact")
     result["execution_adapter"] = "backtrader-multifeed-v2"
     return result
+
+
+ROBUSTNESS_EVIDENCE_VERSION = "development-robustness-v1"
+
+
+def _window_stamps(bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window) -> list[str]:
+    return sorted({row["t"] for rows in bars_by_symbol.values() for row in rows
+                   if iso(row["t"]) >= iso(window.start) and iso(row["t"]) < iso(window.end)}, key=iso)
+
+
+def fold_manifest(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window, config: ExecutionConfigV2) -> tuple[dict[str, Any], V2Window]:
+    """Create a self-contained fold with no inherited indicator/position state."""
+    warmup = int(validate_strategy_dna(dna).warmup_bars) + config.warmup_safety_bars
+    stamps = _window_stamps(bars_by_symbol, window)
+    purge = warmup
+    embargo = warmup
+    # Purge all observations that could carry a feature dependency from the
+    # preceding fold.  The embargo is recorded explicitly even though each
+    # fold starts a fresh strategy/broker instance and has no train state.
+    start_index = min(len(stamps) - 1, purge + embargo) if stamps else 0
+    effective_start = stamps[start_index] if stamps else window.start
+    effective = V2Window(id=window.id, start=effective_start, end=window.end)
+    manifest = {"schema_version": "fold-manifest-v1", "id": window.id,
+                "requested": window.model_dump(), "effective": effective.model_dump(),
+                "warmup_bars": warmup, "purge_bars": purge, "embargo_bars": embargo,
+                "state_reset": {"indicator": True, "target": True, "portfolio": True, "broker": True},
+                "observations_before": len(stamps), "observations_after": max(0, len(stamps) - start_index),
+                "hash": ""}
+    manifest["hash"] = digest({key: value for key, value in manifest.items() if key != "hash"})
+    return manifest, effective
+
+
+def _flat_baseline(window: V2Window, bars_by_symbol: dict[str, list[dict[str, Any]]], initial_cash: float) -> dict[str, Any]:
+    curve = [{"t": stamp, "value": initial_cash} for stamp in _window_stamps(bars_by_symbol, window)]
+    metrics = compute_metrics(curve, [], [], [], [], interval_minutes=5)
+    return {"name": "flat_cash_precommitted", "metrics": metrics,
+            "activity": {"signals": 0, "targets": 0, "fills": 0, "closed_trades": 0}}
+
+
+def _permuted_return_null(base: dict[str, Any], dna_hash: str, window: V2Window, initial_cash: float) -> dict[str, Any]:
+    """A bounded, drift-free null built from completed development returns.
+
+    A plain permutation preserves mean/volatility and therefore preserves
+    Sharpe exactly. Centering before the deterministic cyclic permutation
+    removes the observed drift while retaining its volatility and tail shape.
+    """
+    points = base.get("equity_curve", [])
+    returns = [points[index]["value"] / points[index - 1]["value"] - 1 for index in range(1, len(points))
+               if points[index - 1]["value"] > 0]
+    seed = digest({"dna_hash": dna_hash, "window": window.model_dump(), "null": "cyclic-return-permutation-v1"})
+    offset = int(seed[:8], 16) % len(returns) if returns else 0
+    average = sum(returns) / len(returns) if returns else 0.0
+    shuffled = [item - average for item in (returns[offset:] + returns[:offset])]
+    curve = []
+    value = initial_cash
+    stamps = [point["t"] for point in points]
+    if stamps: curve.append({"t": stamps[0], "value": value})
+    for index, item in enumerate(shuffled, 1):
+        value *= 1 + item
+        curve.append({"t": stamps[min(index, len(stamps) - 1)], "value": value})
+    return {"name": "centered_cyclic_permuted_return_null_precommitted", "seed_hash": seed,
+            "metrics": compute_metrics(curve, [], [], [], [], interval_minutes=5),
+            "activity": {"signals": 0, "targets": 0, "fills": 0, "closed_trades": 0}}
+
+
+def _deterministic_gap_bars(bars_by_symbol: dict[str, list[dict[str, Any]]]) -> dict[str, list[dict[str, Any]]]:
+    """Remove sparse fixed bars and mark the following observation unhealthy.
+
+    The schedule is a precommitted index rule (every 37th interior bar), not a
+    response to returns or strategy performance.  It models a modest feed gap
+    without creating an unbounded alternate dataset.
+    """
+    output: dict[str, list[dict[str, Any]]] = {}
+    for symbol in sorted(bars_by_symbol):
+        result = []
+        for index, source in enumerate(bars_by_symbol[symbol]):
+            if index > 0 and index % 37 == 18:
+                continue
+            row = dict(source)
+            if index > 0 and (index - 1) % 37 == 18:
+                row["data_health"], row["data_coverage"] = "gapped", .89
+            result.append(row)
+        output[symbol] = result
+    return output
+
+
+def _compact_evidence(run: dict[str, Any]) -> dict[str, Any]:
+    """Keep evidence bounded; raw bars are never copied into a robustness artifact."""
+    return {"metrics": run["metrics"], "activity": {"signals": len(run["signals"]), "targets": len(run["targets"]),
+            "fills": len(run["fills"]), "closed_trades": len(run["closed_trades"]),
+            "rejected_fills": len(run["rejected_fills"])}, "warnings": run["warnings"],
+            "per_symbol": run.get("per_symbol", {})}
+
+
+def _development_coverage(bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window) -> float:
+    values = [float(row.get("data_coverage", 1.0))
+              for rows in bars_by_symbol.values() for row in rows
+              if iso(row["t"]) >= iso(window.start) and iso(row["t"]) < iso(window.end)]
+    return round(sum(values) / len(values), 10) if values else 0.0
+
+
+def _derived_warmup(features: list[dict[str, Any]]) -> int:
+    """Recompute the DSL warmup after a bounded parameter perturbation."""
+    lookbacks: dict[str, int] = {}
+    derived = 0
+    for node in features:
+        op = node["op"]
+        params = node.get("params", {})
+        if op in {"simple_return", "log_return", "rate_of_change"}:
+            own = int(params.get("lag", 1))
+        elif op == "gap_return":
+            own = 0
+        elif OPS[op].window:
+            own = int(params["window"]) + (1 if op in {"rolling_high_distance", "rolling_low_distance"} else 0)
+        else:
+            own = 0
+        lookbacks[node["id"]] = own
+        derived = max(derived, own + max((lookbacks[source] for source in node.get("inputs", [])), default=0))
+    return derived
+
+
+def _strategy_parameter_variants(dna: dict[str, Any]) -> list[dict[str, Any]]:
+    """Build two frozen, deterministic variants of the first tunable alpha parameter.
+
+    Variants are evidence only: the candidate DNA, hash and supervisor input
+    remain unchanged. Window/lag parameters are preferred over constants so
+    this measures rule sensitivity instead of merely rescaling exposure.
+    """
+    original = validate_strategy_dna(dna)
+    selected: tuple[int, str] | None = None
+    for key in ("window", "lag"):
+        selected = next(((index, key) for index, node in enumerate(dna["features"]) if key in node.get("params", {})), None)
+        if selected:
+            break
+    if selected is None:
+        return []
+    index, key = selected
+    current = int(dna["features"][index]["params"][key])
+    low = 2 if key == "window" else 1
+    candidates = [max(low, current - max(1, round(current * .10))), min(252, current + max(1, round(current * .10)))]
+    variants = []
+    for value in dict.fromkeys(candidates):
+        if value == current:
+            continue
+        document = deepcopy(dna)
+        document["features"][index]["params"][key] = value
+        document["warmup_bars"] = _derived_warmup(document["features"])
+        frozen = build_strategy_dna(document)
+        variants.append({"node_id": document["features"][index]["id"], "parameter": key,
+                         "original_value": current, "perturbed_value": value,
+                         "original_dna_hash": original.dna_hash, "variant": frozen})
+    return variants
+
+
+def development_evidence(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window, config: ExecutionConfigV2, base: dict[str, Any], stress: dict[str, Any]) -> dict[str, Any]:
+    """Precommitted, bounded development-only robustness evidence.
+
+    This runs only for a selected completed development fold.  It never edits
+    DNA and has no holdout branch, preventing the evidence from becoming a
+    tuning loop over sealed performance.
+    """
+    symbols = sorted(set(validate_strategy_dna(dna).scope["symbols"]) & set(bars_by_symbol))
+    target_sensitivity = []
+    for multiplier in (.90, 1.10):
+        run = simulate_v2(dna, bars_by_symbol, window, config, target_multiplier=multiplier)
+        target_sensitivity.append({"name": f"execution_target_scale_{multiplier:.2f}", "target_multiplier": multiplier,
+                              "frozen_dna_hash": validate_strategy_dna(dna).dna_hash, "result": _compact_evidence(run)})
+    parameter_perturbations = []
+    for variant in _strategy_parameter_variants(dna):
+        run = simulate_v2(variant["variant"], bars_by_symbol, window, config)
+        parameter_perturbations.append({key: value for key, value in variant.items() if key != "variant"}
+                                       | {"variant_dna_hash": variant["variant"]["dna_hash"], "result": _compact_evidence(run)})
+    groups = [symbols[::2], symbols[1::2]]
+    leave_group_out = []
+    for index, group in enumerate(groups):
+        remaining = {symbol: rows for symbol, rows in bars_by_symbol.items() if symbol not in group}
+        if not group or not remaining: continue
+        run = simulate_v2(dna, remaining, window, config)
+        leave_group_out.append({"group_id": f"deterministic-parity-{index + 1}", "excluded_symbols": group,
+                                "remaining_symbols": sorted(remaining), "result": _compact_evidence(run)})
+    gap = simulate_v2(dna, _deterministic_gap_bars(bars_by_symbol), window, config, gap_stress=True)
+    evidence = {"schema_version": ROBUSTNESS_EVIDENCE_VERSION, "scope": "development_only_final_fold",
+                "coverage": _development_coverage(bars_by_symbol, window), "critical_faults": [],
+                "base": _compact_evidence(base), "stress": _compact_evidence(stress),
+                "null_baseline": _flat_baseline(window, bars_by_symbol, config.initial_cash),
+                "permuted_return_null": _permuted_return_null(base, validate_strategy_dna(dna).dna_hash, window, config.initial_cash),
+                "execution_target_sensitivity": target_sensitivity, "parameter_perturbations": parameter_perturbations,
+                "leave_symbol_group_out": leave_group_out,
+                "moderate_gap_stress": {"adverse_open_gap_bps": 10, "gap_schedule": "drop_every_37th_interior_bar_mark_next_gapped", "result": _compact_evidence(gap)},
+                "protocol": {"candidate_dna_mutated": False, "adaptive_selection": False,
+                             "strategy_parameter_perturbations": "up to two deterministic frozen evidence-only variants of the first tunable alpha parameter",
+                             "max_symbol_groups": 2,
+                             "deterministic_symbol_order": symbols}, "hash": ""}
+    evidence["hash"] = digest({key: value for key, value in evidence.items() if key != "hash"})
+    return evidence
 
 
 def run_v2(payload: BacktestRequestV2, *, engine: dict[str, Any], input_hash: str | None = None) -> dict[str, Any]:
@@ -675,14 +888,41 @@ def run_v2(payload: BacktestRequestV2, *, engine: dict[str, Any], input_hash: st
         base_dna = strategy.dna
         windows = []
         for window in payload.windows:
-            ideal = simulate_v2(base_dna, canonical_bars, window, payload.execution, stress=False)
-            stress = simulate_v2(base_dna, canonical_bars, window, payload.execution, stress=True)
-            windows.append({"window_id": window.id, "ideal": ideal, "stress": stress,
+            if payload.phase == "development":
+                manifest, effective_window = fold_manifest(base_dna, canonical_bars, window, payload.execution)
+            else:
+                effective_window = window
+                manifest = {"schema_version": "fold-manifest-v1", "id": window.id,
+                            "requested": window.model_dump(), "effective": window.model_dump(),
+                            "warmup_bars": int(validate_strategy_dna(base_dna).warmup_bars) + payload.execution.warmup_safety_bars,
+                            "purge_bars": 0, "embargo_bars": 0,
+                            "state_reset": {"indicator": True, "target": True, "portfolio": True, "broker": True},
+                            "observations_before": len(_window_stamps(canonical_bars, window)),
+                            "observations_after": len(_window_stamps(canonical_bars, window)), "hash": ""}
+                manifest["hash"] = digest({key: value for key, value in manifest.items() if key != "hash"})
+            ideal = simulate_v2(base_dna, canonical_bars, effective_window, payload.execution, stress=False)
+            stress = simulate_v2(base_dna, canonical_bars, effective_window, payload.execution, stress=True)
+            windows.append({"window_id": window.id, "fold_manifest": manifest, "ideal": ideal, "stress": stress,
                             "approved_artifact": "stress", "metrics": stress["metrics"]})
+        if payload.phase == "development" and windows:
+            # Bounded by one final fold per strategy: 12 strategies x at most
+            # 40 symbols remains tractable while evidence stays comparable.
+            final = windows[-1]
+            final["development_evidence"] = development_evidence(base_dna, canonical_bars,
+                V2Window(**final["fold_manifest"]["effective"]), payload.execution, final["ideal"], final["stress"])
+        elif windows:
+            # Holdout only reports precommitted, non-adaptive base/stress facts.
+            sealed = windows[0]
+            sealed["holdout_evidence"] = {"schema_version": "holdout-evidence-v1", "adaptive_robustness": False,
+                "base": _compact_evidence(sealed["ideal"]), "stress": _compact_evidence(sealed["stress"]),
+                "degradation": {"net_return_delta": round(sealed["stress"]["metrics"]["return"] - sealed["ideal"]["metrics"]["return"], 10),
+                                "sharpe_delta": round(sealed["stress"]["metrics"]["daily_sharpe"] - sealed["ideal"]["metrics"]["daily_sharpe"], 10)},
+                "hash": ""}
+            sealed["holdout_evidence"]["hash"] = digest({key: value for key, value in sealed["holdout_evidence"].items() if key != "hash"})
         results.append({"strategy_id": strategy.id, "strategy_format": strategy.strategy_format, "dna_hash": strategy.dna_hash, "compiler": base_dna.get("compiler"), "windows": windows})
     response = {"schema_version": ARTIFACT_SCHEMA_VERSION, "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
                 "execution_contract_version": payload.execution.version,
-                "metrics_schema_version": "intraday-metrics-v2",
+                "metrics_schema_version": "intraday-metrics-v2", "robustness_evidence_version": ROBUSTNESS_EVIDENCE_VERSION,
                 "job_id": payload.job_id, "phase": payload.phase, "engine": engine,
                 "dataset": {"snapshot_id": payload.dataset.snapshot_id, "sha256": payload.dataset.sha256, "universe_id": payload.dataset.universe_id, "universe_sha256": payload.dataset.universe_sha256, "timeframe": payload.dataset.timeframe, "feed": payload.dataset.feed, "adjustment": payload.dataset.adjustment, "session": payload.dataset.session, "calendar_id": payload.dataset.calendar_id, "calendar_sha256": payload.dataset.calendar_sha256, "symbols": [item.model_dump() for item in sorted(payload.dataset.symbols, key=lambda x: x.symbol)]},
                 "input_hash": input_hash or digest(payload.model_dump(mode="json")), "results": results,

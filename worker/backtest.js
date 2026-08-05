@@ -307,11 +307,14 @@ function v2Windows(phase, barsBySymbol) {
   const { start, end } = timestampBounds(barsBySymbol);
   if (phase !== "development") return [{ id: "holdout", start, end }];
   const anchor = barsBySymbol[Object.keys(barsBySymbol).sort()[0]];
-  const size = Math.max(1, Math.floor(anchor.length * .68));
-  return [0.80, .90, 1].map((fraction, index) => {
-    const final = index === 2 ? anchor.length - 1 : Math.max(0, Math.floor(anchor.length * fraction) - 1);
-    return { id: `development-${index + 1}`, start: anchor[Math.max(0, final - size + 1)]?.t ?? start, end: exclusiveEnd(anchor, final) || end };
-  });
+  const ends = [.60, .80, 1].map((fraction, index) => index === 2
+    ? anchor.length - 1 : Math.max(0, Math.floor(anchor.length * fraction) - 1));
+  const rollingSize = Math.max(1, Math.floor(anchor.length * .45));
+  const anchored = ends.map((final, index) => ({ id: `anchored-${index + 1}`,
+    start: anchor[0]?.t ?? start, end: exclusiveEnd(anchor, final) || end }));
+  const rolling = ends.map((final, index) => ({ id: `rolling-${index + 1}`,
+    start: anchor[Math.max(0, final - rollingSize + 1)]?.t ?? start, end: exclusiveEnd(anchor, final) || end }));
+  return [...anchored, ...rolling];
 }
 
 /**

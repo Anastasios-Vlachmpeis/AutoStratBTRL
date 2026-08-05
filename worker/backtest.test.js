@@ -157,6 +157,8 @@ test("v2 payload canonicalizes symbols and bars, with a stable immutable identit
   assert.equal(first.payload.dataset.sha256, await sha256(first.payload.bars_by_symbol));
   assert.equal("asset" in first.payload.strategies[0], false);
   assert.equal(first.payload.windows.every((window) => window.start < window.end), true);
+  assert.deepEqual(first.payload.windows.map((window) => window.id),
+    ["anchored-1", "anchored-2", "anchored-3", "rolling-1", "rolling-2", "rolling-3"]);
 });
 
 test("v2 development payload physically excludes holdout and holdout mutation leaves it unchanged", async () => {

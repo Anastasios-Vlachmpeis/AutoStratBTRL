@@ -17,7 +17,7 @@ import {
 import { isAuthorized } from "./auth.js";
 import {
   aggregateMetrics, buildBacktestPayload, buildBacktestPayloadShardsV2, comparison, engineMode, frozenDna,
-  makeDataset, makeMultiSymbolDataset, normalizeMetrics, remoteEnabled, reviewDecision, sha256, validationDecision,
+  makeDataset, makeMultiSymbolDataset, normalizeMetrics, remoteEnabled, sha256,
 } from "./backtest.js";
 import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
 import { createRuntimeGateways } from "./gateways.js";
@@ -48,12 +48,84 @@ import {
   prepareEvolutionaryResearch,
 } from "./research.js";
 import { dispatchExpensiveFinalists, pauseResearch, resumeResearch } from "./research-registry.js";
+import {
+  authorizeSealedHoldout,
+  bindSealedHoldoutDispatch,
+  holdoutAuthorizationJob,
+  lineageIdentity,
+  recordSealedHoldoutOutcome,
+  recordSealedHoldoutServiceStatus,
+} from "./research-contract.js";
+import { createEvaluationPolicy, decideHoldout, evaluationPolicyHash, replaySupervisorDecision, selectValidationCapacity, superviseDevelopment } from "./evaluation-policy.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
 
 function json(payload, status = 200) {
   return new Response(JSON.stringify(payload), { status, headers: JSON_HEADERS });
+}
+
+// Plan 06 policy seam: the numerical evaluator may be replaced by the
+// versioned evaluation-policy module without changing burn-ledger semantics.
+function sealedHoldoutOutcome(strategy, validation, policy = createEvaluationPolicy()) {
+  const folds = strategy.backtest_runs?.development?.folds ?? [strategy.metrics ?? {}];
+  const decision = decideHoldout({ development_folds: folds, holdout: {
+    metrics: validation, per_symbol: Object.values(validation.per_symbol ?? {}),
+  }, policy });
+  return [decision.decision, decision.reasons.join(", ") || "sealed holdout evaluated against precommitted development bounds", decision];
+}
+
+function diverseHoldoutCandidates(candidates, policy = createEvaluationPolicy()) {
+  const capacity = selectValidationCapacity(candidates.map((strategy) => ({ strategy_id: strategy.id,
+    behavior_cluster: strategy.behavior_cluster ?? strategy.behavior_hash ?? `unclustered:${strategy.id}`,
+    decision: "supervisor_approved", evidence: { normalized: { robustness: strategy.metrics?.robustness ?? 0 } },
+  })), { policy });
+  return new Set(capacity.selected.map((item) => item.strategy_id));
+}
+
+function applyHoldoutCapacity(state, policy = createEvaluationPolicy()) {
+  const pool = state.strategies.filter((item) => item.state === "validation" || item.state === "capacity_wait");
+  const selected = diverseHoldoutCandidates(pool, policy);
+  for (const strategy of pool) {
+    if (selected.has(strategy.id)) {
+      strategy.state = "validation";
+      strategy.capacity_wait = null;
+    } else {
+      strategy.state = "capacity_wait";
+      strategy.capacity_wait = { reason: "bounded sealed-holdout pool", at: strategy.capacity_wait?.at ?? new Date().toISOString() };
+    }
+  }
+  return { selected, waiting: new Set(pool.filter((item) => !selected.has(item.id)).map((item) => item.id)) };
+}
+
+function developmentPolicyEvidence(state, strategy, strategyResult, foldResults, metrics, candidateFoldScores = null) {
+  const supplied = strategyResult?.windows?.findLast?.((window) => window.development_evidence)?.development_evidence
+    ?? [...(strategyResult?.windows ?? [])].reverse().find((window) => window.development_evidence)?.development_evidence
+    ?? strategyResult?.development_evidence ?? {};
+  const objectValues = (value) => Array.isArray(value) ? value : Object.values(value ?? {});
+  const folds = foldResults.map((result) => ({ metrics: result.metrics ?? result }));
+  const per_symbol = objectValues(supplied.per_symbol ?? supplied.base?.per_symbol ?? metrics.per_symbol);
+  const regimes = objectValues(supplied.regimes ?? supplied.base?.metrics?.regimes ?? supplied.base?.regimes ?? metrics.regimes);
+  const perturbations = [...(supplied.parameter_perturbations ?? []), ...(supplied.execution_target_sensitivity ?? [])]
+    .map((item) => item.result ?? item);
+  const nulls = [supplied.null_baseline, supplied.permuted_return_null].filter(Boolean);
+  const behavior = { target_series: foldResults.flatMap((result) => result.targets ?? result.exposure_curve ?? []),
+    closed_trades: foldResults.flatMap((result) => result.closed_trades ?? []) };
+  const archive_members = state.strategies.filter((item) => item.id !== strategy.id && ((item.backtests ?? 0) > 0 || item.metrics))
+    .map((item) => ({ strategy_id: item.id, target_series: item.metrics?.exposure_curve ?? [], trades: item.metrics?.trade_events ?? [] }));
+  return {
+    strategy_id: strategy.id, folds, stress: supplied.stress ? [supplied.stress] : foldResults.map((result) => ({ metrics: result.metrics ?? result })),
+    per_symbol, regimes, perturbations, nulls, behavior, archive_members, coverage: supplied.coverage ?? 0,
+    critical_faults: supplied.critical_faults ?? [],
+    concentration: supplied.concentration ?? supplied.base?.metrics?.concentration
+      ?? supplied.base?.metrics?.symbol_concentration_hhi ?? metrics.concentration ?? 0,
+    complexity: supplied.complexity ?? Math.min(1, (strategy.strategy_dna?.features?.length ?? 1) / 64),
+    closed_trades: supplied.closed_trades ?? supplied.base?.activity?.closed_trades ?? metrics.trades,
+    candidate_fold_scores: supplied.candidate_fold_scores ?? candidateFoldScores
+      ?? { [strategy.id]: folds.map((fold) => Number(fold.metrics.bar_sharpe ?? fold.metrics.sharpe ?? 0)) },
+    protocol: supplied.protocol ?? null, protocol_hash: supplied.hash ?? null,
+    trial_registry_count: state.research?.total_trials ?? 0,
+  };
 }
 
 function labStub(env) {
@@ -562,7 +634,10 @@ export class AxiomLab extends DurableObject {
     const calendar = state.marketData?.calendar ?? {};
     const dataset = await makeMultiSymbolDataset(available, {
       timeframe: "5Min",
-      max_bars: options.max_bars ?? 20_000,
+      // Three regular-session years are roughly 59k five-minute bars per
+      // symbol. Keep the complete immutable snapshot; do not silently turn it
+      // into a recent-history sample before the 75/25 seal.
+      max_bars: options.max_bars ?? 60_000,
       development_ratio: .75,
       metadata: {
         universe: { id: universe.id, sha256: universe.sha256 },
@@ -572,6 +647,11 @@ export class AxiomLab extends DurableObject {
         adjustment: "all", session: "regular", data_revision: "canonical-five-minute-v1",
       },
     });
+    const shortHistory = dataset.manifest.symbols.filter((item) => {
+      const span = new Date(item.end).getTime() - new Date(item.start).getTime();
+      return !Number.isFinite(span) || span < 1090 * 24 * 60 * 60 * 1000;
+    }).map((item) => item.symbol);
+    if (shortHistory.length) throw new Error(`Plan 06 requires the sealed three-year snapshot; incomplete symbols: ${shortHistory.join(", ")}`);
     const insufficient = dataset.manifest.symbols.filter((item) => item.split_index < 300
       || item.bar_count - item.split_index < 100).map((item) => item.symbol);
     if (insufficient.length) throw new Error(`Insufficient sealed five-minute history: ${insufficient.join(", ")}`);
@@ -616,12 +696,13 @@ export class AxiomLab extends DurableObject {
     return candidates.length > 0;
   }
 
-  async invokeBacktrader(state, phase, strategies, dataset) {
+  async invokeBacktrader(state, phase, strategies, dataset, options = {}) {
     const bars = await this.controlPlane.artifacts.getDatasetSlice(dataset.id, phase === "holdout" ? "holdout" : "development");
     if (!(Array.isArray(bars) ? bars.length : Object.keys(bars ?? {}).length)) throw new Error(`Sealed ${phase} dataset is unavailable`);
     if (dataset.schema_version === 2) {
       const sealed = { ...dataset, [phase === "holdout" ? "holdout" : "development"]: bars };
       const shards = await buildBacktestPayloadShardsV2(phase, strategies, sealed);
+      if (options.beforeDispatch) await options.beforeDispatch(shards.map((shard) => ({ job_id: shard.job_id, payload: shard.payload })));
       const responses = [];
       for (const shard of shards) {
         const response = await this.gateways.research.run(shard.payload);
@@ -652,6 +733,7 @@ export class AxiomLab extends DurableObject {
     }
     const built = await buildBacktestPayload(phase, strategies, dataset, bars);
     const { payload, config_hash, dna, slice_hash: sliceHash } = built;
+    if (options.beforeDispatch) await options.beforeDispatch([{ job_id: payload.job_id, payload }]);
     const job_id = payload.job_id;
     const response = await this.gateways.research.run(payload);
     if (response.job_id !== job_id || response.phase !== phase) throw new Error("Backtest service provenance does not match the request");
@@ -688,13 +770,39 @@ export class AxiomLab extends DurableObject {
           error instanceof Error ? error.message : String(error)));
       }
     }
+    if (phase === "holdout") {
+      for (const strategy of strategies.filter((item) => allowed.has(item.id))) {
+        try {
+          const dataset = state.datasets?.[strategy.dataset_id];
+          if (!dataset) throw new Error("sealed dataset is missing");
+          const lineage_id = lineageIdentity(strategy);
+          const policy_hash = evaluationPolicyHash(strategy.supervision?.policy ?? createEvaluationPolicy());
+          const job_id = holdoutAuthorizationJob({ lineage_id, dataset_id: dataset.id,
+            dataset_hash: dataset.holdout_hash ?? dataset.sha256, dna_hash: strategy.dna_hash,
+            configuration_hash: policy_hash });
+          const { authorization, retry } = authorizeSealedHoldout(state, {
+            lineage_id, job_id, dataset_id: dataset.id, dataset_hash: dataset.holdout_hash ?? dataset.sha256,
+            dna_hash: strategy.dna_hash, configuration_hash: policy_hash,
+          });
+          strategy.holdout_authorization = { authorization_id: authorization.authorization_id, job_id,
+            lineage_id, policy_hash, retry, authorized_at: authorization.authorized_at };
+          recordSealedHoldoutServiceStatus(state, { lineage_id, authorization_id: authorization.authorization_id, status: "dispatched" });
+        } catch (error) {
+          allowed.delete(strategy.id);
+          this.record(state, "BACKTEST_ERROR", `${strategy.name} holdout blocked`, error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
     return strategies.filter((strategy) => allowed.has(strategy.id));
   }
 
   async reviewRemote(state, env, barsByFormat) {
     reworkCandidates(state);
     const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
-    if (!candidates.length) return this.record(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
+    if (!candidates.length) {
+      applyHoldoutCapacity(state);
+      return this.record(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
+    }
     const byDataset = new Map();
     let multiDataset;
     for (const strategy of candidates) {
@@ -703,7 +811,7 @@ export class AxiomLab extends DurableObject {
         const barsBySymbol = isDsl ? barsByFormat.dsl : barsByFormat.legacy;
         const dataset = isDsl
           ? (strategy.dataset_id ? state.datasets?.[strategy.dataset_id]
-            : (multiDataset ??= await this.sealMultiDataset(state, barsBySymbol, { max_bars: 20_000 })))
+            : (multiDataset ??= await this.sealMultiDataset(state, barsBySymbol, { max_bars: 60_000 })))
           : await this.sealDataset(state, strategy.asset, barsBySymbol[strategy.asset] ?? [],
             { timeframe: "1Day", max_bars: 600 });
         if (!dataset) throw new Error("sealed strategy dataset is unavailable");
@@ -715,8 +823,8 @@ export class AxiomLab extends DurableObject {
         const group = byDataset.get(groupKey) ?? { dataset, strategies: [] };
         group.strategies.push(strategy); byDataset.set(groupKey, group);
       } catch (error) {
-        strategy.rework = { ...(strategy.rework ?? {}), source_stage: "data", diagnosis: error.message, attempt: strategy.rework?.attempt ?? 0, max_attempts: 3, history: strategy.rework?.history ?? [] };
-        strategy.state = "rework"; this.record(state, "BACKTEST_ERROR", `${strategy.name} data unavailable`, error.message);
+        strategy.service_status = { phase: "development", status: "data_error", error: error.message, at: new Date().toISOString() };
+        this.record(state, "BACKTEST_ERROR", `${strategy.name} data unavailable`, error.message);
       }
     }
     for (const { dataset, strategies } of byDataset.values()) {
@@ -724,6 +832,12 @@ export class AxiomLab extends DurableObject {
         const authorized = this.authorizeResearchDispatch(state, strategies, "development");
         if (!authorized.length) continue;
         const run = await this.invokeBacktrader(state, "development", authorized, dataset);
+        const candidateFoldScores = Object.fromEntries((run.response.results ?? []).map((candidate) => [
+          String(candidate.strategy_id ?? candidate.id), (candidate.windows ?? [candidate]).map((window) => {
+            const result = window.stress ?? window.ideal ?? window;
+            return Number(result?.metrics?.bar_sharpe ?? result?.metrics?.sharpe ?? 0);
+          }),
+        ]));
         for (const strategy of authorized) {
           const strategyResult = run.response.results.find((item) => String(item.strategy_id ?? item.id) === strategy.id);
           if (strategyResult?.dna_hash !== strategy.dna_hash) throw new Error(`service returned mismatched DNA for ${strategy.id}`);
@@ -737,25 +851,42 @@ export class AxiomLab extends DurableObject {
           const results = windows.map((window) => window.stress ?? window.ideal ?? window);
           if (!results.length) throw new Error(`service returned no result for ${strategy.id}`);
           const metrics = aggregateMetrics(results);
+          const policy = createEvaluationPolicy(); const policy_hash = evaluationPolicyHash(policy);
+          const evidence = developmentPolicyEvidence(state, strategy, strategyResult, results, metrics, candidateFoldScores);
+          const trial_registry = Number(state.research?.total_trials ?? 0);
+          const supervision = superviseDevelopment({ evidence, trial_registry, policy });
+          const replay = replaySupervisorDecision({ policy, policy_hash, artifacts: { evidence, trial_registry, status: supervision.status } });
+          const supervisionArtifact = { policy, policy_hash, evidence, decision: supervision.decision, reasons: supervision.reasons,
+            status: supervision.status, replay: { evidence_protocol_hash: evidence.protocol_hash,
+              replay_hash: replay.replay_hash, decision: replay.supervision.decision } };
           const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "development", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
             input_hash: run.response.input_hash, service_result_hash: run.response.result_hash,
-            warnings: run.response.warnings ?? [] }, { strategy: strategyResult, metrics });
+            warnings: run.response.warnings ?? [] }, { strategy: strategyResult, metrics, supervision: supervisionArtifact });
           strategy.backtest_runs ??= {}; strategy.backtest_runs.development = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: run.response.engine ?? { name: "backtrader" }, input_hash: run.response.input_hash,
-            service_result_hash: run.response.result_hash, result_hash: await sha256({ results, metrics }), completed_at: new Date().toISOString() };
+            service_result_hash: run.response.result_hash, result_hash: await sha256({ results, metrics }),
+            folds: windows.map((window, index) => ({ window_id: window.window_id ?? `fold-${index + 1}`,
+              fold_manifest: window.fold_manifest ?? null, metrics: (window.stress ?? window.ideal ?? window).metrics ?? {} })),
+            completed_at: new Date().toISOString() };
           strategy.metrics = metrics; strategy.backtests = (strategy.backtests ?? 0) + results.length;
-          const [next, reason] = reviewDecision(metrics); strategy.state = next;
+          strategy.supervision = supervisionArtifact;
+          strategy.backtest_runs.development.supervision = strategy.supervision;
+          const [next, reason] = supervision.decision === "supervisor_approved" ? ["validation", "frozen development policy approved"]
+            : supervision.decision === "development_reject" ? ["development_reject", `development policy rejected: ${supervision.reasons.join(", ")}`]
+              : supervision.decision === "development_rework" ? ["rework", `development policy requires rework: ${supervision.reasons.join(", ")}`]
+                : [strategy.state, `development service status: ${supervision.status}`];
+          strategy.state = next;
+          strategy.service_status = { phase: "development", status: supervision.status, at: new Date().toISOString() };
           if (next === "rework") strategy.rework = { ...(strategy.rework ?? {}), source_stage: "development", diagnosis: reason, attempt: strategy.rework?.attempt ?? 0, max_attempts: 3, history: strategy.rework?.history ?? [] };
-          this.record(state, next === "validation" ? "PROMOTE" : next === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${next}`, reason);
+          this.record(state, next === "validation" ? "SUPERVISOR_APPROVED" : next === "development_reject" ? "DEVELOPMENT_REJECT" : "DEVELOPMENT_REWORK", `${strategy.name} → ${next}`, reason);
         }
       } catch (error) {
-        for (const strategy of strategies) this.record(state, "BACKTEST_ERROR", `${strategy.name} review deferred`, error.message);
+        for (const strategy of strategies) {
+          strategy.service_status = { phase: "development", status: "infrastructure_error", error: error.message, at: new Date().toISOString() };
+          this.record(state, "BACKTEST_ERROR", `${strategy.name} review deferred`, error.message);
+        }
       }
     }
-    const validation = state.strategies.filter((item) => item.state === "validation"
-      || (item.state === "rework" && item.rework?.source_stage === "capacity"))
-      .sort((a, b) => (b.metrics?.score ?? 0) - (a.metrics?.score ?? 0));
-    validation.slice(0, 3).forEach((strategy) => { strategy.state = "validation"; });
-    validation.slice(3).forEach((strategy) => { strategy.state = "rework"; strategy.rework = { ...(strategy.rework ?? {}), source_stage: "capacity", diagnosis: "waiting for validation capacity", attempt: strategy.rework?.attempt ?? 0, max_attempts: 3, history: strategy.rework?.history ?? [] }; });
+    applyHoldoutCapacity(state);
     state.marketClock += 8;
   }
 
@@ -772,7 +903,24 @@ export class AxiomLab extends DurableObject {
     for (const { dataset, strategies } of groups.values()) try {
       const authorized = this.authorizeResearchDispatch(state, strategies, "holdout");
       if (!authorized.length) continue;
-      const run = await this.invokeBacktrader(state, "holdout", authorized, dataset);
+      // First durable checkpoint: the lineage is burned before the sealed
+      // slice is read. A process restart can only retry this reservation.
+      await this.controlPlane.saveState(state);
+      const run = await this.invokeBacktrader(state, "holdout", authorized, dataset, {
+        beforeDispatch: async (jobs) => {
+          const wire = await Promise.all(jobs.map(async (job) => ({ job_id: job.job_id,
+            payload_hash: await sha256(job.payload), strategy_ids: (job.payload?.strategies ?? []).map((item) => String(item.id)) })));
+          for (const strategy of authorized) {
+            const strategyJobs = wire.filter((job) => !job.strategy_ids.length || job.strategy_ids.includes(String(strategy.id)))
+              .map(({ job_id, payload_hash }) => ({ job_id, payload_hash }));
+            bindSealedHoldoutDispatch(state, { lineage_id: lineageIdentity(strategy),
+              authorization_id: strategy.holdout_authorization?.authorization_id, jobs: strategyJobs });
+          }
+          // Second durable checkpoint: exact shard payloads are now frozen,
+          // immediately before the first outbound service request.
+          await this.controlPlane.saveState(state);
+        },
+      });
       for (const strategy of authorized) {
         const strategyResult = run.response.results.find((item) => String(item.strategy_id ?? item.id) === strategy.id);
         if (strategyResult?.dna_hash !== strategy.dna_hash) throw new Error(`service returned mismatched DNA for ${strategy.id}`);
@@ -786,17 +934,40 @@ export class AxiomLab extends DurableObject {
         const result = window?.stress ?? window?.ideal ?? window;
         if (!result) throw new Error(`service returned no result for ${strategy.id}`);
         const validation = normalizeMetrics(result);
+        const policy = strategy.supervision?.policy ?? createEvaluationPolicy();
+        const policy_hash = evaluationPolicyHash(policy);
+        if (strategy.holdout_authorization?.policy_hash !== policy_hash) throw new Error(`sealed policy changed for ${strategy.id}`);
+        const [outcome, reason, holdoutDecision] = sealedHoldoutOutcome(strategy, validation, policy);
         const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "holdout", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
           input_hash: run.response.input_hash, service_result_hash: run.response.result_hash,
-          warnings: run.response.warnings ?? [] }, { strategy: strategyResult, metrics: validation });
+          warnings: run.response.warnings ?? [] }, { strategy: strategyResult, metrics: validation,
+          holdout_decision: { policy_hash, ...holdoutDecision } });
         strategy.backtest_runs ??= {}; strategy.backtest_runs.holdout = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: run.response.engine ?? { name: "backtrader" }, input_hash: run.response.input_hash,
-          service_result_hash: run.response.result_hash, result_hash: await sha256({ result, validation }), completed_at: new Date().toISOString() };
+          service_result_hash: run.response.result_hash, result_hash: await sha256({ result, validation, policy_hash, holdoutDecision }),
+          policy_hash, decision: holdoutDecision, completed_at: new Date().toISOString() };
         strategy.validation = validation; strategy.backtests = (strategy.backtests ?? 0) + 1;
-        const [next, reason] = validationDecision(strategy.metrics, validation); strategy.state = next;
-        if (next === "rework") strategy.rework = { ...(strategy.rework ?? {}), source_stage: "validation", diagnosis: reason, attempt: strategy.rework?.attempt ?? 0, max_attempts: 3, history: strategy.rework?.history ?? [] };
-        this.record(state, next === "released" ? "RELEASE" : next === "dropped" ? "DROP" : "REWORK", `${strategy.name} → ${next}`, reason);
+        const authorization = strategy.holdout_authorization;
+        recordSealedHoldoutOutcome(state, { lineage_id: lineageIdentity(strategy), authorization_id: authorization?.authorization_id,
+          outcome, result_hash: strategy.backtest_runs.holdout.result_hash, artifact_id: artifactId });
+        strategy.holdout_outcome = outcome;
+        strategy.state = outcome;
+        strategy.service_status = { phase: "holdout", status: "ok", at: new Date().toISOString() };
+        this.record(state, outcome === "incubation" ? "INCUBATE" : outcome === "holdout_reject" ? "HOLDOUT_REJECT" : "INCONCLUSIVE", `${strategy.name} → ${outcome}`, reason);
       }
-    } catch (error) { for (const strategy of strategies) this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, error.message); }
+    } catch (error) {
+      for (const strategy of strategies) {
+        const ledgerRecord = state.research?.holdout_burn_ledger?.by_lineage?.[lineageIdentity(strategy)];
+        if (ledgerRecord?.outcome) continue;
+        if (strategy.holdout_authorization && !ledgerRecord?.outcome) recordSealedHoldoutServiceStatus(state, {
+          lineage_id: lineageIdentity(strategy), authorization_id: strategy.holdout_authorization.authorization_id,
+          status: "error", error: error.message,
+        });
+        // Preserve validation/capacity state: service trouble is not quality evidence.
+        strategy.service_status = { phase: "holdout", status: "infrastructure_error", error: error.message, at: new Date().toISOString() };
+        this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, error.message);
+      }
+    }
+    applyHoldoutCapacity(state);
     if (options.advanceClock !== false) state.marketClock += 5;
   }
 

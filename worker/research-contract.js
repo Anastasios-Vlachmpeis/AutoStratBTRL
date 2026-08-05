@@ -1,7 +1,7 @@
 import { COMPILER_MANIFEST, hashCanonical } from "./dsl.js";
 import { INITIAL_UNIVERSE_ID, INITIAL_UNIVERSE_SHA256 } from "./universe.js";
 
-export const RESEARCH_SCHEMA_VERSION = 1;
+export const RESEARCH_SCHEMA_VERSION = 2;
 export const RESEARCH_ENGINE_VERSION = "1.0.0";
 export const RESEARCH_LIMITS = Object.freeze({
   sampled_genomes: 128,
@@ -76,6 +76,9 @@ export function emptyResearchState() {
     trials: {},
     population: [],
     novelty_archive: { dna_hashes: [], behavior_hashes: [] },
+    // Private, append-only provenance for the one permitted final-holdout
+    // opening of a lineage.  It deliberately contains no bars or metrics.
+    holdout_burn_ledger: { by_lineage: {}, authorization_index: {}, total_burns: 0 },
     budget: { session_date: null, trials: 0, expensive_dispatches: 0, runtime_ms: 0, estimated_cost_usd: 0, telemetry_status: "healthy" },
   };
 }
@@ -91,7 +94,110 @@ export function ensureResearchState(state) {
   state.research.novelty_archive.dna_hashes ??= [];
   state.research.novelty_archive.behavior_hashes ??= [];
   state.research.budget ??= emptyResearchState().budget;
+  state.research.holdout_burn_ledger ??= emptyResearchState().holdout_burn_ledger;
+  state.research.holdout_burn_ledger.by_lineage ??= {};
+  // Canonical records live only under by_lineage.  The secondary map is an
+  // ID→lineage index, so JSON persistence cannot produce divergent copies.
+  state.research.holdout_burn_ledger.authorization_index ??= {};
+  for (const [lineage, record] of Object.entries(state.research.holdout_burn_ledger.by_lineage)) {
+    if (record?.authorization_id) state.research.holdout_burn_ledger.authorization_index[record.authorization_id] = lineage;
+  }
+  delete state.research.holdout_burn_ledger.authorizations;
+  state.research.holdout_burn_ledger.total_burns ??= 0;
   return state.research;
+}
+
+/** A root lineage survives ordinary reproduction and development-only rework. */
+export function lineageIdentity(strategy) {
+  const explicit = strategy?.lineage_id ?? strategy?.root_lineage_id;
+  if (explicit) return String(explicit);
+  const dna = strategy?.strategy_dna;
+  return String(dna?.lineage?.root_strategy_id ?? dna?.lineage?.parent_strategy_id ?? dna?.strategy_id ?? strategy?.id ?? "");
+}
+
+export function holdoutAuthorizationJob({ lineage_id, dataset_id, dataset_hash, dna_hash, configuration_hash = null }) {
+  if (!lineage_id || !dataset_id || !dna_hash) throw new Error("Sealed holdout authorization requires lineage, dataset, and DNA identity");
+  return `HOJ-${hashCanonical({ phase: "holdout", lineage_id: String(lineage_id), dataset_id: String(dataset_id),
+    dataset_hash: String(dataset_hash ?? ""), dna_hash: String(dna_hash), configuration_hash: configuration_hash ?? null }).slice(0, 32)}`;
+}
+
+/**
+ * Burn the final holdout before remote dispatch. A duplicate retry must carry
+ * exactly the same frozen job identity; any other opening is rejected.
+ */
+export function authorizeSealedHoldout(state, request = {}) {
+  const research = ensureResearchState(state);
+  const lineage_id = String(request.lineage_id ?? "");
+  const job_id = String(request.job_id ?? holdoutAuthorizationJob(request));
+  const dataset_id = String(request.dataset_id ?? "");
+  const dna_hash = String(request.dna_hash ?? "");
+  if (!lineage_id || !dataset_id || !dna_hash || !job_id) throw new Error("Invalid sealed holdout authorization request");
+  const ledger = research.holdout_burn_ledger;
+  const current = ledger.by_lineage[lineage_id];
+  if (current) {
+    if (current.outcome) throw new Error("Final holdout already has a terminal outcome for this lineage");
+    if (current.job_id !== job_id || current.dataset_id !== dataset_id || current.dna_hash !== dna_hash) {
+      throw new Error("Final holdout is already burned for this lineage");
+    }
+    return { authorization: current, created: false, retry: true };
+  }
+  const authorization_id = `HOLD-${hashCanonical({ lineage_id, job_id, dataset_id, dna_hash,
+    dataset_hash: request.dataset_hash ?? null, configuration_hash: request.configuration_hash ?? null }).slice(0, 32)}`;
+  const authorization = {
+    authorization_id, lineage_id, job_id, dataset_id, dataset_hash: request.dataset_hash ?? null,
+    dna_hash, configuration_hash: request.configuration_hash ?? null,
+    authorized_at: new Date().toISOString(), service_status: "authorized", outcome: null,
+    completed_at: null, result_hash: null, artifact_id: null,
+  };
+  ledger.by_lineage[lineage_id] = authorization;
+  ledger.authorization_index[authorization_id] = lineage_id;
+  ledger.total_burns += 1;
+  return { authorization, created: true, retry: false };
+}
+
+export function recordSealedHoldoutServiceStatus(state, { lineage_id, authorization_id, status, error = null } = {}) {
+  const research = ensureResearchState(state);
+  const ledger = research.holdout_burn_ledger;
+  const authorization = ledger.by_lineage[String(lineage_id ?? "")]
+    ?? ledger.by_lineage[ledger.authorization_index[String(authorization_id ?? "")]];
+  if (!authorization) throw new Error("Unknown sealed holdout authorization");
+  authorization.service_status = String(status ?? "error");
+  authorization.last_error = error ? String(error) : null;
+  authorization.last_service_at = new Date().toISOString();
+  return authorization;
+}
+
+/** Bind the burned reservation to the exact wire payload(s) before sending. */
+export function bindSealedHoldoutDispatch(state, { lineage_id, authorization_id, jobs = [] } = {}) {
+  const authorization = recordSealedHoldoutServiceStatus(state, { lineage_id, authorization_id, status: "bound" });
+  const normalized = [...jobs].map((job) => ({ job_id: String(job.job_id), payload_hash: String(job.payload_hash) }))
+    .sort((a, b) => a.job_id.localeCompare(b.job_id));
+  if (!normalized.length || normalized.some((job) => !job.job_id || !job.payload_hash)) throw new Error("Exact holdout dispatch binding is required");
+  const prior = authorization.wire_jobs;
+  if (prior && hashCanonical(prior) !== hashCanonical(normalized)) throw new Error("Sealed holdout retry changed its wire payload");
+  authorization.wire_jobs ??= normalized;
+  authorization.bound_at ??= new Date().toISOString();
+  return authorization;
+}
+
+export function recordSealedHoldoutOutcome(state, { lineage_id, authorization_id, outcome, result_hash = null, artifact_id = null } = {}) {
+  if (!["incubation", "holdout_reject", "inconclusive"].includes(outcome)) throw new Error("Invalid sealed holdout outcome");
+  const research = ensureResearchState(state);
+  const ledger = research.holdout_burn_ledger;
+  const authorization = ledger.by_lineage[String(lineage_id ?? "")]
+    ?? ledger.by_lineage[ledger.authorization_index[String(authorization_id ?? "")]];
+  if (!authorization) throw new Error("Unknown sealed holdout authorization");
+  if (!authorization.wire_jobs?.length) throw new Error("Sealed holdout outcome requires an exact dispatch binding");
+  if (authorization.outcome) {
+    if (authorization.outcome === outcome && authorization.result_hash === result_hash && authorization.artifact_id === artifact_id) return authorization;
+    throw new Error("Final holdout already has a terminal outcome for this lineage");
+  }
+  recordSealedHoldoutServiceStatus(state, { lineage_id, authorization_id, status: "complete" });
+  authorization.outcome = outcome;
+  authorization.result_hash = result_hash;
+  authorization.artifact_id = artifact_id;
+  authorization.completed_at = new Date().toISOString();
+  return authorization;
 }
 
 export function publicResearchState(research) {
@@ -107,6 +213,11 @@ export function publicResearchState(research) {
     total_expensive_dispatches: Number(value.total_expensive_dispatches ?? 0),
     population_size: value.population?.length ?? 0,
     novelty_archive_size: value.novelty_archive?.dna_hashes?.length ?? 0,
+    holdout: {
+      total_burns: Number(value.holdout_burn_ledger?.total_burns ?? 0),
+      completed: Object.values(value.holdout_burn_ledger?.by_lineage ?? {}).filter((item) => item.outcome).length,
+      pending: Object.values(value.holdout_burn_ledger?.by_lineage ?? {}).filter((item) => !item.outcome).length,
+    },
     budget: { ...(value.budget ?? {}) },
     latest_cohort: latest ? {
       cohort_id: latest.cohort_id,

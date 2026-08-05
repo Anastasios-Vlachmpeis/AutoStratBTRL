@@ -3,10 +3,16 @@ import test from "node:test";
 
 import {
   RESEARCH_LIMITS,
+  authorizeSealedHoldout,
+  bindSealedHoldoutDispatch,
   deterministicTrialId,
   emptyResearchState,
+  holdoutAuthorizationJob,
+  lineageIdentity,
   normalizeResearchConfig,
   publicResearchState,
+  recordSealedHoldoutOutcome,
+  recordSealedHoldoutServiceStatus,
   researchContract,
 } from "./research-contract.js";
 
@@ -48,4 +54,34 @@ test("public research state contains summaries rather than trial DNA", () => {
   assert.equal(value.total_trials, 0);
   assert.equal(value.latest_cohort.finalists, 2);
   assert.equal("trials" in value, false);
+});
+
+test("sealed holdout burn ledger permits only one deterministic retry per lineage", () => {
+  const state = { research: emptyResearchState() };
+  const request = { lineage_id: "DSL1-root", dataset_id: "sealed-v2", dataset_hash: DATASET_HASH,
+    dna_hash: "d".repeat(64), configuration_hash: "c".repeat(64) };
+  const job_id = holdoutAuthorizationJob(request);
+  const first = authorizeSealedHoldout(state, { ...request, job_id });
+  const retry = authorizeSealedHoldout(state, { ...request, job_id });
+  assert.equal(first.created, true);
+  assert.equal(retry.retry, true);
+  assert.equal(retry.authorization.authorization_id, first.authorization.authorization_id);
+  bindSealedHoldoutDispatch(state, { lineage_id: request.lineage_id, jobs: [{ job_id: "bt-1", payload_hash: "p".repeat(64) }] });
+  const restored = JSON.parse(JSON.stringify(state));
+  bindSealedHoldoutDispatch(restored, { lineage_id: request.lineage_id, jobs: [{ job_id: "bt-1", payload_hash: "p".repeat(64) }] });
+  assert.throws(() => bindSealedHoldoutDispatch(state, { lineage_id: request.lineage_id, jobs: [{ job_id: "bt-2", payload_hash: "p".repeat(64) }] }), /changed/);
+  assert.throws(() => authorizeSealedHoldout(state, { ...request, job_id: "different-job" }), /already burned/);
+  recordSealedHoldoutServiceStatus(state, { lineage_id: request.lineage_id, status: "error", error: "timeout" });
+  assert.equal(state.research.holdout_burn_ledger.by_lineage[request.lineage_id].outcome, null);
+  recordSealedHoldoutOutcome(state, { lineage_id: request.lineage_id, outcome: "inconclusive", result_hash: "r".repeat(64) });
+  assert.throws(() => recordSealedHoldoutOutcome(state, { lineage_id: request.lineage_id, outcome: "incubation", result_hash: "x".repeat(64) }), /terminal outcome/);
+  assert.throws(() => authorizeSealedHoldout(state, { ...request, job_id }), /terminal outcome/);
+  const publicValue = publicResearchState(state.research);
+  assert.equal(publicValue.holdout.total_burns, 1);
+  assert.equal("holdout_burn_ledger" in publicValue, false);
+});
+
+test("lineage identity prefers a preserved root across rework children", () => {
+  assert.equal(lineageIdentity({ id: "child", lineage_id: "root" }), "root");
+  assert.equal(lineageIdentity({ id: "child", strategy_dna: { strategy_id: "DNA-child", lineage: { parent_strategy_id: "DNA-root" } } }), "DNA-root");
 });

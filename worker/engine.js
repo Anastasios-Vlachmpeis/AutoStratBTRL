@@ -1,13 +1,13 @@
 /** Deterministic strategy generation, backtesting, and lifecycle supervision. */
 
-import { evaluateLatestTarget, evaluateStrategyTargets } from "./dsl.js";
+import { buildStrategyDNA, evaluateLatestTarget, evaluateStrategyTargets } from "./dsl.js";
 import { DSL_FAMILIES, buildGeneratedStrategyDNA } from "./dsl-generation.js";
 import { emptyResearchState, ensureResearchState, publicResearchState } from "./research-contract.js";
 import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
 
 export const REGIMES = ["Expansion", "Compression", "Stress", "Recovery"];
 export const ASSETS = [...INITIAL_UNIVERSE_SYMBOLS];
-export const CURRENT_SCHEMA_VERSION = 9;
+export const CURRENT_SCHEMA_VERSION = 10;
 
 const NAMES = [
   "Orion Pulse", "Kestrel Drift", "Helix Break", "Cobalt Revert",
@@ -353,10 +353,23 @@ function newStrategy(state, parent = null, mutateParent = true) {
   }
   const name = `${NAMES[(state.nextId - 1) % NAMES.length]} ${String.fromCharCode(65 + state.cycle % 26)}${state.nextId % 10}`;
   const generation = parent ? parent.generation + 1 : 1;
-  const built = buildGeneratedStrategyDNA({
-    family: archetype, params, seed: state.seed + (state.nextId - 1) * 103 + state.cycle,
-    trialId: strategyId, generation, parentStrategyId: parent?.strategy_dna?.strategy_id ?? null,
-  });
+  const creationSeed = state.seed + (state.nextId - 1) * 103 + state.cycle;
+  let built;
+  if (parent && !DSL_FAMILIES.includes(archetype)) {
+    const document = clone(parent.strategy_dna);
+    delete document.strategy_id; delete document.dna_hash;
+    document.lineage = { trial_id: strategyId, generation,
+      parent_strategy_id: parent.strategy_dna.strategy_id, creation_seed: creationSeed >>> 0 };
+    const tunable = document.features.filter((node) => node.op === "constant"
+      && Number.isFinite(Number(node.params?.value)) && ![0, 1, -1].includes(Number(node.params.value)));
+    const node = tunable[creationSeed % Math.max(tunable.length, 1)];
+    if (node) node.params.value = round(Number(node.params.value) * (generation % 2 ? .88 : 1.12), 8);
+    else document.target.position_size = round(clamp(Number(document.target.position_size) * .90, .1, 1), 3);
+    built = { dna: buildStrategyDNA(document), explanation: parent.explanation };
+  } else {
+    built = buildGeneratedStrategyDNA({ family: archetype, params, seed: creationSeed,
+      trialId: strategyId, generation, parentStrategyId: parent?.strategy_dna?.strategy_id ?? null });
+  }
   return {
     id: strategyId,
     name,
@@ -366,6 +379,7 @@ function newStrategy(state, parent = null, mutateParent = true) {
     state: "generated",
     generation,
     parent: parent?.id ?? null,
+    lineage_id: parent?.lineage_id ?? parent?.strategy_dna?.lineage?.strategy_id ?? built.dna.strategy_id,
     backtests: 0,
     metrics: null,
     validation: null,
@@ -407,6 +421,10 @@ export function registerResearchFinalists(state, finalists, cohort) {
     const id = `AX-${String(state.cycle).padStart(2, "0")}-${String(state.nextId).padStart(3, "0")}`;
     state.nextId += 1;
     const dna = clone(trial.dna);
+    const parentStrategy = dna.lineage.parent_strategy_id
+      ? state.strategies.find((item) => item.id === dna.lineage.parent_strategy_id
+        || item.strategy_dna?.strategy_id === dna.lineage.parent_strategy_id)
+      : null;
     const symbols = dna.scope.symbols;
     const assetIndex = Number.parseInt(dna.dna_hash.slice(0, 8), 16) % symbols.length;
     return {
@@ -418,11 +436,13 @@ export function registerResearchFinalists(state, finalists, cohort) {
       state: "generated",
       generation: Number(dna.lineage.generation),
       parent: null,
+      lineage_id: parentStrategy?.lineage_id ?? dna.lineage.parent_strategy_id ?? dna.strategy_id,
       trial_id: trial.trial_id,
       cohort_id: cohort.cohort_id,
       selection_rank: Number(trial.selection_rank ?? index + 1),
       fitness: clone(trial.fitness ?? null),
       behavior_hash: trial.behavior_hash ?? null,
+      behavior_cluster: trial.behavior_cluster ?? null,
       backtests: 0,
       metrics: null,
       validation: null,
@@ -517,22 +537,34 @@ function mutateDevelopmentDNA(state, parent) {
   const attempt = (parent.rework?.attempt ?? 0) + 1;
   const diagnosis = diagnoseDevelopment(parent);
   const child = newStrategy(state, parent, false);
-  const before = child.params[diagnosis.key];
-  const numericId = Number(parent.id.split("-").at(-1));
-  const factor = diagnosis.factor ?? ((numericId + attempt) % 2 === 0 ? 0.84 : 1.16);
-  let after;
-  if (Number.isInteger(before)) {
-    after = Math.max(3, Math.round(before * factor));
-    if (diagnosis.key === "slow") after = Math.max(child.params.fast + 3, after);
+  let change;
+  if (!DSL_FAMILIES.includes(parent.archetype)) {
+    const parentConstants = new Map(parent.strategy_dna.features.filter((node) => node.op === "constant")
+      .map((node) => [node.id, Number(node.params.value)]));
+    const changed = child.strategy_dna.features.find((node) => node.op === "constant"
+      && parentConstants.has(node.id) && parentConstants.get(node.id) !== Number(node.params.value));
+    change = changed
+      ? { parameter: `feature:${changed.id}.value`, from: parentConstants.get(changed.id), to: Number(changed.params.value) }
+      : { parameter: "target.position_size", from: Number(parent.strategy_dna.target.position_size), to: Number(child.strategy_dna.target.position_size) };
+    child.params = researchDisplayParams(child.strategy_dna);
   } else {
-    after = round(before * factor, 4);
-    if (diagnosis.key === "position_size") after = round(clamp(after, 0.20, 1), 2);
-    else after = Math.max(0.0001, after);
+    const before = child.params[diagnosis.key];
+    const numericId = Number(parent.id.split("-").at(-1));
+    const factor = diagnosis.factor ?? ((numericId + attempt) % 2 === 0 ? 0.84 : 1.16);
+    let after;
+    if (Number.isInteger(before)) {
+      after = Math.max(3, Math.round(before * factor));
+      if (diagnosis.key === "slow") after = Math.max(child.params.fast + 3, after);
+    } else {
+      after = round(before * factor, 4);
+      if (diagnosis.key === "position_size") after = round(clamp(after, 0.20, 1), 2);
+      else after = Math.max(0.0001, after);
+    }
+    if (after === before) after = Number.isInteger(before) ? before + 1 : round(before * 0.9, 4);
+    child.params[diagnosis.key] = after;
+    refreshStrategyDNA(child, parent);
+    change = { parameter: diagnosis.key, from: before, to: after };
   }
-  if (after === before) after = Number.isInteger(before) ? before + 1 : round(before * 0.9, 4);
-  child.params[diagnosis.key] = after;
-  refreshStrategyDNA(child, parent);
-  const change = { parameter: diagnosis.key, from: before, to: after };
   const history = [
     ...(parent.rework?.history ?? []),
     {
@@ -561,7 +593,7 @@ function mutateDevelopmentDNA(state, parent) {
   };
   parent.state = "superseded";
   parent.rework = { ...(parent.rework ?? emptyRework()), diagnosis: diagnosis.text };
-  event(state, "REWORK", `${parent.name} → ${child.name}`, `${diagnosis.text} · attempt ${attempt}/${MAX_REWORK_ATTEMPTS} · ${diagnosis.key} ${before} → ${after}`);
+  event(state, "REWORK", `${parent.name} → ${child.name}`, `${diagnosis.text} · attempt ${attempt}/${MAX_REWORK_ATTEMPTS} · ${change.parameter} ${change.from} → ${change.to}`);
   return child;
 }
 
@@ -585,20 +617,21 @@ function finalizeValidationPool(state, pool) {
   const unique = [...new Map(pool.map((strategy) => [strategy.id, strategy])).values()]
     .sort((left, right) => right.metrics.score - left.metrics.score);
   unique.slice(0, 3).forEach((strategy) => {
-    const wasWaiting = strategy.state === "rework";
+    const wasWaiting = strategy.state === "capacity_wait";
     strategy.state = "validation";
     if (wasWaiting) event(state, "PROMOTE", `${strategy.name} → validation`, "Validation capacity opened; frozen DNA moved forward without retuning.");
   });
   unique.slice(3).forEach((strategy) => {
-    queueRework(strategy, "capacity", "waiting for an available validation slot; DNA remains frozen");
-    event(state, "REWORK", `${strategy.name} held`, "Validation cap reached; frozen DNA retained without retuning.");
+    strategy.state = "capacity_wait";
+    strategy.capacity_wait = { reason: "bounded sealed-holdout pool", at: new Date().toISOString() };
+    event(state, "CAPACITY_WAIT", `${strategy.name} held`, "Validation cap reached; frozen DNA retained without retuning.");
   });
 }
 
 export function reviewCandidates(state, bootstrap = false) {
   reworkCandidates(state);
   const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
-  const validationPool = state.strategies.filter((item) => item.state === "rework" && item.rework?.source_stage === "capacity");
+  const validationPool = state.strategies.filter((item) => item.state === "capacity_wait");
   if (!candidates.length && !validationPool.length) {
     if (!bootstrap) event(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
     return;
@@ -639,7 +672,7 @@ function marketRegimes(prices) {
 export function reviewCandidatesWithBars(state, barsBySymbol, dslBarsBySymbol = barsBySymbol) {
   reworkCandidates(state);
   const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
-  const validationPool = state.strategies.filter((item) => item.state === "rework" && item.rework?.source_stage === "capacity");
+  const validationPool = state.strategies.filter((item) => item.state === "capacity_wait");
   if (!candidates.length && !validationPool.length) {
     event(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
     return;
@@ -982,6 +1015,7 @@ export function migrateState(state) {
     engine_family: strategy.engine_family ?? null,
     dataset_id: strategy.dataset_id ?? null,
     backtest_runs: strategy.backtest_runs ?? {},
+    lineage_id: strategy.lineage_id ?? strategy.strategy_dna?.lineage?.parent_strategy_id ?? strategy.strategy_dna?.strategy_id ?? strategy.id,
   }));
   migrated.datasets ??= {};
   migrated.backtestArtifacts ??= {};
@@ -1011,9 +1045,9 @@ export function snapshot(state) {
     summary: {
       generated: strategies.filter((item) => item.state === "generated").length,
       testing: strategies.filter((item) => item.state === "rework").length,
-      validation: strategies.filter((item) => item.state === "validation").length,
+      validation: strategies.filter((item) => item.state === "validation" || item.state === "capacity_wait").length,
       released: released.length,
-      dropped: strategies.filter((item) => item.state === "dropped").length,
+      dropped: strategies.filter((item) => ["development_reject", "holdout_reject", "inconclusive", "dropped"].includes(item.state)).length,
       average_score: round(averageScore, 1),
       capital: round(capital, 2),
     },
