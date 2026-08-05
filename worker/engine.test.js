@@ -332,6 +332,20 @@ test("schema 9 migration initializes sealed holdout provenance without exposing 
   assert.equal("holdout_burn_ledger" in snapshot(migrated).research, false);
 });
 
+test("schema 10 migration initializes durable orchestration and strategy lifecycle state", () => {
+  const state = createDemoState();
+  generateBatch(state, 1);
+  state.schemaVersion = 10;
+  delete state.orchestration;
+  delete state.strategies[0].lifecycle;
+  const migrated = migrateState(state);
+  assert.equal(migrated.orchestration.schema_version, 1);
+  assert.equal(migrated.orchestration.mode, "observe");
+  assert.equal(migrated.strategies[0].lifecycle.quality.state, "screened");
+  assert.equal(migrated.strategies[0].lifecycle.operational.state, "ready");
+  assert.equal(snapshot(migrated).orchestration.controls.kill_switch, false);
+});
+
 test("only evolutionary finalists enter the lifecycle and private trials stay out of snapshots", () => {
   const fixture = createDemoState();
   generateBatch(fixture, 1);

@@ -23,9 +23,10 @@
     }
   },
   "triggers": {
-    "crons": ["0 * * * *"]
+    "crons": ["* * * * *", "0 * * * *"]
   },
   "vars": {
+    "ORCHESTRATION_MODE": "observe",
     "CONTROL_PLANE_MODE": "legacy",
     "MARKET_DATA_MODE": "off",
     "ALPACA_DATA_FEED": "iex",

@@ -16,7 +16,7 @@ import {
 } from "./engine.js";
 import { isAuthorized } from "./auth.js";
 import {
-  aggregateMetrics, buildBacktestPayload, buildBacktestPayloadShardsV2, comparison, engineMode, frozenDna,
+  aggregateMetrics, buildBacktestPayload, buildBacktestPayloadShardsV2, comparison, engineMode, EXECUTION_CONFIG_V2, frozenDna,
   makeDataset, makeMultiSymbolDataset, normalizeMetrics, remoteEnabled, sha256,
 } from "./backtest.js";
 import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
@@ -57,6 +57,10 @@ import {
   recordSealedHoldoutServiceStatus,
 } from "./research-contract.js";
 import { createEvaluationPolicy, decideHoldout, evaluationPolicyHash, replaySupervisorDecision, selectValidationCapacity, superviseDevelopment } from "./evaluation-policy.js";
+import { applyOrchestrationCommand, createOrchestrationCommand, ensureOrchestrationState, executionAllowed, orchestrationMode } from "./orchestration.js";
+import { OrchestrationStore } from "./orchestration-store.js";
+import { planMarketEvent, planOrchestrationTick } from "./orchestration-schedule.js";
+import { applyLifecycleCommand, bindLifecycleProvenance, initialLifecycle, transitionId } from "./lifecycle.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
@@ -90,9 +94,21 @@ function applyHoldoutCapacity(state, policy = createEvaluationPolicy()) {
     if (selected.has(strategy.id)) {
       strategy.state = "validation";
       strategy.capacity_wait = null;
+      if (["supervisor_approved", "capacity_wait"].includes(strategy.lifecycle?.quality?.state)) {
+        transitionStrategyLifecycle(strategy, "sealed_validation", { trigger: "validation_capacity",
+          artifact_id: strategy.backtest_runs?.development?.artifact_id ?? "artifact:development",
+          event_id: `capacity:${strategy.cohort_id ?? "uncohorted"}`, reason_code: "validation_capacity_selected",
+          explanation: "Frozen candidate admitted to the bounded sealed-validation pool." });
+      }
     } else {
       strategy.state = "capacity_wait";
       strategy.capacity_wait = { reason: "bounded sealed-holdout pool", at: strategy.capacity_wait?.at ?? new Date().toISOString() };
+      if (strategy.lifecycle?.quality?.state === "supervisor_approved") {
+        transitionStrategyLifecycle(strategy, "capacity_wait", { trigger: "validation_capacity",
+          artifact_id: strategy.backtest_runs?.development?.artifact_id ?? "artifact:development",
+          event_id: `capacity:${strategy.cohort_id ?? "uncohorted"}`, reason_code: "validation_capacity_wait",
+          explanation: "Candidate remains frozen while waiting for sealed-validation capacity." });
+      }
     }
   }
   return { selected, waiting: new Set(pool.filter((item) => !selected.has(item.id)).map((item) => item.id)) };
@@ -128,6 +144,42 @@ function developmentPolicyEvidence(state, strategy, strategyResult, foldResults,
   };
 }
 
+const ZERO_HASH = "0".repeat(64);
+
+function lifecycleProvenance(strategy, dataset, configHash, policyHash) {
+  return { dna_hash: /^[a-f0-9]{64}$/.test(strategy.dna_hash ?? "") ? strategy.dna_hash : ZERO_HASH,
+    dataset_hash: dataset?.sha256 ?? dataset?.development_hash ?? ZERO_HASH,
+    configuration_hash: configHash ?? ZERO_HASH, policy_hash: policyHash };
+}
+
+function ensureLifecycleForEvaluation(strategy, dataset, configHash, policyHash, timestamp = new Date().toISOString()) {
+  const provenance = lifecycleProvenance(strategy, dataset, configHash, policyHash);
+  strategy.lifecycle ??= structuredClone(initialLifecycle({ strategy_id: strategy.id, ...provenance, timestamp }));
+  if (["proposed", "compiled", "screened"].includes(strategy.lifecycle.quality.state)) {
+    strategy.lifecycle = structuredClone(bindLifecycleProvenance(strategy.lifecycle, provenance, timestamp));
+  }
+  return strategy.lifecycle;
+}
+
+function transitionStrategyLifecycle(strategy, target, { kind = "quality", artifact_id = "artifact:none",
+  event_id = "event:none", trigger = "system", reason_code = target, explanation = target,
+  correlation_id = `${strategy.id}:${target}`, timestamp = new Date().toISOString(), actor = "system" } = {}) {
+  const lifecycle = strategy.lifecycle;
+  if (!lifecycle) throw new Error(`Lifecycle provenance is not bound for ${strategy.id}`);
+  const branch = lifecycle[kind];
+  const value = { schema_version: 1, strategy_id: strategy.id, kind,
+    expected: kind === "quality" ? { quality_state: branch.state, version: branch.version }
+      : { operational_state: branch.state, version: branch.version }, target, trigger, artifact_id, event_id,
+    policy_hash: lifecycle.provenance.policy_hash, actor, timestamp, reason_code, explanation, correlation_id,
+    provenance: { dna_hash: lifecycle.provenance.dna_hash, dataset_hash: lifecycle.provenance.dataset_hash,
+      configuration_hash: lifecycle.provenance.configuration_hash } };
+  value.transition_id = transitionId(value);
+  const applied = applyLifecycleCommand(lifecycle, value);
+  if (applied.status !== "applied") throw new Error(`Lifecycle transition rejected for ${strategy.id}: ${applied.code}`);
+  strategy.lifecycle = structuredClone(applied.state);
+  return applied.transition;
+}
+
 function labStub(env) {
   return env.AXIOM_LAB.get(env.AXIOM_LAB.idFromName(SINGLETON_NAME));
 }
@@ -157,6 +209,13 @@ async function tickMarketData(env, stub, scheduledTime = Date.now()) {
   }));
 }
 
+async function tickOrchestration(stub, scheduledTime = Date.now()) {
+  return stub.fetch(new Request("https://axiom.internal/internal/orchestration/tick", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ scheduled_at: new Date(scheduledTime).toISOString() }),
+  }));
+}
+
 async function stateFrom(stub) {
   const response = await stub.fetch(new Request("https://axiom.internal/api/state"));
   if (!response.ok) throw new Error("Unable to load supervisor state");
@@ -165,6 +224,8 @@ async function stateFrom(stub) {
 
 async function synchronizeAlpaca(env, stub, bucket, orderBucket = bucket) {
   const appState = await stateFrom(stub);
+  const forceFlatten = Boolean(appState.orchestration?.controls?.flatten_requested);
+  if (!executionAllowed(appState) && !forceFlatten) return Response.json({ ok: true, skipped: true, reason: appState.orchestration?.controls?.kill_switch ? "kill_switch" : "execution_paused" });
   const cycle = await createRuntimeGateways(env).broker.buildCycle(appState, bucket, orderBucket);
   return stub.fetch(new Request("https://axiom.internal/internal/alpaca-cycle", {
     method: "POST",
@@ -297,10 +358,14 @@ export class AxiomLab extends DurableObject {
     this.controlPlane = createControlPlaneRuntime(ctx.storage, env, SINGLETON_NAME);
     this.gateways = createRuntimeGateways(env);
     this.marketDataRepository = new MarketDataRepository(ctx.storage, env, SINGLETON_NAME);
+    this.orchestrationStore = env.AXIOM_DB ? new OrchestrationStore(env.AXIOM_DB, {
+      queue: env.AXIOM_JOBS, artifacts: env.AXIOM_ARTIFACTS,
+    }) : null;
     this.ready = ctx.blockConcurrencyWhile(async () => {
       const existing = await this.controlPlane.loadState();
       if (!existing) {
         const initial = createDemoState();
+        ensureOrchestrationState(initial, orchestrationMode(env));
         initial.schemaVersion = CURRENT_SCHEMA_VERSION; initial.datasets = {}; initial.backtestArtifacts = {};
         const universe = await ensureMarketDataState(initial, env);
         await this.marketDataRepository.saveUniverse(universe);
@@ -314,21 +379,35 @@ export class AxiomLab extends DurableObject {
           migrated.backtestArtifacts ??= {};
         }
         const universe = await ensureMarketDataState(migrated, env);
+        ensureOrchestrationState(migrated, orchestrationMode(env));
         await this.marketDataRepository.saveUniverse(universe);
         await this.controlPlane.saveState(migrated);
+      }
+      if (orchestrationMode(env) === "autonomous" && this.ctx.storage.setAlarm) {
+        await this.ctx.storage.setAlarm(Date.now() + 60_000);
       }
     });
   }
 
   async load() {
     await this.ready;
-    return this.controlPlane.loadState();
+    const state = await this.controlPlane.loadState();
+    if (state && this.orchestrationStore) {
+      const authoritative = await this.orchestrationStore.loadLifecycle(SINGLETON_NAME, "__workspace__");
+      if (authoritative && authoritative.version > Number(state.orchestration?.version ?? -1)) {
+        state.orchestration = authoritative.snapshot;
+        ensureOrchestrationState(state, orchestrationMode(this.env));
+        await this.controlPlane.saveState(state);
+      }
+    }
+    return state;
   }
 
   async save(state) {
     state.schemaVersion = Math.max(state.schemaVersion ?? 1, CURRENT_SCHEMA_VERSION);
     state.datasets ??= {};
     state.backtestArtifacts ??= {};
+    ensureOrchestrationState(state, orchestrationMode(this.env));
     await ensureMarketDataState(state, this.env);
     await this.controlPlane.saveState(state);
     return json(snapshot(state));
@@ -339,6 +418,154 @@ export class AxiomLab extends DurableObject {
     state.events.unshift({ id: `BT-${now.getTime()}-${Math.random().toString(36).slice(2, 7)}`,
       kind: type, type, title, detail, time: now.toISOString().slice(11, 16), at: now.toISOString() });
     state.events = state.events.slice(0, 28);
+  }
+
+  async executeOrchestrationActions(state, command, result) {
+    const orchestration = ensureOrchestrationState(state, orchestrationMode(this.env));
+    orchestration.executed_command_ids ??= [];
+    if (orchestration.executed_command_ids.includes(command.command_id)) return { duplicate: true };
+    for (const action of result.actions ?? []) {
+      if (action.kind === "watchdog.repair" && this.orchestrationStore) {
+        await this.orchestrationStore.repairExpiredLeases();
+        await this.orchestrationStore.dispatchOutbox();
+      } else if (action.kind === "broker.cancel_unsafe_orders") {
+        if (!this.env.ALPACA_API_KEY || !this.env.ALPACA_API_SECRET) {
+          orchestration.incidents.push({ kind: "broker_blocked", action: action.kind, command_id: command.command_id,
+            reason: "alpaca_credentials_missing", opened_at: command.timestamp });
+        } else {
+          const cancellation = await this.gateways.broker.cancelManagedOpenOrders();
+          this.record(state, "BROKER_SAFETY", "Managed open orders cancelled",
+            `${cancellation.cancelled.length} framework orders cancelled; ${cancellation.skipped_manual_orders} manual orders untouched`);
+        }
+      } else if (action.kind === "broker.verify_flat") {
+        if (!this.env.ALPACA_API_KEY || !this.env.ALPACA_API_SECRET) {
+          orchestration.incidents.push({ kind: "broker_blocked", action: action.kind, command_id: command.command_id,
+            reason: "alpaca_credentials_missing", opened_at: command.timestamp });
+        } else {
+          const overview = await this.gateways.broker.accountOverview();
+          const managed = new Set(state.alpaca?.managed_symbols ?? []);
+          const remaining = overview.positions.filter((position) => managed.has(position.symbol));
+          if (remaining.length) orchestration.incidents.push({ kind: "broker_not_flat", action: action.kind,
+            command_id: command.command_id, symbols: remaining.map((position) => position.symbol), opened_at: command.timestamp });
+          else orchestration.controls.flatten_requested = false;
+        }
+      } else if (action.kind === "broker.flatten_all") {
+        this.record(state, "BROKER_SAFETY", "Managed flatten requested", "The next reconciliation cycle targets every framework-managed position to zero.");
+      } else if (action.kind === "operational.retry") {
+        const strategy = state.strategies.find((item) => item.id === action.strategy_id);
+        if (!strategy?.lifecycle) throw new Error(`Unknown lifecycle strategy ${action.strategy_id}`);
+        if (["retry_wait", "service_unavailable", "data_blocked", "broker_blocked", "dead_lettered"].includes(strategy.lifecycle.operational.state)) {
+          transitionStrategyLifecycle(strategy, "queued", { kind: "operational", trigger: "operator_retry",
+            artifact_id: `operator-command:${command.command_id}`, event_id: command.command_id,
+            reason_code: "operator_retry", explanation: command.payload?.reason ?? "Operational work retried by operator.",
+            correlation_id: command.correlation_id, timestamp: command.timestamp, actor: command.actor });
+        }
+      } else if (["strategy.pause", "strategy.resume", "strategy.quarantine", "strategy.retire"].includes(action.kind)) {
+        const strategy = state.strategies.find((item) => item.id === action.strategy_id);
+        if (!strategy) throw new Error(`Unknown strategy ${action.strategy_id}`);
+        const lifecycleTarget = action.kind === "strategy.pause" ? "operator_paused"
+          : action.kind === "strategy.resume" ? strategy.lifecycle?.paused_from
+            : action.kind === "strategy.quarantine" ? "quarantined" : "retired";
+        if (!lifecycleTarget) throw new Error(`Strategy ${strategy.id} has no paused lifecycle to resume`);
+        if (strategy.lifecycle && strategy.lifecycle.quality.state !== lifecycleTarget) {
+          transitionStrategyLifecycle(strategy, lifecycleTarget, { trigger: "operator_command",
+            artifact_id: `operator-command:${command.command_id}`, event_id: command.command_id,
+            reason_code: action.kind, explanation: command.payload?.reason ?? `${lifecycleTarget} by operator`,
+            correlation_id: command.correlation_id, timestamp: command.timestamp, actor: command.actor });
+        }
+        if (action.kind === "strategy.pause") {
+          strategy.operator_pause = { previous_state: strategy.state, command_id: command.command_id, at: command.timestamp };
+          strategy.state = "operator_paused";
+        } else if (action.kind === "strategy.resume") {
+          strategy.state = strategy.operator_pause?.previous_state ?? "generated";
+          strategy.operator_pause = null;
+        } else strategy.state = action.kind === "strategy.quarantine" ? "watch" : "dropped";
+        strategy.operator_action = { kind: action.kind, command_id: command.command_id, at: command.timestamp };
+      } else if (action.kind === "approval.persist" && this.orchestrationStore) {
+        const approval = action.approval;
+        await this.orchestrationStore.recordConfigApproval({ approvalId: command.command_id,
+          workspaceId: SINGLETON_NAME, configKey: approval.kind, configHash: approval.subject_hash,
+          approvedBy: approval.actor });
+      } else if (action.kind === "workspace.reset_nonproduction") {
+        if (String(this.env.ENVIRONMENT ?? "development").toLowerCase() === "production") {
+          throw new Error("Workspace reset is disabled in production");
+        }
+        await this.clearWorkspaceStorage();
+        const fresh = createDemoState();
+        ensureOrchestrationState(fresh, orchestrationMode(this.env));
+        for (const key of Object.keys(state)) delete state[key];
+        Object.assign(state, fresh);
+        return { duplicate: false, reset: true };
+      } else if (action.kind === "pipeline.validate") {
+        await this.validateRemote(state, this.env, { advanceClock: false, silent: true });
+      } else if (action.kind === "market.reconcile_session" && state.marketData?.calendar?.id) {
+        const calendar = await this.marketDataRepository.loadCalendar(state.marketData.calendar.id);
+        if (calendar) await this.reconcileLiveSession(state, new Date(command.timestamp), calendar);
+      } else if (["pipeline.review", "research.run_cohort", "research.schedule"].includes(action.kind)) {
+        // Plan 08 supplies the partition-streaming executor. Until then this is
+        // an operational data block, never a strategy-quality outcome.
+        orchestration.incidents.push({ kind: "data_blocked", action: action.kind, command_id: command.command_id,
+          reason: "sealed_partition_executor_pending", opened_at: command.timestamp });
+      }
+    }
+    orchestration.executed_command_ids.push(command.command_id);
+    orchestration.executed_command_ids = orchestration.executed_command_ids.slice(-2048);
+    return { duplicate: false };
+  }
+
+  async submitOrchestrationCommand(state, command, { forceDirect = false } = {}) {
+    const current = ensureOrchestrationState(state, orchestrationMode(this.env));
+    const applied = applyOrchestrationCommand(current, command);
+    if (applied.blocked) return { ...applied.result, queued: false, idempotent: false };
+    if (!applied.idempotent) {
+      if (!forceDirect && orchestrationMode(this.env) === "autonomous" && this.orchestrationStore && this.env.AXIOM_JOBS) {
+        await this.orchestrationStore.persistLifecycle({ workspaceId: SINGLETON_NAME,
+          strategyId: "__workspace__", expectedVersion: current.version,
+          state: applied.result.status, snapshot: applied.state,
+          command: { id: command.command_id, idempotencyKey: command.command_id, kind: command.kind, payload: command },
+          transition: { id: `OTR-${command.command_id.slice(4)}`, details: { actor: command.actor, correlation_id: command.correlation_id } },
+          fromState: current.latest_command_id ? "active" : "ready",
+          outbox: { kind: "orchestration.command.v1", payload: { workspace_id: SINGLETON_NAME, command } },
+        });
+        state.orchestration = applied.state;
+        await this.controlPlane.saveState(state);
+        await this.orchestrationStore.dispatchOutbox();
+        return { ...applied.result, queued: true };
+      }
+      state.orchestration = applied.state;
+    }
+    await this.executeOrchestrationActions(state, command, applied.result);
+    return { ...applied.result, queued: false, idempotent: applied.idempotent };
+  }
+
+  async planAndSubmitOrchestration(state, timestamp, events = []) {
+    const orchestration = ensureOrchestrationState(state, orchestrationMode(this.env));
+    if (orchestration.controls.ingestion_paused) return [];
+    const intents = [];
+    for (const event of events) intents.push(...planMarketEvent(event, { completed_intent_ids: orchestration.completed_intent_ids }));
+    const calendar = state.marketData?.calendar?.id
+      ? await this.marketDataRepository.loadCalendar(state.marketData.calendar.id) : null;
+    if (calendar) intents.push(...planOrchestrationTick({ calendar, now: timestamp,
+      completed_intent_ids: orchestration.completed_intent_ids }).intents);
+    const results = [];
+    for (const intent of intents) {
+      const command = createOrchestrationCommand({ kind: intent.kind, intent_id: intent.id, actor: "system",
+        timestamp: new Date(timestamp).toISOString(), correlation_id: intent.id, payload: intent.data });
+      results.push(await this.submitOrchestrationCommand(state, command));
+    }
+    return results;
+  }
+
+  async alarm() {
+    const state = await this.load();
+    const timestamp = new Date().toISOString();
+    await this.planAndSubmitOrchestration(state, timestamp, []);
+    if (this.orchestrationStore) {
+      await this.orchestrationStore.repairExpiredLeases();
+      if (this.env.AXIOM_JOBS) await this.orchestrationStore.dispatchOutbox();
+    }
+    await this.controlPlane.saveState(state);
+    if (orchestrationMode(this.env) === "autonomous" && this.ctx.storage.setAlarm) await this.ctx.storage.setAlarm(Date.now() + 60_000);
   }
 
   async clearWorkspaceStorage() {
@@ -544,6 +771,9 @@ export class AxiomLab extends DurableObject {
       revision_events: Number(state.marketData.live?.revision_events ?? 0)
         + result.events.filter((event) => event.retroactive).length,
       latest_event_count: result.events.length,
+      latest_events: result.events.map((event) => ({ id: event.id, event_id: event.id,
+        bucket_close: event.bucket_close, actionable: event.actionable, retroactive: event.retroactive,
+        content_hash: event.content_hash })).slice(-80),
     };
     if (previousStatus && previousStatus !== result.health.status) {
       this.record(state, result.health.status === "healthy" ? "MARKET_DATA" : "MARKET_DATA_ERROR",
@@ -824,6 +1054,9 @@ export class AxiomLab extends DurableObject {
         group.strategies.push(strategy); byDataset.set(groupKey, group);
       } catch (error) {
         strategy.service_status = { phase: "development", status: "data_error", error: error.message, at: new Date().toISOString() };
+        if (strategy.lifecycle?.operational?.state === "ready") transitionStrategyLifecycle(strategy, "data_blocked", {
+          kind: "operational", trigger: "development_data", artifact_id: "artifact:data-unavailable",
+          event_id: `data-error:${strategy.id}`, reason_code: "data_blocked", explanation: error.message });
         this.record(state, "BACKTEST_ERROR", `${strategy.name} data unavailable`, error.message);
       }
     }
@@ -831,6 +1064,22 @@ export class AxiomLab extends DurableObject {
       try {
         const authorized = this.authorizeResearchDispatch(state, strategies, "development");
         if (!authorized.length) continue;
+        const policyHash = evaluationPolicyHash(createEvaluationPolicy());
+        const configurationHash = await sha256(EXECUTION_CONFIG_V2);
+        for (const strategy of authorized) {
+          ensureLifecycleForEvaluation(strategy, dataset, configurationHash, policyHash);
+          if (strategy.lifecycle.quality.state === "screened") transitionStrategyLifecycle(strategy, "development", {
+            trigger: "development_dispatch", artifact_id: `dataset:${dataset.id}`, event_id: `dispatch:${strategy.id}`,
+            reason_code: "development_started", explanation: "Frozen DNA entered development evaluation." });
+          if (["ready", "retry_wait", "service_unavailable", "data_blocked"].includes(strategy.lifecycle.operational.state)) {
+            transitionStrategyLifecycle(strategy, "queued", { kind: "operational", trigger: "development_dispatch",
+              artifact_id: `dataset:${dataset.id}`, event_id: `dispatch:${strategy.id}`, reason_code: "backtest_queued",
+              explanation: "Development backtest queued." });
+          }
+          if (strategy.lifecycle.operational.state === "queued") transitionStrategyLifecycle(strategy, "running", {
+            kind: "operational", trigger: "development_dispatch", artifact_id: `dataset:${dataset.id}`,
+            event_id: `dispatch:${strategy.id}`, reason_code: "backtest_running", explanation: "Development backtest is running." });
+        }
         const run = await this.invokeBacktrader(state, "development", authorized, dataset);
         const candidateFoldScores = Object.fromEntries((run.response.results ?? []).map((candidate) => [
           String(candidate.strategy_id ?? candidate.id), (candidate.windows ?? [candidate]).map((window) => {
@@ -876,12 +1125,25 @@ export class AxiomLab extends DurableObject {
                 : [strategy.state, `development service status: ${supervision.status}`];
           strategy.state = next;
           strategy.service_status = { phase: "development", status: supervision.status, at: new Date().toISOString() };
+          if (strategy.lifecycle?.operational?.state === "running") transitionStrategyLifecycle(strategy, "ready", {
+            kind: "operational", trigger: "development_result", artifact_id: artifactId,
+            event_id: run.job_id, reason_code: "backtest_complete", explanation: "Development artifact verified and persisted." });
+          if (strategy.lifecycle?.quality?.state === "development") {
+            const lifecycleTarget = supervision.decision === "supervisor_approved" ? "supervisor_approved"
+              : supervision.decision === "development_reject" ? "development_reject" : "superseded";
+            transitionStrategyLifecycle(strategy, lifecycleTarget, { trigger: "supervisor_decision", artifact_id: artifactId,
+              event_id: run.job_id, reason_code: supervision.decision,
+              explanation: reason, correlation_id: `${strategy.id}:${policy_hash}:${artifactId}` });
+          }
           if (next === "rework") strategy.rework = { ...(strategy.rework ?? {}), source_stage: "development", diagnosis: reason, attempt: strategy.rework?.attempt ?? 0, max_attempts: 3, history: strategy.rework?.history ?? [] };
           this.record(state, next === "validation" ? "SUPERVISOR_APPROVED" : next === "development_reject" ? "DEVELOPMENT_REJECT" : "DEVELOPMENT_REWORK", `${strategy.name} → ${next}`, reason);
         }
       } catch (error) {
         for (const strategy of strategies) {
           strategy.service_status = { phase: "development", status: "infrastructure_error", error: error.message, at: new Date().toISOString() };
+          if (strategy.lifecycle?.operational?.state === "running") transitionStrategyLifecycle(strategy, "retry_wait", {
+            kind: "operational", trigger: "development_error", artifact_id: `dataset:${dataset.id}`,
+            event_id: `error:${strategy.id}`, reason_code: "service_unavailable", explanation: error.message });
           this.record(state, "BACKTEST_ERROR", `${strategy.name} review deferred`, error.message);
         }
       }
@@ -903,6 +1165,16 @@ export class AxiomLab extends DurableObject {
     for (const { dataset, strategies } of groups.values()) try {
       const authorized = this.authorizeResearchDispatch(state, strategies, "holdout");
       if (!authorized.length) continue;
+      for (const strategy of authorized) {
+        if (["ready", "retry_wait", "service_unavailable", "data_blocked"].includes(strategy.lifecycle?.operational?.state)) {
+          transitionStrategyLifecycle(strategy, "queued", { kind: "operational", trigger: "sealed_validation_dispatch",
+            artifact_id: strategy.backtest_runs?.development?.artifact_id ?? `dataset:${dataset.id}`,
+            event_id: `holdout:${strategy.id}`, reason_code: "holdout_queued", explanation: "Sealed validation queued." });
+        }
+        if (strategy.lifecycle?.operational?.state === "queued") transitionStrategyLifecycle(strategy, "running", {
+          kind: "operational", trigger: "sealed_validation_dispatch", artifact_id: `dataset:${dataset.id}`,
+          event_id: `holdout:${strategy.id}`, reason_code: "holdout_running", explanation: "Sealed validation is running." });
+      }
       // First durable checkpoint: the lineage is burned before the sealed
       // slice is read. A process restart can only retry this reservation.
       await this.controlPlane.saveState(state);
@@ -952,6 +1224,12 @@ export class AxiomLab extends DurableObject {
         strategy.holdout_outcome = outcome;
         strategy.state = outcome;
         strategy.service_status = { phase: "holdout", status: "ok", at: new Date().toISOString() };
+        if (strategy.lifecycle?.operational?.state === "running") transitionStrategyLifecycle(strategy, "ready", {
+          kind: "operational", trigger: "holdout_result", artifact_id: artifactId, event_id: run.job_id,
+          reason_code: "holdout_complete", explanation: "Sealed holdout artifact verified and persisted." });
+        if (strategy.lifecycle?.quality?.state === "sealed_validation") transitionStrategyLifecycle(strategy, outcome, {
+          trigger: "holdout_decision", artifact_id: artifactId, event_id: run.job_id,
+          reason_code: outcome, explanation: reason, correlation_id: `${strategy.id}:${policy_hash}:${artifactId}` });
         this.record(state, outcome === "incubation" ? "INCUBATE" : outcome === "holdout_reject" ? "HOLDOUT_REJECT" : "INCONCLUSIVE", `${strategy.name} → ${outcome}`, reason);
       }
     } catch (error) {
@@ -964,6 +1242,9 @@ export class AxiomLab extends DurableObject {
         });
         // Preserve validation/capacity state: service trouble is not quality evidence.
         strategy.service_status = { phase: "holdout", status: "infrastructure_error", error: error.message, at: new Date().toISOString() };
+        if (strategy.lifecycle?.operational?.state === "running") transitionStrategyLifecycle(strategy, "retry_wait", {
+          kind: "operational", trigger: "holdout_error", artifact_id: `dataset:${dataset.id}`,
+          event_id: `holdout-error:${strategy.id}`, reason_code: "service_unavailable", explanation: error.message });
         this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, error.message);
       }
     }
@@ -1209,6 +1490,28 @@ export class AxiomLab extends DurableObject {
         applyAlpacaOverview(state, overview);
         return this.save(state);
       }
+      if (request.method === "POST" && url.pathname === "/internal/orchestration/command") {
+        const body = await request.json();
+        const command = body.command;
+        const result = await this.submitOrchestrationCommand(state, command, { forceDirect: true });
+        await this.controlPlane.saveState(state);
+        return json({ ok: true, result, orchestration: state.orchestration });
+      }
+      if (request.method === "POST" && url.pathname === "/internal/orchestration/tick") {
+        const body = await request.json().catch(() => ({}));
+        const timestamp = body.scheduled_at ?? new Date().toISOString();
+        const results = await this.planAndSubmitOrchestration(state, timestamp, body.events ?? state.marketData?.live?.latest_events ?? []);
+        await this.controlPlane.saveState(state);
+        return json({ ok: true, results });
+      }
+      if (request.method === "POST" && url.pathname === "/api/orchestration/command") {
+        const body = await request.json();
+        const command = createOrchestrationCommand({ kind: body.kind, intent_id: body.intent_id ?? null,
+          strategy_id: body.strategy_id ?? null, actor: "operator:admin", timestamp: new Date().toISOString(),
+          correlation_id: body.correlation_id ?? `operator:${body.kind}:${Date.now()}`, payload: body.payload ?? {} });
+        const result = await this.submitOrchestrationCommand(state, command);
+        return this.save(state).then(async (response) => json({ ...(await response.json()), command_result: result }));
+      }
       if (request.method === "POST" && url.pathname === "/internal/scheduled") {
         const scheduledBucket = request.headers.get("x-axiom-scheduled-bucket");
         if (!scheduledBucket) return json({ error: "Missing schedule bucket" }, 400);
@@ -1260,13 +1563,10 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
-    if (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET) {
-      console.warn("Alpaca schedule skipped: credentials are not configured");
-      return;
-    }
     const stub = labStub(env);
     const work = [];
-    if (controller.cron === "0 * * * *") {
+    const hasBrokerCredentials = Boolean(env.ALPACA_API_KEY && env.ALPACA_API_SECRET);
+    if (controller.cron === "0 * * * *" && orchestrationMode(env) !== "autonomous" && hasBrokerCredentials) {
       const bucket = new Date(controller.scheduledTime).toISOString().slice(0, 13);
       work.push((async () => {
         await synchronizeAlpaca(env, stub, bucket);
@@ -1288,8 +1588,17 @@ export default {
         }
       })());
     }
-    if (marketDataMode(env) === "shadow" && controller.cron === "* * * * *") {
-      work.push(tickMarketData(env, stub, controller.scheduledTime));
+    if (controller.cron === "* * * * *") {
+      work.push((async () => {
+        if (marketDataMode(env) === "shadow") await tickMarketData(env, stub, controller.scheduledTime);
+        await tickOrchestration(stub, controller.scheduledTime);
+        if (!hasBrokerCredentials) return;
+        const current = await stateFrom(stub);
+        const latest = [...(current.market_data?.live?.latest_events ?? [])]
+          .filter((event) => event.actionable && !event.retroactive)
+          .sort((left, right) => String(left.bucket_close).localeCompare(String(right.bucket_close))).at(-1);
+        if (latest) await synchronizeAlpaca(env, stub, `event:${latest.event_id ?? latest.id}`, latest.bucket_close);
+      })());
     }
     if (work.length) ctx.waitUntil(Promise.all(work));
   },

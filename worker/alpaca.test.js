@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildPaperCycle,
+  cancelManagedOpenOrders,
   getAccountOverview,
   getFiveMinuteHistory,
   getMarketCalendar,
@@ -64,6 +65,7 @@ function fixtureFetch({
     });
     if (url.pathname === "/v2/positions") return Response.json(positions);
     if (url.pathname === "/v2/orders" && init.method !== "POST") return Response.json(orders);
+    if (url.pathname.startsWith("/v2/orders/") && init.method === "DELETE") return Response.json({});
     if (url.pathname === "/v2/clock") return Response.json({
       is_open: true, timestamp: "2026-08-03T15:00:00Z",
       next_open: "2026-08-04T13:30:00Z", next_close: "2026-08-03T20:00:00Z",
@@ -154,6 +156,20 @@ test("account overview returns sanitized positions and open orders without tradi
   assert.equal("secret_internal_field" in overview.positions[0], false);
   assert.equal("extended_internal_payload" in overview.open_orders[0], false);
   assert.equal(mock.submitted.length, 0);
+});
+
+test("safety cancellation removes only framework-owned open orders", async () => {
+  const mock = fixtureFetch({ orders: [
+    { id: "managed-1", client_order_id: "axiom-bucket-spy-buy", symbol: "SPY", side: "buy", type: "market", status: "new", qty: "1" },
+    { id: "manual-1", client_order_id: "my-manual-order", symbol: "QQQ", side: "buy", type: "limit", status: "new", qty: "2" },
+  ] });
+  globalThis.fetch = mock;
+  const result = await cancelManagedOpenOrders(credentials);
+  assert.equal(result.cancelled.length, 1);
+  assert.equal(result.cancelled[0].id, "managed-1");
+  assert.equal(result.skipped_manual_orders, 1);
+  assert.equal(mock.requests.some((url) => url.pathname === "/v2/orders/managed-1"), true);
+  assert.equal(mock.requests.some((url) => url.pathname === "/v2/orders/manual-1"), false);
 });
 
 test("research bars request the configured IEX feed", async () => {
@@ -271,6 +287,22 @@ test("existing short can be covered after borrow eligibility is lost", async () 
   const cycle = await buildPaperCycle(credentials, appState, "2026-08-03T19");
   assert.equal(cycle.proposed_orders[0].side, "buy");
   assert.equal(cycle.proposed_orders[0].qty, 5);
+});
+
+test("operator flatten overrides strategy targets but closes only managed exposure", async () => {
+  const mock = fixtureFetch({
+    positions: [{ symbol: "SPY", side: "long", qty: "4", market_value: "1000", current_price: "250" }],
+  });
+  globalThis.fetch = mock;
+  const appState = stateFor(momentumStrategy());
+  appState.alpaca.managed_symbols = ["SPY"];
+  appState.orchestration = { controls: { flatten_requested: true } };
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, appState, "2026-08-03T19:05");
+  assert.equal(cycle.force_flatten, true);
+  assert.equal(cycle.evaluations["AX-SPY-01"], undefined);
+  assert.equal(cycle.submitted_orders.length, 1);
+  assert.equal(mock.submitted[0].side, "sell");
+  assert.equal(mock.submitted[0].qty, "4");
 });
 
 test("direction flips flatten the managed position before opening the opposite side", async () => {

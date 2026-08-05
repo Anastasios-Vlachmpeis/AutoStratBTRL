@@ -1,13 +1,16 @@
 /** Deterministic strategy generation, backtesting, and lifecycle supervision. */
 
-import { buildStrategyDNA, evaluateLatestTarget, evaluateStrategyTargets } from "./dsl.js";
+import { buildStrategyDNA, evaluateLatestTarget, evaluateStrategyTargets, hashCanonical } from "./dsl.js";
 import { DSL_FAMILIES, buildGeneratedStrategyDNA } from "./dsl-generation.js";
+import { createEvaluationPolicy, evaluationPolicyHash } from "./evaluation-policy.js";
+import { applyLifecycleCommand, initialLifecycle, transitionId } from "./lifecycle.js";
+import { emptyOrchestrationState, ensureOrchestrationState, publicOrchestrationState } from "./orchestration.js";
 import { emptyResearchState, ensureResearchState, publicResearchState } from "./research-contract.js";
 import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
 
 export const REGIMES = ["Expansion", "Compression", "Stress", "Recovery"];
 export const ASSETS = [...INITIAL_UNIVERSE_SYMBOLS];
-export const CURRENT_SCHEMA_VERSION = 10;
+export const CURRENT_SCHEMA_VERSION = 11;
 
 const NAMES = [
   "Orion Pulse", "Kestrel Drift", "Helix Break", "Cobalt Revert",
@@ -16,6 +19,44 @@ const NAMES = [
 ];
 const ARCHETYPES = DSL_FAMILIES;
 const ACTIVE_STATES = new Set(["released", "healthy", "watch", "adjusted"]);
+const ZERO_HASH = "0".repeat(64);
+
+function lifecycleQuality(state) {
+  return ({ generated: "screened", rework: "development", validation: "sealed_validation", capacity_wait: "capacity_wait",
+    incubation: "incubation", released: "released_paper", healthy: "released_paper", adjusted: "released_paper",
+    watch: "watch", development_reject: "development_reject", holdout_reject: "holdout_reject",
+    inconclusive: "inconclusive", superseded: "superseded", dropped: "retired" })[state] ?? "proposed";
+}
+
+function strategyLifecycle(strategy, { datasetHash = ZERO_HASH, configurationHash = ZERO_HASH,
+  policyHash = evaluationPolicyHash(createEvaluationPolicy()), timestamp = new Date().toISOString() } = {}) {
+  const lifecycle = structuredClone(initialLifecycle({ strategy_id: strategy.id,
+    dna_hash: /^[a-f0-9]{64}$/.test(strategy.dna_hash ?? "") ? strategy.dna_hash : ZERO_HASH,
+    dataset_hash: /^[a-f0-9]{64}$/.test(datasetHash ?? "") ? datasetHash : ZERO_HASH,
+    configuration_hash: /^[a-f0-9]{64}$/.test(configurationHash ?? "") ? configurationHash : ZERO_HASH,
+    policy_hash: policyHash, timestamp }));
+  const target = lifecycleQuality(strategy.state);
+  if (["compiled", "screened"].includes(target)) {
+    let current = lifecycle;
+    for (const next of target === "compiled" ? ["compiled"] : ["compiled", "screened"]) {
+      const command = { schema_version: 1, strategy_id: strategy.id, kind: "quality",
+        expected: { quality_state: current.quality.state, version: current.quality.version }, target: next,
+        trigger: "strategy_generation", artifact_id: `dna:${strategy.dna_hash ?? "unavailable"}`,
+        event_id: `generation:${strategy.id}`, policy_hash: current.provenance.policy_hash, actor: "system",
+        timestamp, reason_code: next === "compiled" ? "dsl_compiled" : "structural_screen_passed",
+        explanation: next === "compiled" ? "Typed strategy DNA compiled successfully." : "Compiled DNA passed structural screening.",
+        correlation_id: `${strategy.id}:bootstrap`, provenance: { dna_hash: current.provenance.dna_hash,
+          dataset_hash: current.provenance.dataset_hash, configuration_hash: current.provenance.configuration_hash } };
+      command.transition_id = transitionId(command);
+      current = structuredClone(applyLifecycleCommand(current, command).state);
+    }
+    return current;
+  }
+  // Historical migrations did not retain transition events. Preserve their
+  // current quality state without fabricating evidence that never existed.
+  lifecycle.quality = { state: target, version: 0 };
+  return lifecycle;
+}
 
 class SeededRandom {
   constructor(seed) {
@@ -370,7 +411,7 @@ function newStrategy(state, parent = null, mutateParent = true) {
     built = buildGeneratedStrategyDNA({ family: archetype, params, seed: creationSeed,
       trialId: strategyId, generation, parentStrategyId: parent?.strategy_dna?.strategy_id ?? null });
   }
-  return {
+  const strategy = {
     id: strategyId,
     name,
     archetype,
@@ -395,6 +436,8 @@ function newStrategy(state, parent = null, mutateParent = true) {
     rework: emptyRework(parent?.rework?.attempt ?? 0, parent?.rework?.history ?? []),
     monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
   };
+  strategy.lifecycle = strategyLifecycle(strategy, { configurationHash: hashCanonical({ source: "generated-dsl", compiler: strategy.compiler }) });
+  return strategy;
 }
 
 function researchDisplayParams(dna) {
@@ -427,7 +470,7 @@ export function registerResearchFinalists(state, finalists, cohort) {
       : null;
     const symbols = dna.scope.symbols;
     const assetIndex = Number.parseInt(dna.dna_hash.slice(0, 8), 16) % symbols.length;
-    return {
+    const strategy = {
       id,
       name: `${NAMES[(state.nextId - 2 + index) % NAMES.length]} E${state.nextId % 10}`,
       archetype: trial.behavior_cluster ? `Behavior ${trial.behavior_cluster}` : `Evolved ${trial.operator ?? "grammar"}`,
@@ -458,6 +501,9 @@ export function registerResearchFinalists(state, finalists, cohort) {
       rework: emptyRework(),
       monitor: { returns: [], streak: 0, adjustments: 0, sharpe: null, drawdown: null, ratio: null },
     };
+    strategy.lifecycle = strategyLifecycle(strategy, { datasetHash: cohort.contract?.dataset_hash,
+      configurationHash: cohort.contract_hash ?? hashCanonical(cohort.contract ?? {}) });
+    return strategy;
   });
   state.strategies = [...created, ...state.strategies];
   event(state, "EVOLVE", `${cohort.cohort_id} selected ${created.length} finalists`,
@@ -973,6 +1019,9 @@ export function applyAlpacaCycle(state, cycle) {
     last_cycle_bucket: cycle.scheduled_bucket,
     last_bar_time: latestBarTime,
   };
+  if (cycle.force_flatten && !(cycle.positions ?? []).length && state.orchestration?.controls) {
+    state.orchestration.controls.flatten_requested = false;
+  }
   if (hasNewMarketData) state.marketClock += 21;
   event(state, "ALPACA", "Alpaca paper account synchronized", `${cycle.feed.toUpperCase()} data · ${cycle.positions.length} positions · trading ${cycle.trading_enabled ? "enabled" : "disabled"}`);
   return true;
@@ -991,6 +1040,7 @@ export function createDemoState() {
     alpaca: { connected: false, managed_symbols: [], last_cycle_bucket: null, short_trading_enabled: false, safety_reasons: [] },
     marketData: {},
     research: emptyResearchState(),
+    orchestration: emptyOrchestrationState(),
   };
 }
 
@@ -1000,7 +1050,8 @@ export function migrateState(state) {
   if (version >= CURRENT_SCHEMA_VERSION) return state;
   const migrated = clone(state);
   migrated.schemaVersion = CURRENT_SCHEMA_VERSION;
-  migrated.strategies = (migrated.strategies ?? []).map((strategy) => ({
+  migrated.strategies = (migrated.strategies ?? []).map((strategy) => {
+    const upgraded = {
     ...strategy,
     strategy_format: strategy.strategy_format ?? (strategy.strategy_dna ? "dsl-v1" : "legacy-archetype-v0"),
     legacy_dna: strategy.strategy_dna ? (strategy.legacy_dna ?? null) : (strategy.legacy_dna ?? {
@@ -1016,11 +1067,19 @@ export function migrateState(state) {
     dataset_id: strategy.dataset_id ?? null,
     backtest_runs: strategy.backtest_runs ?? {},
     lineage_id: strategy.lineage_id ?? strategy.strategy_dna?.lineage?.parent_strategy_id ?? strategy.strategy_dna?.strategy_id ?? strategy.id,
-  }));
+    };
+    upgraded.lifecycle ??= strategyLifecycle(upgraded, {
+      datasetHash: migrated.datasets?.[strategy.dataset_id]?.sha256 ?? migrated.datasets?.[strategy.dataset_id]?.development_hash,
+      configurationHash: strategy.backtest_runs?.development?.config_hash ?? ZERO_HASH,
+      policyHash: strategy.supervision?.policy_hash ?? evaluationPolicyHash(createEvaluationPolicy()),
+    });
+    return upgraded;
+  });
   migrated.datasets ??= {};
   migrated.backtestArtifacts ??= {};
   migrated.marketData ??= {};
   ensureResearchState(migrated);
+  ensureOrchestrationState(migrated);
   return migrated;
 }
 
@@ -1063,6 +1122,7 @@ export function snapshot(state) {
       live: state.marketData?.live ?? null,
     }),
     research: publicResearchState(state.research),
+    orchestration: publicOrchestrationState(state.orchestration),
     policy: {
       release_score: 61, min_sharpe: 0.55, max_drawdown: 0.20,
       validation_min_sharpe: 0.30, validation_max_drawdown: 0.20, monitor_window: 21,

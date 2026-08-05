@@ -1,5 +1,6 @@
 import {
   buildPaperCycle,
+  cancelManagedOpenOrders,
   getAccountOverview,
   getAssets,
   getFiveMinuteBars,
@@ -56,6 +57,10 @@ export class AlpacaPaperBrokerGateway {
 
   async buildCycle(appState, scheduledBucket, orderBucket = scheduledBucket) {
     return buildPaperCycle(this.env, appState, scheduledBucket, orderBucket);
+  }
+
+  async cancelManagedOpenOrders() {
+    return cancelManagedOpenOrders(this.env);
   }
 }
 

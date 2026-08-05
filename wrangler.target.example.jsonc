@@ -37,6 +37,7 @@
   },
   "triggers": { "crons": ["* * * * *", "0 * * * *"] },
   "vars": {
+    "ORCHESTRATION_MODE": "observe",
     "CONTROL_PLANE_MODE": "dual_write",
     "MARKET_DATA_MODE": "shadow",
     "ALPACA_DATA_FEED": "iex",

@@ -153,6 +153,18 @@ export async function getAccountOverview(env) {
   };
 }
 
+/** Cancel only orders created by this framework; manual account orders remain untouched. */
+export async function cancelManagedOpenOrders(env) {
+  const overview = await getAccountOverview(env);
+  const managed = overview.open_orders.filter((order) => String(order.client_order_id ?? "").startsWith("axiom-"));
+  const cancelled = [];
+  for (const order of managed) {
+    await alpacaRequest(env, PAPER_BASE, `/v2/orders/${encodeURIComponent(order.id)}`, { method: "DELETE" });
+    cancelled.push({ id: order.id, client_order_id: order.client_order_id, symbol: order.symbol });
+  }
+  return { cancelled, skipped_manual_orders: overview.open_orders.length - managed.length, fetched_at: overview.fetched_at };
+}
+
 export async function getStockBars(env, symbols, {
   timeframe, start, end = new Date().toISOString(), limit = 10000,
   adjustment = "all", maxPages = 1000,
@@ -299,7 +311,8 @@ function wholeSharesForNotional(notional, position) {
 
 export async function buildPaperCycle(env, appState, scheduledBucket, orderBucket = scheduledBucket) {
   const overview = await getAccountOverview(env);
-  const active = appState.strategies.filter((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
+  const forceFlatten = Boolean(appState.orchestration?.controls?.flatten_requested);
+  const active = forceFlatten ? [] : appState.strategies.filter((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
   const symbols = [...new Set(active.map((strategy) => strategy.asset).filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)))];
   const dslSymbols = [...new Set(active.filter((strategy) => strategy.strategy_format === "dsl-v1")
     .map((strategy) => strategy.asset).filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)))];
@@ -458,6 +471,7 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
     ...overview,
     feed: env.ALPACA_DATA_FEED || "iex",
     trading_enabled: tradingEnabled,
+    force_flatten: forceFlatten,
     short_trading_enabled: shortTradingEnabled,
     can_trade_now: canTrade,
     evaluations,
