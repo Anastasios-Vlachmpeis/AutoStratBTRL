@@ -22,6 +22,8 @@ import {
 import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
 import { finalizeIncubationSession, recordIncubationBar } from "./incubation.js";
 import { createRuntimeGateways } from "./gateways.js";
+import { BrokerStore } from "./broker-store.js";
+import { canReleaseStrategyToPaper } from "./alpaca.js";
 import { consumeArchitectureQueue } from "./jobs.js";
 import { combineQueuedBacktest, planQueuedBacktest, recordQueuedBacktestReceipt, strategyScopeSymbols } from "./backtest-queue.js";
 import {
@@ -230,7 +232,21 @@ async function synchronizeAlpaca(env, stub, bucket, orderBucket = bucket) {
   const appState = await stateFrom(stub);
   const forceFlatten = Boolean(appState.orchestration?.controls?.flatten_requested);
   if (!executionAllowed(appState) && !forceFlatten) return Response.json({ ok: true, skipped: true, reason: appState.orchestration?.controls?.kill_switch ? "kill_switch" : "execution_paused" });
-  const cycle = await createRuntimeGateways(env).broker.buildCycle(appState, bucket, orderBucket);
+  const broker = createRuntimeGateways(env).broker;
+  const plan = await broker.planCycle(appState, bucket, orderBucket, { scope: "released" });
+  if (!env.AXIOM_DB && ((plan.order_plans?.length ?? 0) || (plan.cancel_plans?.length ?? 0))) {
+    throw new Error("AXIOM_DB is required before any broker order can be submitted");
+  }
+  const store = env.AXIOM_DB ? new BrokerStore(env.AXIOM_DB) : null;
+  if (store) await store.persistPlan({ workspaceId: SINGLETON_NAME, plan });
+  const cycle = await broker.executePlan(plan);
+  if (store) {
+    const journal = await store.persistExecution({ workspaceId: SINGLETON_NAME, execution: cycle });
+    for (const fill of cycle.fills ?? []) if (!(fill.allocations?.length)
+        && journal.recovered_allocations?.[fill.broker_fill_id]) {
+      fill.allocations = journal.recovered_allocations[fill.broker_fill_id];
+    }
+  }
   return stub.fetch(new Request("https://axiom.internal/internal/alpaca-cycle", {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -372,6 +388,7 @@ export class AxiomLab extends DurableObject {
     this.env = env;
     this.controlPlane = createControlPlaneRuntime(ctx.storage, env, SINGLETON_NAME);
     this.gateways = createRuntimeGateways(env);
+    this.brokerStore = env.AXIOM_DB ? new BrokerStore(env.AXIOM_DB) : null;
     this.marketDataRepository = new MarketDataRepository(ctx.storage, env, SINGLETON_NAME);
     this.orchestrationStore = env.AXIOM_DB ? new OrchestrationStore(env.AXIOM_DB, {
       queue: env.AXIOM_JOBS, artifacts: env.AXIOM_ARTIFACTS,
@@ -673,6 +690,43 @@ export class AxiomLab extends DurableObject {
     return decoded;
   }
 
+  async runBrokerCycle(state, bucket, orderBucket, options = {}) {
+    const plan = await this.gateways.broker.planCycle(state, bucket, orderBucket, options);
+    if (options.scope === "incubation") return plan;
+    if (this.brokerStore) {
+      await this.brokerStore.persistPlan({ workspaceId: SINGLETON_NAME, plan });
+    } else {
+      const activation = plan.activation ?? {};
+      const canExecute = plan.force_flatten || activation.canary_enabled
+        || activation.long_enabled || activation.short_enabled;
+      if (canExecute && ((plan.order_plans?.length ?? 0) || (plan.cancel_plans?.length ?? 0))) {
+        throw new Error("AXIOM_DB is required before any broker order can be submitted");
+      }
+    }
+    const execution = await this.gateways.broker.executePlan(plan);
+    if (this.brokerStore) {
+      const journal = await this.brokerStore.persistExecution({ workspaceId: SINGLETON_NAME, execution });
+      for (const fill of execution.fills ?? []) {
+        if (!(fill.allocations?.length) && journal.recovered_allocations?.[fill.broker_fill_id]) {
+          fill.allocations = journal.recovered_allocations[fill.broker_fill_id];
+        }
+      }
+      for (const item of journal.unattributed) execution.safety_reasons.push({
+        reason: item.reason, broker_fill_id: item.broker_fill_id, severity: "critical",
+      });
+    }
+    const incidents = state.orchestration?.incidents;
+    if (incidents) for (const safety of execution.safety_reasons.filter((item) => item.severity === "critical")) {
+      const incidentId = `broker:${bucket}:${safety.symbol ?? safety.broker_fill_id ?? "portfolio"}:${safety.reason}`;
+      if (!incidents.some((item) => item.incident_id === incidentId)) incidents.push({
+        incident_id: incidentId, kind: "broker_safety", reason: safety.reason,
+        symbol: safety.symbol ?? null, broker_fill_id: safety.broker_fill_id ?? null,
+        opened_at: execution.clock?.timestamp ?? new Date().toISOString(),
+      });
+    }
+    return execution;
+  }
+
   async executeOrchestrationActions(state, command, result) {
     const orchestration = ensureOrchestrationState(state, orchestrationMode(this.env));
     const followups = [];
@@ -688,6 +742,9 @@ export class AxiomLab extends DurableObject {
           throw new Error("Broker order cancellation requires configured Alpaca paper credentials");
         } else {
           const cancellation = await this.gateways.broker.cancelManagedOpenOrders();
+          if (this.brokerStore) await this.brokerStore.persistCancellations({
+            workspaceId: SINGLETON_NAME, cancelled: cancellation.cancelled,
+          });
           this.record(state, "BROKER_SAFETY", "Managed open orders cancelled",
             `${cancellation.cancelled.length} framework orders cancelled; ${cancellation.skipped_manual_orders} manual orders untouched`);
         }
@@ -707,7 +764,7 @@ export class AxiomLab extends DurableObject {
           throw new Error("Managed flatten requires configured Alpaca paper credentials");
         }
         const bucket = `flatten:${command.command_id}`;
-        const cycle = await this.gateways.broker.buildCycle(state, bucket, command.timestamp, {
+        const cycle = await this.runBrokerCycle(state, bucket, command.timestamp, {
           scope: "released", tradingEnabled: true, safetyFlatten: true,
         });
         applyAlpacaCycle(state, cycle);
@@ -723,6 +780,29 @@ export class AxiomLab extends DurableObject {
         }
         this.record(state, "BROKER_SAFETY", "Managed flatten reconciled",
           `${cycle.submitted_orders?.length ?? 0} close orders submitted; ${closePending.size} symbols already had an open order`);
+      } else if (action.kind === "risk.reset_daily_halt") {
+        if (!this.env.ALPACA_API_KEY || !this.env.ALPACA_API_SECRET) {
+          throw new Error("Daily-loss reset requires configured Alpaca paper credentials");
+        }
+        const overview = await this.gateways.broker.accountOverview();
+        applyAlpacaOverview(state, overview);
+        state.alpaca.risk_session = { session_date: newYorkClock(overview.clock.timestamp).date,
+          baseline_equity: overview.account.equity, current_equity: overview.account.equity,
+          loss_fraction: 0, halted: false, reason: null, triggered_at: null,
+          reset_at: command.timestamp, reset_by: command.actor };
+        this.record(state, "RISK_RESET", "Daily loss halt reset",
+          `New paper baseline $${overview.account.equity.toFixed(2)} set by ${command.actor}`);
+      } else if (action.kind === "broker.run_canary") {
+        const bucket = `canary:${command.command_id}`;
+        const cycle = await this.runBrokerCycle(state, bucket, command.timestamp, {
+          scope: "released", tradingEnabled: true, canary: action.payload,
+        });
+        applyAlpacaCycle(state, cycle);
+        if (cycle.order_errors?.length || !(cycle.submitted_orders?.length)) {
+          throw new Error(cycle.order_errors?.[0]?.message ?? "Broker canary did not submit");
+        }
+        this.record(state, "BROKER_CANARY", `${action.payload.side.toUpperCase()} canary submitted`,
+          `${action.payload.symbol} · $${action.payload.notional}`);
       } else if (action.kind === "operational.retry") {
         const strategy = state.strategies.find((item) => item.id === action.strategy_id);
         if (!strategy?.lifecycle) throw new Error(`Unknown lifecycle strategy ${action.strategy_id}`);
@@ -837,8 +917,9 @@ export class AxiomLab extends DurableObject {
           throw new Error("Target computation requires configured Alpaca paper credentials");
         }
         const bucket = String(action.payload?.event_id ?? action.payload?.bucket_close ?? command.command_id);
-        const cycle = await this.gateways.broker.buildCycle(state, bucket, action.payload?.bucket_close ?? bucket,
-          { scope: action.scope, tradingEnabled: action.scope === "released" });
+        const cycle = await this.runBrokerCycle(state, bucket, action.payload?.bucket_close ?? bucket,
+          { scope: action.scope, tradingEnabled: action.scope === "released",
+            blockNewRisk: Boolean(action.block_new_risk) });
         if (action.scope === "released") {
           applyAlpacaCycle(state, cycle);
         } else {
@@ -890,7 +971,16 @@ export class AxiomLab extends DurableObject {
         const unfinished = state.strategies.find((item) => item.state === "incubation"
           && !item.incubation?.sessions?.[releaseSession]?.completed);
         if (unfinished) throw new Error(`Release waits for incubation session evidence for ${unfinished.id}`);
-        for (const strategy of state.strategies.filter((item) => item.state === "incubation" && item.release_ready)) {
+        for (const strategy of state.strategies.filter((item) =>
+          ["incubation", "release_blocked_short"].includes(item.state) && item.release_ready)) {
+          if (!canReleaseStrategyToPaper(this.env, strategy)) {
+            strategy.state = "release_blocked_short";
+            strategy.release_blocked_reason = "short_execution_not_enabled";
+            this.record(state, "RELEASE_BLOCKED", `${strategy.name} held in incubation`,
+              "Its strategy DNA can open shorts, but autonomous paper shorts are not enabled.");
+            continue;
+          }
+          strategy.release_blocked_reason = null;
           strategy.state = "released";
           if (strategy.lifecycle?.quality?.state === "incubation") transitionStrategyLifecycle(strategy, "released_paper", {
             trigger: "incubation_evidence", artifact_id: strategy.incubation?.artifact_id ?? "artifact:incubation",

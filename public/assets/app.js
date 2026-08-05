@@ -17,7 +17,7 @@ const filterConfigs = {
     { id: "generated", label: "Generated", states: ["generated"] },
     { id: "rework", label: "Rework", states: ["rework"] },
     { id: "validation", label: "Validation", states: ["validation", "capacity_wait"] },
-    { id: "market", label: "Market", states: ["incubation", "released", "healthy", "watch", "adjusted"] },
+    { id: "market", label: "Market", states: ["incubation", "release_blocked_short", "released", "healthy", "watch", "adjusted"] },
     { id: "retired", label: "Retired", states: ["development_reject", "holdout_reject", "inconclusive", "dropped", "superseded"] },
   ],
   testing: [
@@ -29,7 +29,7 @@ const filterConfigs = {
   ],
   released: [
     { id: "all", label: "All" },
-    { id: "incubation", label: "Incubation", states: ["incubation"] },
+    { id: "incubation", label: "Incubation", states: ["incubation", "release_blocked_short"] },
     { id: "released", label: "New", states: ["released"] },
     { id: "healthy", label: "Healthy", states: ["healthy"] },
     { id: "watch", label: "Watch", states: ["watch"] },
@@ -39,7 +39,7 @@ const filterConfigs = {
 
 const statusLabels = {
   generated: "Generated", rework: "Rework", validation: "Validation", capacity_wait: "Capacity wait",
-  development_reject: "Development reject", incubation: "Incubation", holdout_reject: "Holdout reject",
+  development_reject: "Development reject", incubation: "Incubation", release_blocked_short: "Short release blocked", holdout_reject: "Holdout reject",
   inconclusive: "Inconclusive", released: "Released", healthy: "Healthy", watch: "Watch", adjusted: "Adjusted",
   dropped: "Dropped", superseded: "Superseded"
 };
@@ -101,7 +101,7 @@ async function api(path, body = null, allowAuthRetry = true) {
 function strategiesForView(view = activeView) {
   if (!state) return [];
   if (view === "testing") return state.strategies.filter((item) => ["generated", "rework", "validation", "capacity_wait"].includes(item.state));
-  if (view === "released") return state.strategies.filter((item) => ["incubation", "released", "healthy", "watch", "adjusted"].includes(item.state));
+  if (view === "released") return state.strategies.filter((item) => ["incubation", "release_blocked_short", "released", "healthy", "watch", "adjusted"].includes(item.state));
   return state.strategies;
 }
 
@@ -132,7 +132,7 @@ function ensureSelection() {
     return;
   }
   if (!state.strategies.some((item) => item.id === selectedId)) {
-    const best = state.strategies.find((item) => ["healthy", "released", "watch", "adjusted", "incubation"].includes(item.state));
+    const best = state.strategies.find((item) => ["healthy", "released", "watch", "adjusted", "incubation", "release_blocked_short"].includes(item.state));
     selectedId = (best || state.strategies[0])?.id || null;
   }
   if (visible.length && !visible.some((item) => item.id === selectedId)) selectedId = visible[0].id;
@@ -510,11 +510,19 @@ function renderStrategyContext(strategy) {
   const strip = $("#strategy-context-strip");
   const monitor = strategy.monitor ?? {};
   const rework = strategy.rework ?? {};
-  const activeMarketState = ["incubation", "released", "healthy", "watch", "adjusted"].includes(strategy.state);
+  const activeMarketState = ["incubation", "release_blocked_short", "released", "healthy", "watch", "adjusted"].includes(strategy.state);
   const hasMarketHistory = activeMarketState
     || (monitor.returns?.length ?? 0) > 0
     || Number(monitor.adjustments ?? 0) > 0;
   const hasReworkContext = strategy.state === "rework" || Number(rework.attempt ?? 0) > 0;
+
+  if (strategy.state === "release_blocked_short") {
+    strip.className = "strategy-context-strip watch";
+    strip.innerHTML = `<span class="context-marker" aria-hidden="true">!</span>
+      <div class="context-copy"><span class="context-kicker">RELEASE SAFETY</span><strong>Paper short execution is not enabled</strong><small>This strategy passed incubation but can open short positions. It remains blocked until the independent paper-short switch and execution mode are explicitly enabled.</small></div>`;
+    strip.hidden = false;
+    return;
+  }
 
   if (strategy.state === "watch") {
     const checks = [

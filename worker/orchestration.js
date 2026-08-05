@@ -19,6 +19,7 @@ export const OPERATOR_COMMANDS = Object.freeze([
   "pause_research", "resume_research", "pause_ingestion", "resume_ingestion", "pause_release", "resume_release",
   "pause_execution", "resume_execution", "retry_operational", "quarantine_strategy", "retire_strategy",
   "pause_strategy", "resume_strategy",
+  "reset_daily_loss_halt", "run_broker_canary",
   "reset_nonproduction_workspace",
   "prepare_workspace_reset", "execute_workspace_reset",
   "approve_configuration", "approve_universe", "approve_policy",
@@ -114,9 +115,15 @@ function routineActions(current, command) {
       return controls.research_paused ? result(command, "blocked", [], "research_paused") : result(command, "applied", [{ kind: "research.run_cohort", payload }]);
     case "weekly_operational_diversity_review": return result(command, "applied", [{ kind: "review.weekly", payload }]);
     case "compute_incubation_targets": case "compute_released_targets":
-      return controls.kill_switch || controls.execution_paused || controls.entries_paused
-        ? result(command, "blocked", [], controls.kill_switch ? "kill_switch" : "execution_paused")
-        : result(command, "applied", [{ kind: "pipeline.compute_targets", scope: command.kind === "compute_incubation_targets" ? "incubation" : "released", payload }]);
+      if (controls.kill_switch || controls.execution_paused) {
+        return result(command, "blocked", [], controls.kill_switch ? "kill_switch" : "execution_paused");
+      }
+      if (controls.entries_paused && command.kind === "compute_incubation_targets") {
+        return result(command, "blocked", [], "entries_paused");
+      }
+      return result(command, "applied", [{ kind: "pipeline.compute_targets",
+        scope: command.kind === "compute_incubation_targets" ? "incubation" : "released",
+        block_new_risk: controls.entries_paused, payload }]);
     case "record_monitoring_observations": return result(command, "applied", [{ kind: "pipeline.monitor", payload }]);
     case "pipeline_review": return result(command, "applied", [{ kind: "pipeline.review", payload }]);
     case "pipeline_validate": return result(command, "applied", [{ kind: "pipeline.validate", payload }]);
@@ -132,7 +139,9 @@ function operatorActions(current, command) {
   switch (command.kind) {
     case "global_pause": controls.global_paused = true; return result(command, "applied");
     case "global_resume": controls.global_paused = false; return result(command, "applied");
-    case "kill_switch": controls.kill_switch = true; controls.execution_paused = true; controls.entries_paused = true; return result(command, "applied", [{ kind: "broker.cancel_unsafe_orders", payload }]);
+    case "kill_switch": controls.kill_switch = true; controls.execution_paused = true;
+      controls.entries_paused = true; controls.flatten_requested = true;
+      return result(command, "applied", [{ kind: "broker.cancel_unsafe_orders", payload }, { kind: "broker.flatten_all", payload }]);
     case "clear_kill_switch": controls.kill_switch = false; return result(command, "applied");
     case "flatten_all": controls.flatten_requested = true; return result(command, "applied", [{ kind: "broker.flatten_all", payload }]);
     case "pause_research": controls.research_paused = true; return result(command, "applied");
@@ -143,6 +152,17 @@ function operatorActions(current, command) {
     case "resume_release": controls.release_paused = false; return result(command, "applied");
     case "pause_execution": controls.execution_paused = true; return result(command, "applied");
     case "resume_execution": if (controls.kill_switch) return result(command, "blocked", [], "kill_switch"); controls.execution_paused = false; controls.entries_paused = false; return result(command, "applied");
+    case "reset_daily_loss_halt": return result(command, "applied", [{ kind: "risk.reset_daily_halt", payload }]);
+    case "run_broker_canary": {
+      const symbol = String(payload.symbol ?? "SPY").toUpperCase();
+      const side = String(payload.side ?? "buy").toLowerCase();
+      const notional = Number(payload.notional ?? 25);
+      if (!/^[A-Z]{1,5}$/.test(symbol) || !["buy", "sell"].includes(side)
+          || !Number.isFinite(notional) || notional <= 0 || notional > 25) {
+        throw new TypeError("Broker canary requires a valid symbol, buy/sell side, and notional from $1 to $25");
+      }
+      return result(command, "applied", [{ kind: "broker.run_canary", payload: { symbol, side, notional } }]);
+    }
     case "retry_operational": return result(command, "applied", [{ kind: "operational.retry", strategy_id: command.strategy_id, payload }]);
     case "pause_strategy": return result(command, "applied", [{ kind: "strategy.pause", strategy_id: command.strategy_id, payload }]);
     case "resume_strategy": return result(command, "applied", [{ kind: "strategy.resume", strategy_id: command.strategy_id, payload }]);

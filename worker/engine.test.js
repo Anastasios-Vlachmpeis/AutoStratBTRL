@@ -422,6 +422,25 @@ test("an accepted Axiom short marks the symbol as managed for later covers", () 
   assert.ok(state.alpaca.managed_symbols.includes(active.asset));
 });
 
+test("broker fills update per-strategy position attribution exactly once", () => {
+  const state = createDemoState(); const active = addReleasedStrategy(state);
+  const cycle = {
+    scheduled_bucket: "fill-cycle-1", fetched_at: "2026-08-03T15:05:00Z", feed: "iex",
+    trading_enabled: true, can_trade_now: true, account: { equity: 100000 }, positions: [],
+    open_orders: [], clock: { is_open: true }, proposed_orders: [], order_errors: [], safety_reasons: [],
+    submitted_orders: [{ id: "broker-order-1", symbol: active.asset, side: "buy", status: "accepted",
+      client_order_id: "axiom-attributed", allocations: [{ strategy_id: active.id, signed_notional: 500 }] }],
+    fills: [{ broker_fill_id: "fill-1", broker_order_id: "broker-order-1", symbol: active.asset,
+      side: "buy", qty: 1.25, price: 400, transaction_time: "2026-08-03T15:04:00Z",
+      allocations: [{ strategy_id: active.id, signed_notional: 500 }] }], evaluations: {},
+  };
+  applyAlpacaCycle(state, cycle);
+  assert.equal(state.alpaca.position_attribution[active.asset].by_strategy[active.id], 1.25);
+  applyAlpacaCycle(state, { ...cycle, scheduled_bucket: "fill-cycle-2", submitted_orders: [] });
+  assert.equal(state.alpaca.position_attribution[active.asset].by_strategy[active.id], 1.25);
+  assert.equal(state.alpaca.last_fill_at, "2026-08-03T15:04:00Z");
+});
+
 test("read-only Alpaca overview refresh preserves strategy ownership state", () => {
   const state = createDemoState();
   state.alpaca.managed_symbols = ["SPY"];

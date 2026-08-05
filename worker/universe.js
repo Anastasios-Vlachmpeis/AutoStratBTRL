@@ -11,7 +11,7 @@ export const INITIAL_UNIVERSE_SYMBOLS = Object.freeze([
   "BA", "DIS", "KO", "PFE", "INTC", "CSCO",
 ]);
 
-const GROUPS = Object.freeze({
+export const INITIAL_UNIVERSE_GROUPS = Object.freeze({
   broad_equity_etfs: ["SPY", "QQQ", "IWM", "DIA"],
   macro_and_sector_etfs: ["TLT", "GLD", "SLV", "XLF", "XLK", "XLE", "XLV", "XLI"],
   technology_and_communications: ["AAPL", "MSFT", "NVDA", "AMZN", "META", "GOOGL", "TSLA", "AVGO", "AMD", "NFLX", "INTC", "CSCO"],
@@ -30,7 +30,7 @@ function canonicalUniverse() {
     asset_class: "us_equity",
     session: "regular",
     symbols: [...INITIAL_UNIVERSE_SYMBOLS],
-    groups: Object.fromEntries(Object.entries(GROUPS).map(([name, symbols]) => [name, [...symbols]])),
+    groups: Object.fromEntries(Object.entries(INITIAL_UNIVERSE_GROUPS).map(([name, symbols]) => [name, [...symbols]])),
     selection_policy: "fixed diversified liquid US stocks and ETFs; quarterly review for future cohorts only",
     point_in_time_membership: false,
     survivorship_bias_notice: "Current fixed membership is not a historical point-in-time index universe.",
@@ -53,7 +53,7 @@ export function assertInitialUniverse() {
   for (const symbol of INITIAL_UNIVERSE_SYMBOLS) {
     if (!/^[A-Z][A-Z0-9.-]{0,9}$/.test(symbol)) throw new Error(`Invalid initial universe symbol: ${symbol}`);
   }
-  const grouped = new Set(Object.values(GROUPS).flat());
+  const grouped = new Set(Object.values(INITIAL_UNIVERSE_GROUPS).flat());
   if (grouped.size !== unique.size || [...unique].some((symbol) => !grouped.has(symbol))) {
     throw new Error("Initial universe groups must cover every symbol exactly once");
   }

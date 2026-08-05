@@ -7,10 +7,10 @@ import { exchangeParts, normalizeCalendarSessions } from "./market-data.js";
 export const ORCHESTRATION_SCHEDULE_VERSION = 1;
 
 export const DEFAULT_CLOSE_PHASES = Object.freeze({
-  stop_entries: 15,
+  stop_entries: 30,
   cancel_unsafe_orders: 10,
-  flatten_positions: 5,
-  verify_flat: -1,
+  flatten_positions: 10,
+  verify_flat: 5,
   reconcile_session: -10,
   close_valid_day_ledger: -15,
   pipeline_incubation: -16,

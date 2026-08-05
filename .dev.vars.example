@@ -8,8 +8,22 @@ MARKET_DATA_MODE=off
 ORCHESTRATION_MODE=observe
 ALPACA_API_KEY=replace-with-your-paper-key-id
 ALPACA_API_SECRET=replace-with-your-paper-secret-key
+ALPACA_BROKER_MODE=shadow
 ALPACA_TRADING_ENABLED=false
+ALPACA_CANARY_TRADING_ENABLED=false
+ALPACA_LONG_TRADING_ENABLED=false
 ALPACA_SHORT_TRADING_ENABLED=false
+# Frozen Plan 09 safety defaults. Keep all execution switches false until the
+# shadow comparison and explicit canary checks pass.
+ALPACA_MAX_STRATEGY_PCT=0.005
+ALPACA_MAX_PORTFOLIO_PCT=0.10
+ALPACA_MAX_SYMBOL_PCT=0.02
+ALPACA_MAX_CLUSTER_PCT=0.04
+ALPACA_DAILY_LOSS_HALT_PCT=0.005
+ALPACA_ENTRY_CUTOFF_MINUTES=30
+ALPACA_FLATTEN_START_MINUTES=10
+ALPACA_FLAT_TARGET_MINUTES=5
+ALPACA_MAX_ORDER_PCT=0.02
 # Optional remote Backtrader service. Start in shadow, use legacy for an
 # immediate rollback, and switch to backtrader only after parity review.
 BACKTEST_SERVICE_URL=https://your-cloud-run-service.run.app

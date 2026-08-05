@@ -3,6 +3,7 @@ import test from "node:test";
 
 import {
   buildPaperCycle,
+  canReleaseStrategyToPaper,
   cancelManagedOpenOrders,
   getAccountOverview,
   getFiveMinuteHistory,
@@ -16,7 +17,10 @@ const credentials = {
   ALPACA_API_KEY: "paper-key",
   ALPACA_API_SECRET: "paper-secret",
   ALPACA_DATA_FEED: "iex",
+  ALPACA_BROKER_MODE: "shadow",
   ALPACA_TRADING_ENABLED: "false",
+  ALPACA_LONG_TRADING_ENABLED: "false",
+  ALPACA_SHORT_TRADING_ENABLED: "false",
   ALPACA_MAX_STRATEGY_PCT: "0.005",
   ALPACA_MAX_PORTFOLIO_PCT: "0.10",
 };
@@ -29,13 +33,17 @@ function momentumStrategy(asset = "SPY", size = 0.5) {
 }
 
 function stateFor(...strategies) {
-  return { strategies, alpaca: { managed_symbols: [] } };
+  return { strategies, alpaca: { managed_symbols: [] },
+    marketData: { live: { status: "healthy", coverage: 1 } } };
 }
 
 function fixtureFetch({
   existingOrder = null,
   positions = [],
   orders = [],
+  fills = [],
+  clock = {},
+  barEnd = null,
   assets = {},
   account = {},
   descendingSymbols = [],
@@ -69,16 +77,19 @@ function fixtureFetch({
     if (url.pathname === "/v2/clock") return Response.json({
       is_open: true, timestamp: "2026-08-03T15:00:00Z",
       next_open: "2026-08-04T13:30:00Z", next_close: "2026-08-03T20:00:00Z",
+      ...clock,
     });
     if (url.pathname === "/v2/calendar") return Response.json([
       { date: "2026-08-03", open: "09:30", close: "16:00" },
       { date: "2026-11-27", open: "09:30", close: "13:00" },
     ]);
     if (url.pathname === "/v2/account/portfolio/history") return Response.json(portfolioHistory);
+    if (url.pathname === "/v2/account/activities/FILL") return Response.json(fills);
     if (url.pathname === "/v2/stocks/bars") {
       const symbols = url.searchParams.get("symbols").split(",");
+      const finalBar = Date.parse(barEnd ?? clock.timestamp ?? "2026-08-03T15:00:00Z");
       const bars = Object.fromEntries(symbols.map((symbol) => [symbol, Array.from({ length: 260 }, (_, index) => ({
-        t: new Date(Date.UTC(2025, 0, 1) + index * 3600000).toISOString(),
+        t: new Date(finalBar - (259 - index) * 5 * 60_000).toISOString(),
         o: descendingSymbols.includes(symbol) ? 400 - index : 100 + index,
         h: descendingSymbols.includes(symbol) ? 401 - index : 101 + index,
         l: descendingSymbols.includes(symbol) ? 399 - index : 99 + index,
@@ -241,18 +252,22 @@ test("explicit paper-trading enablement submits an idempotent long order", async
     }],
     alpaca: { managed_symbols: [] },
   };
-  const cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, appState, "2026-08-03T15");
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_BROKER_MODE: "paper",
+    ALPACA_TRADING_ENABLED: "true", ALPACA_LONG_TRADING_ENABLED: "true" }, appState, "2026-08-03T15");
   assert.equal(cycle.can_trade_now, true);
   assert.equal(cycle.submitted_orders.length, 1);
   assert.equal(mock.submitted[0].side, "buy");
   assert.equal(mock.submitted[0].time_in_force, "day");
+  assert.ok("notional" in mock.submitted[0]);
+  assert.equal("qty" in mock.submitted[0], false);
   assert.match(mock.submitted[0].client_order_id, /^axiom-/);
 });
 
 test("signed signals propose a whole-share ETB short but do not submit it by default", async () => {
   const mock = fixtureFetch({ descendingSymbols: ["SPY"] });
   globalThis.fetch = mock;
-  const cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T16");
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_BROKER_MODE: "paper",
+    ALPACA_TRADING_ENABLED: "true", ALPACA_LONG_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T16");
   assert.equal(cycle.evaluations["AX-SPY-01"].signal, -1);
   assert.equal(cycle.proposed_orders[0].side, "sell");
   assert.ok(cycle.proposed_orders[0].qty > 0);
@@ -273,7 +288,8 @@ test("incubation evaluation exposes the next-open price and can never submit ord
 test("ETB shorts submit only with explicit short enablement", async () => {
   const mock = fixtureFetch({ descendingSymbols: ["SPY"] });
   globalThis.fetch = mock;
-  const cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true", ALPACA_SHORT_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T17");
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_BROKER_MODE: "paper",
+    ALPACA_TRADING_ENABLED: "true", ALPACA_SHORT_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T17");
   assert.equal(cycle.submitted_orders.length, 1);
   assert.equal(mock.submitted[0].side, "sell");
   assert.ok("qty" in mock.submitted[0]);
@@ -342,18 +358,20 @@ test("direction flips flatten the managed position before opening the opposite s
   assert.equal(cycle.proposed_orders.length, 1);
   assert.equal(cycle.proposed_orders[0].side, "sell");
   assert.equal(cycle.proposed_orders[0].qty, 4);
-  assert.match(cycle.proposed_orders[0].client_order_id, /flatten-long/);
+  assert.match(cycle.proposed_orders[0].client_order_id, /^axiom-[a-f0-9]{36}$/);
 });
 
 test("unmanaged positions and blocked accounts cannot receive automated orders", async () => {
   globalThis.fetch = fixtureFetch({ positions: [{ symbol: "SPY", side: "long", qty: "2", market_value: "500", current_price: "250" }] });
-  let cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T21");
+  let cycle = await buildPaperCycle({ ...credentials, ALPACA_BROKER_MODE: "paper",
+    ALPACA_TRADING_ENABLED: "true", ALPACA_LONG_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T21");
   assert.equal(cycle.proposed_orders.length, 0);
   assert.equal(cycle.safety_reasons[0].reason, "unmanaged_existing_position");
 
   const mock = fixtureFetch({ account: { trading_blocked: true } });
   globalThis.fetch = mock;
-  cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T22");
+  cycle = await buildPaperCycle({ ...credentials, ALPACA_BROKER_MODE: "paper",
+    ALPACA_TRADING_ENABLED: "true", ALPACA_LONG_TRADING_ENABLED: "true" }, stateFor(momentumStrategy()), "2026-08-03T22");
   assert.equal(cycle.can_trade_now, false);
   assert.equal(cycle.submitted_orders.length, 0);
   assert.equal(cycle.proposed_orders.length, 1);
@@ -376,4 +394,125 @@ test("frozen default risk caps are 0.5% per strategy and 10% portfolio gross", a
   const cycle = await buildPaperCycle(env, stateFor(momentumStrategy("SPY", 1)), "2026-08-03T24");
   assert.equal(cycle.proposed_orders.length, 1);
   assert.ok(Number(cycle.proposed_orders[0].notional) <= 500);
+});
+
+test("the entry cutoff blocks new risk and the close window flattens managed risk", async () => {
+  globalThis.fetch = fixtureFetch({ clock: { timestamp: "2026-08-03T19:31:00Z" } });
+  let cycle = await buildPaperCycle(credentials, stateFor(momentumStrategy()), "cutoff");
+  assert.equal(cycle.session_risk.status, "reduce_only");
+  assert.equal(cycle.block_new_risk, true);
+  assert.equal(cycle.proposed_orders.length, 0);
+
+  globalThis.fetch = fixtureFetch({
+    clock: { timestamp: "2026-08-03T19:51:00Z" },
+    positions: [{ symbol: "SPY", side: "long", qty: "4", market_value: "1000", current_price: "250" }],
+  });
+  const state = stateFor(momentumStrategy()); state.alpaca.managed_symbols = ["SPY"];
+  cycle = await buildPaperCycle(credentials, state, "close-flatten");
+  assert.equal(cycle.force_flatten, true);
+  assert.equal(cycle.submitted_orders.length, 1);
+  assert.equal(cycle.submitted_orders[0].side, "sell");
+});
+
+test("daily loss halt is sticky, cancels managed orders, and flattens positions", async () => {
+  const mock = fixtureFetch({
+    account: { equity: "99400", portfolio_value: "99400" },
+    positions: [{ symbol: "SPY", side: "long", qty: "2", market_value: "500", current_price: "250" }],
+    orders: [{ id: "open-1", client_order_id: "axiom-existing", symbol: "SPY", side: "buy",
+      type: "market", status: "new", qty: "1" }],
+  });
+  globalThis.fetch = mock;
+  const state = stateFor(momentumStrategy());
+  state.alpaca = { managed_symbols: ["SPY"], risk_session: { session_date: "2026-08-03",
+    baseline_equity: 100000, halted: false } };
+  const cycle = await buildPaperCycle(credentials, state, "daily-halt");
+  assert.equal(cycle.daily_risk.halted, true);
+  assert.equal(cycle.force_flatten, true);
+  assert.equal(cycle.cancelled_orders.length, 1);
+  assert.equal(cycle.submitted_orders.length, 1);
+});
+
+test("fill polling attaches only known framework attribution", async () => {
+  globalThis.fetch = fixtureFetch({ fills: [{ id: "fill-1", order_id: "broker-order-1", symbol: "SPY",
+    side: "buy", qty: "1.25", price: "400", transaction_time: "2026-08-03T14:59:00Z",
+    type: "partial_fill", cum_qty: "1.25", leaves_qty: "0.25" }] });
+  const state = stateFor(momentumStrategy());
+  state.alpaca.known_orders = { "broker-order-1": { client_order_id: "axiom-known",
+    allocations: [{ strategy_id: "AX-SPY-01", signed_notional: 500 }] } };
+  const cycle = await buildPaperCycle(credentials, state, "fill-poll");
+  assert.equal(cycle.fills[0].qty, 1.25);
+  assert.equal(cycle.fills[0].client_order_id, "axiom-known");
+  assert.equal(cycle.fills[0].allocations[0].strategy_id, "AX-SPY-01");
+});
+
+test("a bounded canary is the only order allowed in canary mode", async () => {
+  const mock = fixtureFetch(); globalThis.fetch = mock;
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_BROKER_MODE: "canary",
+    ALPACA_CANARY_TRADING_ENABLED: "true" }, stateFor(), "canary", "canary",
+  { canary: { symbol: "SPY", side: "buy", notional: 25 } });
+  assert.equal(cycle.submitted_orders.length, 1);
+  assert.equal(mock.submitted[0].notional, "25");
+});
+
+test("short-capable DNA cannot release until the independent paper-short switch is active", () => {
+  const strategy = { strategy_format: "dsl-v1", strategy_dna: { entry: { short: "short-signal" } } };
+  assert.equal(canReleaseStrategyToPaper(credentials, strategy), false);
+  assert.equal(canReleaseStrategyToPaper({ ...credentials, ALPACA_BROKER_MODE: "paper",
+    ALPACA_TRADING_ENABLED: "true", ALPACA_SHORT_TRADING_ENABLED: "true" }, strategy), true);
+  assert.equal(canReleaseStrategyToPaper(credentials,
+    { strategy_format: "dsl-v1", strategy_dna: { entry: { short: null } } }), true);
+});
+
+test("stale market bars fail closed without disturbing existing flat state", async () => {
+  globalThis.fetch = fixtureFetch({ barEnd: "2026-08-03T12:00:00Z" });
+  const cycle = await buildPaperCycle(credentials, stateFor(momentumStrategy()), "stale-data");
+  assert.equal(cycle.proposed_orders.length, 0);
+  assert.equal(cycle.evaluations["AX-SPY-01"].critical_fault, "stale_or_insufficient_market_data");
+});
+
+test("retries reuse the deterministic client ID and never duplicate broker exposure", async () => {
+  const existing = { id: "existing-1", status: "accepted", filled_qty: "0",
+    client_order_id: "existing-client", symbol: "SPY", side: "buy", type: "market", notional: "500" };
+  const mock = fixtureFetch({ existingOrder: existing }); globalThis.fetch = mock;
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_BROKER_MODE: "paper",
+    ALPACA_TRADING_ENABLED: "true", ALPACA_LONG_TRADING_ENABLED: "true" },
+  stateFor(momentumStrategy()), "same-finalized-bar", "same-finalized-bar");
+  assert.equal(cycle.submitted_orders[0].id, "existing-1");
+  assert.equal(mock.submitted.length, 0);
+});
+
+test("malformed buying power, clock uncertainty, and broker failures fail closed", async () => {
+  globalThis.fetch = fixtureFetch({ account: { buying_power: "not-a-number" } });
+  await assert.rejects(buildPaperCycle(credentials, stateFor(momentumStrategy()), "bad-account"),
+    /equity\/buying power/);
+
+  const mock = fixtureFetch({ clock: { next_close: "not-a-date" } }); globalThis.fetch = mock;
+  const uncertain = await buildPaperCycle({ ...credentials, ALPACA_BROKER_MODE: "paper",
+    ALPACA_TRADING_ENABLED: "true", ALPACA_LONG_TRADING_ENABLED: "true" },
+  stateFor(momentumStrategy()), "bad-clock");
+  assert.equal(uncertain.session_risk.critical, true);
+  assert.equal(uncertain.submitted_orders.length, 0);
+
+  globalThis.fetch = fixtureFetch({ clock: { is_open: false },
+    positions: [{ symbol: "SPY", side: "long", qty: "1", market_value: "250", current_price: "250" }] });
+  const closedState = stateFor(momentumStrategy()); closedState.alpaca.managed_symbols = ["SPY"];
+  const closed = await buildPaperCycle(credentials, closedState, "closed-market");
+  assert.ok(closed.safety_reasons.some((item) => item.reason === "managed_position_outside_regular_session"));
+
+  globalThis.fetch = async () => { throw new DOMException("timed out", "TimeoutError"); };
+  await assert.rejects(buildPaperCycle(credentials, stateFor(momentumStrategy()), "timeout"), /timed out/);
+});
+
+test("position-attribution divergence forces broker-authoritative flatten", async () => {
+  globalThis.fetch = fixtureFetch({
+    positions: [{ symbol: "SPY", side: "long", qty: "2", market_value: "500", current_price: "250" }],
+  });
+  const state = stateFor(momentumStrategy());
+  state.alpaca = { managed_symbols: ["SPY"], position_attribution: {
+    SPY: { signed_quantity: 1, by_strategy: { "AX-SPY-01": 1 } },
+  } };
+  const cycle = await buildPaperCycle(credentials, state, "divergence");
+  assert.equal(cycle.force_flatten, true);
+  assert.equal(cycle.submitted_orders[0].side, "sell");
+  assert.ok(cycle.safety_reasons.some((item) => item.reason === "broker_position_attribution_divergence"));
 });

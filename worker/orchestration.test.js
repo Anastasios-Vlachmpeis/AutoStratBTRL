@@ -4,7 +4,7 @@ import { applyOrchestrationCommand, createOrchestrationCommand, emptyOrchestrati
 
 const at = "2026-08-05T12:00:00.000Z";
 const command = (kind, values = {}) => createOrchestrationCommand({ kind, timestamp: at,
-  actor: kind.startsWith("pause_") || ["kill_switch", "clear_kill_switch", "flatten_all", "global_pause", "global_resume", "resume_execution"].includes(kind) ? "operator:test" : "system",
+  actor: kind.startsWith("pause_") || ["kill_switch", "clear_kill_switch", "flatten_all", "global_pause", "global_resume", "resume_execution", "reset_daily_loss_halt", "run_broker_canary"].includes(kind) ? "operator:test" : "system",
   correlation_id: values.intent_id ?? `${kind}:test`, ...values });
 
 test("duplicate commands return the prior result without advancing state", () => {
@@ -16,10 +16,32 @@ test("duplicate commands return the prior result without advancing state", () =>
 
 test("kill switch blocks new target intents even when an old message arrives later", () => {
   const killed = applyOrchestrationCommand(emptyOrchestrationState(), command("kill_switch", { actor: "operator:admin" }));
+  assert.equal(killed.state.controls.flatten_requested, true);
+  assert.deepEqual(killed.result.actions.map((item) => item.kind), ["broker.cancel_unsafe_orders", "broker.flatten_all"]);
   const stale = command("compute_released_targets", { intent_id: "bar-before-kill", timestamp: "2026-08-05T11:55:00.000Z" });
   const blocked = applyOrchestrationCommand(killed.state, stale);
   assert.equal(executionAllowed({ orchestration: blocked.state }), false); assert.equal(blocked.result.status, "blocked");
   assert.equal(blocked.result.reason, "kill_switch"); assert.deepEqual(blocked.result.actions, []);
+});
+
+test("entry cutoff keeps released reconciliation reduce-only while pausing incubation", () => {
+  const stopped = applyOrchestrationCommand(emptyOrchestrationState(), command("stop_entries"));
+  const released = applyOrchestrationCommand(stopped.state, command("compute_released_targets"));
+  assert.equal(released.result.status, "applied");
+  assert.equal(released.result.actions[0].block_new_risk, true);
+  assert.equal(applyOrchestrationCommand(stopped.state, command("compute_incubation_targets")).result.reason,
+    "entries_paused");
+});
+
+test("daily-halt reset and bounded canary require explicit operator commands", () => {
+  assert.equal(applyOrchestrationCommand(emptyOrchestrationState(), command("reset_daily_loss_halt"))
+    .result.actions[0].kind, "risk.reset_daily_halt");
+  const canary = applyOrchestrationCommand(emptyOrchestrationState(), command("run_broker_canary", {
+    payload: { symbol: "spy", side: "buy", notional: 25 },
+  }));
+  assert.deepEqual(canary.result.actions[0].payload, { symbol: "SPY", side: "buy", notional: 25 });
+  assert.throws(() => applyOrchestrationCommand(emptyOrchestrationState(),
+    command("run_broker_canary", { payload: { symbol: "SPY", side: "buy", notional: 26 } })), /\$1 to \$25/);
 });
 
 test("post-close controls are idempotent and cannot override quality gates", () => {

@@ -23,7 +23,8 @@ const ZERO_HASH = "0".repeat(64);
 
 function lifecycleQuality(state) {
   return ({ generated: "screened", rework: "development", validation: "sealed_validation", capacity_wait: "capacity_wait",
-    incubation: "incubation", released: "released_paper", healthy: "released_paper", adjusted: "released_paper",
+    incubation: "incubation", release_blocked_short: "incubation",
+    released: "released_paper", healthy: "released_paper", adjusted: "released_paper",
     watch: "watch", development_reject: "development_reject", holdout_reject: "holdout_reject",
     inconclusive: "inconclusive", superseded: "superseded", dropped: "retired" })[state] ?? "proposed";
 }
@@ -986,13 +987,39 @@ export function applyAlpacaCycle(state, cycle) {
     }
   }
   const priorManaged = new Set(state.alpaca?.managed_symbols ?? []);
+  const knownOrders = { ...(state.alpaca?.known_orders ?? {}) };
   for (const order of cycle.submitted_orders ?? []) {
     // Reconciliation never submits against an unmanaged position, so every
     // accepted Axiom order (including a new short sale) safely establishes
     // management for that symbol.
     priorManaged.add(order.symbol);
+    if (order.id) knownOrders[order.id] = { client_order_id: order.client_order_id,
+      symbol: order.symbol, side: order.side, allocations: order.allocations ?? [] };
     event(state, "ORDER", `${order.side.toUpperCase()} ${order.symbol} submitted`, `${order.status} · ${order.client_order_id}`);
   }
+  const priorFills = state.alpaca?.fills ?? [];
+  const priorFillIds = new Set(priorFills.map((fill) => fill.broker_fill_id));
+  const fillById = new Map(priorFills.map((fill) => [fill.broker_fill_id, fill]));
+  const positionAttribution = structuredClone(state.alpaca?.position_attribution ?? {});
+  for (const fill of cycle.fills ?? []) {
+    fillById.set(fill.broker_fill_id, fill);
+    if (priorFillIds.has(fill.broker_fill_id)) continue;
+    const allocations = fill.allocations ?? [];
+    const gross = allocations.reduce((sum, item) => sum + Math.abs(Number(item.signed_notional)), 0);
+    if (!gross) continue;
+    const entry = positionAttribution[fill.symbol] ?? { signed_quantity: 0, by_strategy: {} };
+    const direction = fill.side === "sell" ? -1 : 1;
+    for (const allocation of allocations) {
+      const quantity = direction * Number(fill.qty) * Math.abs(Number(allocation.signed_notional)) / gross;
+      entry.by_strategy[allocation.strategy_id] = (entry.by_strategy[allocation.strategy_id] ?? 0) + quantity;
+      if (Math.abs(entry.by_strategy[allocation.strategy_id]) < 1e-8) delete entry.by_strategy[allocation.strategy_id];
+    }
+    entry.signed_quantity = Object.values(entry.by_strategy).reduce((sum, quantity) => sum + quantity, 0);
+    if (Math.abs(entry.signed_quantity) < 1e-8) delete positionAttribution[fill.symbol];
+    else positionAttribution[fill.symbol] = entry;
+  }
+  const fills = [...fillById.values()].sort((a, b) => String(a.transaction_time).localeCompare(String(b.transaction_time))).slice(-512);
+  const lastFillAt = fills.at(-1)?.transaction_time ?? state.alpaca?.last_fill_at ?? null;
   for (const failure of cycle.order_errors ?? []) {
     event(state, "ORDER_ERROR", `${failure.symbol} order failed`, failure.message);
   }
@@ -1015,6 +1042,18 @@ export function applyAlpacaCycle(state, cycle) {
     submitted_orders: cycle.submitted_orders,
     order_errors: cycle.order_errors,
     safety_reasons: cycle.safety_reasons ?? [],
+    activation: cycle.activation ?? state.alpaca?.activation ?? null,
+    allocation: cycle.allocation ?? state.alpaca?.allocation ?? null,
+    risk_policy: cycle.risk_policy ?? state.alpaca?.risk_policy ?? null,
+    session_risk: cycle.session_risk ?? state.alpaca?.session_risk ?? null,
+    risk_session: cycle.daily_risk ?? state.alpaca?.risk_session ?? null,
+    block_new_risk: Boolean(cycle.block_new_risk),
+    broker_intents: (cycle.broker_intents ?? []).slice(-128),
+    known_orders: knownOrders,
+    position_attribution: positionAttribution,
+    fills,
+    last_fill_at: lastFillAt,
+    critical_incidents: (cycle.safety_reasons ?? []).filter((item) => item.severity === "critical").slice(-128),
     managed_symbols: [...priorManaged],
     last_cycle_bucket: cycle.scheduled_bucket,
     last_bar_time: latestBarTime,

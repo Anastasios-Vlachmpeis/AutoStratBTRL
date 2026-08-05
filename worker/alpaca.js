@@ -1,6 +1,8 @@
 import { evaluateStrategyWindow, latestSignal } from "./engine.js";
 import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
-import { evaluateLatestTarget } from "./dsl.js";
+import { evaluateLatestTarget, hashCanonical } from "./dsl.js";
+import { allocatePortfolioRisk, dailyRiskState, riskPolicy, riskReducingTarget,
+  sessionRiskPolicy } from "./risk-allocator.js";
 
 const PAPER_BASE = "https://paper-api.alpaca.markets";
 const DATA_BASE = "https://data.alpaca.markets";
@@ -26,6 +28,7 @@ async function alpacaRequest(env, base, path, init = {}, allowNotFound = false) 
   const response = await fetch(`${base}${path}`, {
     ...init,
     headers: { ...headers(env, init.body != null), ...(init.headers ?? {}) },
+    signal: init.signal ?? AbortSignal.timeout(Math.min(Math.max(Number(env.ALPACA_TIMEOUT_MS ?? 10_000), 1_000), 30_000)),
   });
   if (allowNotFound && response.status === 404) return null;
   const requestId = response.headers.get("x-request-id");
@@ -50,12 +53,16 @@ function cleanNumber(value) {
 }
 
 function sanitizeAccount(account) {
+  const equity = Number(account.equity), buyingPower = Number(account.buying_power);
+  if (!(equity > 0) || !Number.isFinite(buyingPower) || buyingPower < 0 || !account.status) {
+    throw new Error("Alpaca returned stale or malformed account equity/buying power");
+  }
   return {
     status: account.status,
     currency: account.currency,
     cash: cleanNumber(account.cash),
-    buying_power: cleanNumber(account.buying_power),
-    equity: cleanNumber(account.equity),
+    buying_power: buyingPower,
+    equity,
     last_equity: cleanNumber(account.last_equity),
     portfolio_value: cleanNumber(account.portfolio_value),
     daytrade_count: cleanNumber(account.daytrade_count),
@@ -90,8 +97,25 @@ function sanitizeOrder(order) {
     qty: cleanNumber(order.qty),
     notional: cleanNumber(order.notional),
     filled_qty: cleanNumber(order.filled_qty),
+    filled_avg_price: cleanNumber(order.filled_avg_price),
     submitted_at: order.submitted_at,
+    filled_at: order.filled_at ?? null,
+    updated_at: order.updated_at ?? null,
+    canceled_at: order.canceled_at ?? null,
   };
+}
+
+function sanitizeFill(activity) {
+  const quantity = Number(activity.qty), price = Number(activity.price);
+  if (!activity.id || !activity.order_id || !activity.symbol || !(quantity > 0) || !(price >= 0)
+      || !["buy", "sell"].includes(activity.side) || Number.isNaN(new Date(activity.transaction_time).getTime())) {
+    throw new Error("Alpaca returned a malformed fill activity");
+  }
+  const transactionTime = new Date(activity.transaction_time).toISOString();
+  return { broker_fill_id: String(activity.id), broker_order_id: String(activity.order_id),
+    symbol: String(activity.symbol), side: activity.side, qty: quantity, quantity, price,
+    transaction_time: transactionTime, filled_at: transactionTime, type: activity.type ?? "fill",
+    cumulative_quantity: cleanNumber(activity.cum_qty), leaves_quantity: cleanNumber(activity.leaves_qty) };
 }
 
 function sanitizePortfolioHistory(history) {
@@ -163,6 +187,26 @@ export async function cancelManagedOpenOrders(env) {
     cancelled.push({ id: order.id, client_order_id: order.client_order_id, symbol: order.symbol });
   }
   return { cancelled, skipped_manual_orders: overview.open_orders.length - managed.length, fetched_at: overview.fetched_at };
+}
+
+/** Poll the authoritative Trading API fill ledger. The cursor is persisted by
+ * the Durable Object; D1 uniqueness makes overlapping pages harmless. */
+export async function getFillActivities(env, { after, maxPages = 10 } = {}) {
+  const fills = []; let pageToken = null; const tokens = new Set();
+  for (let page = 0; page < maxPages; page += 1) {
+    const query = new URLSearchParams({ direction: "asc", page_size: "100" });
+    if (after) query.set("after", new Date(after).toISOString());
+    if (pageToken) query.set("page_token", pageToken);
+    const activities = await alpacaRequest(env, PAPER_BASE, `/v2/account/activities/FILL?${query}`);
+    if (!Array.isArray(activities)) throw new Error("Alpaca fill activity response is malformed");
+    fills.push(...activities.map(sanitizeFill));
+    if (activities.length < 100) break;
+    pageToken = String(activities.at(-1)?.id ?? "");
+    if (!pageToken || tokens.has(pageToken)) throw new Error("Alpaca fill pagination did not advance");
+    tokens.add(pageToken);
+    if (page === maxPages - 1) throw new Error(`Alpaca fill pagination exceeded ${maxPages} pages`);
+  }
+  return fills;
 }
 
 export async function getStockBars(env, symbols, {
@@ -287,8 +331,8 @@ async function submitOrder(env, order) {
   return sanitizeOrder(created);
 }
 
-function orderId(bucket, symbol, side) {
-  return `axiom-${bucket.replace(/[^0-9]/g, "").slice(0, 12)}-${symbol.toLowerCase()}-${side}`;
+function orderId(brokerIntentId, symbol, leg) {
+  return `axiom-${hashCanonical({ broker_intent_id: brokerIntentId, symbol, leg }).slice(0, 36)}`;
 }
 
 function signedPositionValue(position) {
@@ -309,80 +353,217 @@ function wholeSharesForNotional(notional, position) {
   return price > 0 ? Math.floor(Math.abs(notional) / price) : 0;
 }
 
+export function brokerActivation(env = {}, options = {}) {
+  const mode = ["off", "shadow", "canary", "paper"].includes(String(env.ALPACA_BROKER_MODE).toLowerCase())
+    ? String(env.ALPACA_BROKER_MODE).toLowerCase() : "shadow";
+  const global = env.ALPACA_TRADING_ENABLED === "true";
+  return { mode, targets_enabled: mode !== "off", shadow_enabled: ["shadow", "canary", "paper"].includes(mode),
+    canary_enabled: mode === "canary" && env.ALPACA_CANARY_TRADING_ENABLED === "true" && Boolean(options.canary),
+    long_enabled: mode === "paper" && global && env.ALPACA_LONG_TRADING_ENABLED === "true",
+    short_enabled: mode === "paper" && global && env.ALPACA_SHORT_TRADING_ENABLED === "true",
+    global_trading_enabled: global };
+}
+
+export function canReleaseStrategyToPaper(env = {}, strategy = {}) {
+  const needsShort = strategy.strategy_format === "dsl-v1" && strategy.strategy_dna?.entry?.short != null;
+  return !needsShort || brokerActivation(env).short_enabled;
+}
+
+function strategySymbols(strategy, incubation = false) {
+  if (incubation || strategy.strategy_format !== "dsl-v1" || !strategy.strategy_dna) return [strategy.asset];
+  return [...new Set(strategy.strategy_dna.scope?.symbols ?? [strategy.asset])]
+    .filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)).sort();
+}
+
+function freshBar(rows, clockTimestamp, intervalMinutes) {
+  const latest = rows?.at(-1); const barTime = new Date(latest?.t).getTime(); const clock = new Date(clockTimestamp).getTime();
+  if (!latest || !Number.isFinite(barTime) || !Number.isFinite(clock)) return false;
+  const age = clock - barTime;
+  return age >= -60_000 && age <= Math.max(15, intervalMinutes * 2 + 5) * 60_000;
+}
+
+function publicOrder(order) {
+  const { _opens_short, _risk_reducing, _broker_intent_id, _allocations, ...safe } = order;
+  return { ...safe, notional: cleanNumber(order.notional), qty: cleanNumber(order.qty),
+    broker_intent_id: _broker_intent_id, risk_reducing: Boolean(_risk_reducing) };
+}
+
+async function cancelOrder(env, order) {
+  await alpacaRequest(env, PAPER_BASE, `/v2/orders/${encodeURIComponent(order.id)}`, { method: "DELETE" });
+  return { ...order, status: "cancel_requested", canceled_at: new Date().toISOString() };
+}
+
+/** Execute a previously frozen broker plan. Runtime callers persist the plan
+ * before invoking this function, so a crash can replay by client order ID. */
+export async function executePaperPlan(env, plan) {
+  const activation = plan.activation ?? brokerActivation(env, { canary: plan.canary });
+  const safety = Boolean(plan.force_flatten || plan.daily_risk?.halted || plan.kill_switch);
+  const cancelled = [];
+  for (const order of plan.cancel_plans ?? []) cancelled.push(await cancelOrder(env, order));
+  const submitted = []; const orderErrors = []; const safetyReasons = [...(plan.safety_reasons ?? [])];
+  const accountReady = plan.clock?.is_open && String(plan.account?.status ?? "").toUpperCase() === "ACTIVE"
+    && !plan.account?.trading_blocked && !plan.account?.account_blocked && !plan.session_risk?.critical;
+  for (const order of plan.order_plans ?? []) {
+    const permitted = safety || (activation.canary_enabled && plan.canary)
+      || (order._risk_reducing && activation.mode === "paper" && activation.global_trading_enabled)
+      || (order._opens_short ? activation.short_enabled : activation.long_enabled);
+    if (!permitted) {
+      safetyReasons.push({ symbol: order.symbol, reason: order._opens_short
+        ? "short_trading_disabled" : plan.canary ? "canary_trading_disabled" : "long_trading_disabled" });
+      continue;
+    }
+    if (!accountReady) {
+      safetyReasons.push({ symbol: order.symbol, reason: "account_or_market_unavailable" });
+      continue;
+    }
+    try {
+      const { _opens_short, _risk_reducing, _broker_intent_id, _allocations, ...submitPayload } = order;
+      const result = await submitOrder(env, submitPayload);
+      submitted.push({ ...result, broker_intent_id: _broker_intent_id,
+        risk_reducing: Boolean(_risk_reducing), allocations: _allocations ?? [] });
+    } catch (error) {
+      orderErrors.push({ symbol: order.symbol, broker_intent_id: order._broker_intent_id,
+        message: error instanceof Error ? error.message : "Order failed" });
+    }
+  }
+  return { ...plan, trading_enabled: safety || activation.long_enabled || activation.short_enabled || activation.canary_enabled,
+    short_trading_enabled: activation.short_enabled, can_trade_now: Boolean(accountReady),
+    proposed_orders: (plan.order_plans ?? []).map(publicOrder), submitted_orders: submitted,
+    cancelled_orders: cancelled, order_errors: orderErrors, safety_reasons: safetyReasons };
+}
+
 export async function buildPaperCycle(env, appState, scheduledBucket, orderBucket = scheduledBucket, options = {}) {
-  const overview = await getAccountOverview(env);
-  const forceFlatten = Boolean(appState.orchestration?.controls?.flatten_requested);
+  const fillAfter = appState.alpaca?.last_fill_at ?? new Date(Date.now() - 2 * 86400_000).toISOString();
+  const [overview, observedFills] = await Promise.all([getAccountOverview(env), getFillActivities(env, { after: fillAfter })]);
+  const policy = riskPolicy(env); const controls = appState.orchestration?.controls ?? {};
+  const sessionRisk = sessionRiskPolicy(overview.clock, policy);
+  const dailyRisk = dailyRiskState(appState.alpaca?.risk_session, {
+    equity: overview.account.equity, timestamp: overview.clock.timestamp, policy,
+  });
+  const requestedFlatten = Boolean(options.safetyFlatten || controls.flatten_requested || controls.kill_switch);
+  let forceFlatten = requestedFlatten || dailyRisk.halted || sessionRisk.force_flatten;
   const permittedStates = options.scope === "incubation"
     ? new Set(["incubation"]) : new Set(["released", "healthy", "watch", "adjusted"]);
-  const active = forceFlatten ? [] : appState.strategies.filter((strategy) => permittedStates.has(strategy.state));
-  const symbols = [...new Set(active.map((strategy) => strategy.asset).filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)))];
+  const active = forceFlatten || options.canary ? [] : appState.strategies.filter((strategy) => permittedStates.has(strategy.state));
+  const scoped = new Map(active.map((strategy) => [strategy.id, strategySymbols(strategy, options.scope === "incubation")]));
+  const symbols = [...new Set([...scoped.values()].flat())].filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)).sort();
   const dslSymbols = [...new Set(active.filter((strategy) => strategy.strategy_format === "dsl-v1")
-    .map((strategy) => strategy.asset).filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)))];
+    .flatMap((strategy) => scoped.get(strategy.id) ?? []))].sort();
   const legacySymbols = symbols.filter((symbol) => !dslSymbols.includes(symbol)
     || active.some((strategy) => strategy.asset === symbol && strategy.strategy_format !== "dsl-v1"));
   const [legacyBars, dslBars] = await Promise.all([
     legacySymbols.length ? getMonitoringBars(env, legacySymbols) : {},
     dslSymbols.length ? getDslMonitoringBars(env, dslSymbols) : {},
   ]);
-  const evaluations = {};
-  const desiredBySymbol = Object.fromEntries(SUPPORTED_SYMBOLS.map((symbol) => [symbol, 0]));
+  const evaluations = {}; const evaluationsBySymbol = {}; const rawTargets = {}; const safety_reasons = [];
   const equity = overview.account.equity;
-  const strategyCap = equity * Math.min(Math.max(Number(env.ALPACA_MAX_STRATEGY_PCT || 0.005), 0), 0.05);
-  const portfolioCap = Math.min(
-    equity * Math.min(Math.max(Number(env.ALPACA_MAX_PORTFOLIO_PCT || 0.10), 0), 0.50),
-    overview.account.buying_power * 0.50,
-  );
-
   for (const strategy of active) {
     const isDsl = strategy.strategy_format === "dsl-v1" && strategy.strategy_dna;
-    const symbolBars = (isDsl ? dslBars : legacyBars)[strategy.asset] ?? [];
-    const prices = symbolBars.map((bar) => bar.c);
-    if (prices.length < 60) continue;
-    const evaluation = evaluateStrategyWindow(strategy, isDsl ? symbolBars : prices, 21);
-    // Keep execution explicitly tied to the frozen strategy's signed signal.
-    const rawTarget = isDsl ? evaluateLatestTarget(strategy.strategy_dna, symbolBars) : null;
-    const signal = isDsl ? Math.sign(rawTarget) : latestSignal(strategy, prices);
-    evaluations[strategy.id] = {
-      ...evaluation,
-      signal,
-      latest_price: prices.at(-1),
-      latest_open: symbolBars.at(-1)?.o ?? prices.at(-1),
-      bar_time: symbolBars.at(-1).t,
-    };
-    const desired = isDsl
-      ? equity * rawTarget * Number(strategy.risk_multiplier ?? 1)
-      : strategyCap * Number(strategy.params.position_size || 0) * signal;
-    desiredBySymbol[strategy.asset] += Math.max(-strategyCap, Math.min(strategyCap, desired));
+    const perSymbol = {}; rawTargets[strategy.id] = {};
+    for (const symbol of scoped.get(strategy.id) ?? []) {
+      const symbolBars = (isDsl ? dslBars : legacyBars)[symbol] ?? []; const prices = symbolBars.map((bar) => bar.c);
+      const interval = isDsl ? 5 : 60;
+      if (prices.length < 60 || !freshBar(symbolBars, overview.clock.timestamp, interval)) {
+        perSymbol[symbol] = { signal: 0, critical_fault: "stale_or_insufficient_market_data",
+          latest_price: prices.at(-1) ?? null, latest_open: symbolBars.at(-1)?.o ?? null,
+          bar_time: symbolBars.at(-1)?.t ?? null };
+        safety_reasons.push({ symbol, strategy_id: strategy.id, reason: "stale_or_insufficient_market_data" });
+        continue;
+      }
+      const evaluation = evaluateStrategyWindow(strategy, isDsl ? symbolBars : prices, 21);
+      const target = isDsl ? evaluateLatestTarget(strategy.strategy_dna, symbolBars)
+        : Number(strategy.params.position_size || 0) * latestSignal(strategy, prices);
+      perSymbol[symbol] = { ...evaluation, signal: Math.sign(target), target,
+        latest_price: prices.at(-1), latest_open: symbolBars.at(-1)?.o ?? prices.at(-1), bar_time: symbolBars.at(-1).t };
+      evaluationsBySymbol[symbol] ??= perSymbol[symbol]; rawTargets[strategy.id][symbol] = target;
+    }
+    const primary = perSymbol[strategy.asset] ?? Object.values(perSymbol)[0] ?? {};
+    evaluations[strategy.id] = { ...primary, signal: Math.sign(Object.values(rawTargets[strategy.id]).reduce((sum, value) => sum + value, 0)),
+      symbols: perSymbol };
   }
-
-  const desiredGross = Object.values(desiredBySymbol).reduce((sum, value) => sum + Math.abs(value), 0);
-  const scale = desiredGross > portfolioCap && desiredGross > 0 ? portfolioCap / desiredGross : 1;
+  let allocation = allocatePortfolioRisk({ equity, buyingPower: overview.account.buying_power,
+    strategies: active, rawTargets, policy });
+  if (options.canary) {
+    const symbol = String(options.canary.symbol ?? "SPY").toUpperCase();
+    if (!SUPPORTED_SYMBOLS.includes(symbol) || !["buy", "sell"].includes(options.canary.side)) throw new Error("Canary symbol/side is invalid");
+    const amount = Math.min(Math.max(Number(options.canary.notional ?? 25), 1), Number(env.ALPACA_CANARY_MAX_NOTIONAL ?? 25));
+    allocation = { schema_version: 1, targets: { [symbol]: options.canary.side === "buy" ? amount : -amount },
+      contributions: [], gross_before_netting: amount, net_gross: amount, limits: { canary: amount }, portfolio_scale: 1 };
+  }
   const positionBySymbol = Object.fromEntries(overview.positions.map((position) => [position.symbol, position]));
-  const openSymbols = new Set(overview.open_orders.map((order) => order.symbol));
   const managedSymbols = new Set(appState.alpaca?.managed_symbols ?? []);
-  const candidateSymbols = SUPPORTED_SYMBOLS.filter((symbol) => desiredBySymbol[symbol] !== 0
-    || (options.scope !== "incubation" && managedSymbols.has(symbol)));
+  const unmanaged = overview.positions.filter((position) => !managedSymbols.has(position.symbol));
+  for (const position of unmanaged) safety_reasons.push({ symbol: position.symbol, reason: "unmanaged_existing_position", severity: "critical" });
+  if (sessionRisk.critical) safety_reasons.push({ reason: "broker_clock_uncertain", severity: "critical" });
+  if (!overview.clock.is_open) for (const position of overview.positions.filter((item) => managedSymbols.has(item.symbol))) {
+    safety_reasons.push({ symbol: position.symbol, reason: "managed_position_outside_regular_session", severity: "critical" });
+  }
+  const attribution = appState.alpaca?.position_attribution ?? {};
+  const attributionDivergence = [];
+  for (const [symbol, expected] of Object.entries(attribution)) {
+    const actual = positionBySymbol[symbol] ? (positionBySymbol[symbol].side === "short"
+      ? -Math.abs(positionBySymbol[symbol].qty) : Math.abs(positionBySymbol[symbol].qty)) : 0;
+    const expectedQuantity = Number(expected.signed_quantity ?? 0);
+    const tolerance = Math.max(.000001, Math.abs(actual) * .001);
+    if (Math.abs(actual - expectedQuantity) > tolerance) attributionDivergence.push({ symbol,
+      reason: "broker_position_attribution_divergence", severity: "critical",
+      expected_quantity: expectedQuantity, actual_quantity: actual });
+  }
+  if (attributionDivergence.length) {
+    safety_reasons.push(...attributionDivergence);
+    forceFlatten = true;
+  }
+  const candidateSymbols = [...new Set([...Object.keys(allocation.targets),
+    ...(options.scope !== "incubation" ? [...managedSymbols] : []), ...overview.positions.map((item) => item.symbol)])]
+    .filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)).sort();
   const assets = candidateSymbols.length ? await getAssets(env, candidateSymbols) : {};
-  const proposed = [];
-  const safety_reasons = [];
+  const activation = brokerActivation(env, options);
+  const marketHealth = appState.marketData?.live;
+  const dataBlocked = marketHealth && (marketHealth.status !== "healthy" || Number(marketHealth.coverage) < policy.minimum_data_coverage);
+  const blockIncrease = Boolean(options.blockNewRisk || controls.entries_paused || controls.execution_paused
+    || !sessionRisk.allow_increase || dailyRisk.halted || dataBlocked);
+  const cancelPlans = forceFlatten ? overview.open_orders.filter((order) => String(order.client_order_id).startsWith("axiom-")) : [];
+  const cancelIds = new Set(cancelPlans.map((item) => item.id));
+  const openSymbols = new Set(overview.open_orders.filter((order) => !cancelIds.has(order.id)).map((order) => order.symbol));
+  const proposed = []; const intents = [];
 
   for (const symbol of candidateSymbols) {
     if (openSymbols.has(symbol)) {
       safety_reasons.push({ symbol, reason: "open_order_pending" });
       continue;
     }
-    const target = desiredBySymbol[symbol] * scale;
+    const requestedTarget = forceFlatten ? 0 : Number(allocation.targets[symbol] ?? 0);
     const position = positionBySymbol[symbol];
     const current = signedPositionValue(position);
     if (position && !managedSymbols.has(symbol)) {
       safety_reasons.push({ symbol, reason: "unmanaged_existing_position" });
       continue;
     }
+    const target = riskReducingTarget(current, requestedTarget, blockIncrease);
     const difference = target - current;
-    if (Math.abs(difference) < 25) continue;
+    const minimumOrder = Math.max(1, Number(env.ALPACA_MIN_ORDER_NOTIONAL ?? 1));
+    if (Math.abs(difference) < minimumOrder) continue;
     const asset = assets[symbol];
+    const maxNotional = equity * policy.maximum_order_pct;
+    const increasesExposure = current === 0 ? target !== 0
+      : Math.sign(target) === Math.sign(current) && Math.abs(target) > Math.abs(current);
+    if (increasesExposure && Math.abs(difference) > maxNotional + .01) {
+      safety_reasons.push({ symbol, reason: "order_notional_sanity_limit", severity: "critical" }); continue;
+    }
+    let allocations = allocation.contributions.filter((item) => item.symbol === symbol)
+      .map((item) => ({ strategy_id: item.strategy_id, signed_notional: item.notional }));
+    if (!allocations.length && attribution[symbol]?.by_strategy) {
+      const price = Math.abs(Number(position?.current_price)) || 1;
+      allocations = Object.entries(attribution[symbol].by_strategy).map(([strategy_id, quantity]) => ({
+        strategy_id, signed_notional: Number(quantity) * price,
+      })).filter((item) => item.signed_notional !== 0);
+    }
+    const intentId = `intent-${hashCanonical({ scheduledBucket, symbol, target, current, allocations }).slice(0, 40)}`;
+    intents.push({ broker_intent_id: intentId, symbol, target_signed_notional: target,
+      current_signed_notional: current, allocations, intent_kind: forceFlatten ? "flatten" : blockIncrease ? "reduce_only" : "rebalance" });
     const baseOrder = {
       symbol, type: "market", time_in_force: "day", extended_hours: false,
+      _broker_intent_id: intentId, _allocations: allocations,
     };
 
     // Crossing zero is deliberately two-phase.  This avoids accidentally
@@ -390,13 +571,13 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
     if (current > 0 && target < 0) {
       const quantity = Math.abs(cleanNumber(position?.qty));
       if (quantity > 0) proposed.push({ ...baseOrder, qty: String(quantity), side: "sell",
-        client_order_id: orderId(orderBucket, symbol, "flatten-long") });
+        _risk_reducing: true, client_order_id: orderId(intentId, symbol, "flatten-long") });
       continue;
     }
     if (current < 0 && target > 0) {
       const quantity = Math.abs(cleanNumber(position?.qty));
       if (quantity > 0) proposed.push({ ...baseOrder, qty: String(quantity), side: "buy",
-        client_order_id: orderId(orderBucket, symbol, "cover-short") });
+        _risk_reducing: true, client_order_id: orderId(intentId, symbol, "cover-short") });
       continue;
     }
 
@@ -414,7 +595,8 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
       if (quantity > 0) proposed.push({ ...baseOrder, qty: String(quantity),
         side: increasingShort ? "sell" : "buy",
         _opens_short: increasingShort,
-        client_order_id: orderId(orderBucket, symbol, increasingShort ? "short-increase" : "cover") });
+        _risk_reducing: !increasingShort,
+        client_order_id: orderId(intentId, symbol, increasingShort ? "short-increase" : "cover") });
     } else if (difference > 0) {
       if (!asset?.tradable || !asset?.fractionable) {
         safety_reasons.push({ symbol, reason: "asset_not_fractionable_for_long" });
@@ -424,7 +606,8 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
         ...baseOrder,
         notional: String(Math.floor(difference * 100) / 100),
         side: "buy",
-        client_order_id: orderId(orderBucket, symbol, "buy"),
+        _risk_reducing: false,
+        client_order_id: orderId(intentId, symbol, "buy"),
       });
     } else if (current > 0) {
       const fraction = Math.min(Math.abs(difference) / Math.abs(current), 1);
@@ -433,63 +616,55 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
         ...baseOrder,
         qty: String(quantity),
         side: "sell",
-        client_order_id: orderId(orderBucket, symbol, "sell"),
+        _risk_reducing: true,
+        client_order_id: orderId(intentId, symbol, "sell"),
       });
     } else {
       if (!shortBorrowable(asset)) {
         safety_reasons.push({ symbol, reason: "short_borrow_unavailable" });
         continue;
       }
-      const quantity = wholeSharesForNotional(difference, { current_price: evaluations[
-        active.find((strategy) => strategy.asset === symbol)?.id
-      ]?.latest_price });
+      const quantity = wholeSharesForNotional(difference, { current_price: evaluationsBySymbol[symbol]?.latest_price });
+      if (quantity > policy.maximum_order_shares) {
+        safety_reasons.push({ symbol, reason: "order_share_sanity_limit", severity: "critical" }); continue;
+      }
       if (quantity > 0) proposed.push({ ...baseOrder, qty: String(quantity), side: "sell",
-        _opens_short: true,
-        client_order_id: orderId(orderBucket, symbol, "short") });
+        _opens_short: true, _risk_reducing: false,
+        client_order_id: orderId(intentId, symbol, "short") });
     }
   }
-
-  // A verified safety flatten contains only closes of framework-managed
-  // positions. It must remain available after entries/trading are disabled;
-  // otherwise the pre-close stop-entry phase can strand open exposure.
-  const tradingEnabled = options.tradingEnabled === false ? false
-    : options.safetyFlatten === true && forceFlatten ? true
-      : env.ALPACA_TRADING_ENABLED === "true";
-  const shortTradingEnabled = env.ALPACA_SHORT_TRADING_ENABLED === "true";
-  const canTrade = tradingEnabled && overview.clock.is_open
-    && String(overview.account.status || "").toUpperCase() === "ACTIVE"
-    && !overview.account.trading_blocked && !overview.account.account_blocked;
-  const submitted = [];
-  const order_errors = [];
-  if (canTrade) {
-    for (const order of proposed) {
-      if (order._opens_short && !shortTradingEnabled) {
-        safety_reasons.push({ symbol: order.symbol, reason: "short_trading_disabled" });
-        continue;
-      }
-      try {
-        const { _opens_short, ...submitPayload } = order;
-        submitted.push(await submitOrder(env, submitPayload));
-      } catch (error) {
-        order_errors.push({ symbol: order.symbol, message: error instanceof Error ? error.message : "Order failed" });
-      }
-    }
-  }
-
-  return {
+  const knownOrders = appState.alpaca?.known_orders ?? {};
+  const fills = observedFills.map((fill) => ({ ...fill, client_order_id: knownOrders[fill.broker_order_id]?.client_order_id ?? null,
+    allocations: knownOrders[fill.broker_order_id]?.allocations ?? [] }));
+  const plan = {
     ...overview,
     feed: env.ALPACA_DATA_FEED || "iex",
-    trading_enabled: tradingEnabled,
+    activation,
+    trading_enabled: false,
     force_flatten: forceFlatten,
-    short_trading_enabled: shortTradingEnabled,
-    can_trade_now: canTrade,
+    kill_switch: Boolean(controls.kill_switch),
+    short_trading_enabled: activation.short_enabled,
+    can_trade_now: false,
     evaluations,
-    proposed_orders: proposed.map(({ _opens_short, ...order }) => ({ ...order, notional: cleanNumber(order.notional), qty: cleanNumber(order.qty) })),
-    submitted_orders: submitted,
-    order_errors,
+    allocation,
+    risk_policy: policy,
+    session_risk: sessionRisk,
+    daily_risk: dailyRisk,
+    block_new_risk: blockIncrease,
+    broker_intents: intents,
+    order_plans: proposed,
+    cancel_plans: cancelPlans,
+    proposed_orders: proposed.map(publicOrder),
+    submitted_orders: [],
+    cancelled_orders: [],
+    order_errors: [],
     safety_reasons,
+    fills,
+    managed_symbols: [...managedSymbols],
+    canary: options.canary ?? null,
     scheduled_bucket: scheduledBucket,
   };
+  return options.submitOrders === false || options.tradingEnabled === false ? plan : executePaperPlan(env, plan);
 }
 
 export { SUPPORTED_SYMBOLS };

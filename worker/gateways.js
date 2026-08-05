@@ -1,5 +1,6 @@
 import {
   buildPaperCycle,
+  executePaperPlan,
   cancelManagedOpenOrders,
   getAccountOverview,
   getAssets,
@@ -57,6 +58,15 @@ export class AlpacaPaperBrokerGateway {
 
   async buildCycle(appState, scheduledBucket, orderBucket = scheduledBucket, options = {}) {
     return buildPaperCycle(this.env, appState, scheduledBucket, orderBucket, options);
+  }
+
+  async planCycle(appState, scheduledBucket, orderBucket = scheduledBucket, options = {}) {
+    return buildPaperCycle(this.env, appState, scheduledBucket, orderBucket,
+      { ...options, submitOrders: false });
+  }
+
+  async executePlan(plan) {
+    return executePaperPlan(this.env, plan);
   }
 
   async cancelManagedOpenOrders() {

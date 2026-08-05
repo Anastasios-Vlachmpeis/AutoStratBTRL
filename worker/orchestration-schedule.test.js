@@ -27,14 +27,16 @@ test("every-minute watchdog follows the NYSE calendar through DST and skips holi
 });
 
 test("near-close phases use an exact early-close session boundary", () => {
-  const before = planOrchestrationTick({ calendar, now: "2026-11-27T17:44:00Z" }); // 12:44 ET
+  const before = planOrchestrationTick({ calendar, now: "2026-11-27T17:29:00Z" }); // 12:29 ET
   assert.equal(kinds(before).includes("stop_entries"), false);
-  const stop = planOrchestrationTick({ calendar, now: "2026-11-27T17:45:00Z" });
+  const stop = planOrchestrationTick({ calendar, now: "2026-11-27T17:30:00Z" });
   assert.ok(kinds(stop).includes("stop_entries"));
-  const flatten = planOrchestrationTick({ calendar, now: "2026-11-27T17:55:00Z" });
+  const flatten = planOrchestrationTick({ calendar, now: "2026-11-27T17:50:00Z" });
   assert.ok(kinds(flatten).includes("cancel_unsafe_orders"));
   assert.ok(kinds(flatten).includes("flatten_positions"));
   assert.equal(flatten.intents.find((item) => item.kind === "flatten_positions").data.session_close, "13:00");
+  const verify = planOrchestrationTick({ calendar, now: "2026-11-27T17:55:00Z" });
+  assert.ok(kinds(verify).includes("verify_flat"));
 });
 
 test("late ticks repair close work while known IDs suppress duplicate delivery", () => {
