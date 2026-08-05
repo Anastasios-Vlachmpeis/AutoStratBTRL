@@ -82,6 +82,8 @@ test("reproduction preserves lineage and mutates DNA", () => {
 test("rework archives the parent and creates one audited DNA change", () => {
   const state = createDemoState();
   const parent = addReworkStrategy(state);
+  parent.rework.consumed_incubation = { started_at: "2026-08-01T00:00:00Z",
+    ended_at: "2026-08-20T00:00:00Z", event_set_hash: "e".repeat(64) };
   const originalParams = structuredClone(parent.params);
   const [child] = reworkCandidates(state);
   assert.equal(parent.state, "superseded");
@@ -90,6 +92,8 @@ test("rework archives the parent and creates one audited DNA change", () => {
   assert.equal(child.state, "generated");
   assert.equal(child.rework.attempt, 1);
   assert.equal(child.rework.history.length, 1);
+  assert.deepEqual(child.rework.consumed_incubation, parent.rework.consumed_incubation);
+  assert.deepEqual(child.rework.history[0].consumed_incubation, parent.rework.consumed_incubation);
   assert.equal(child.validation, null);
   assert.equal(child.backtests, 0);
   const changed = Object.keys(child.params).filter((key) => child.params[key] !== originalParams[key]);

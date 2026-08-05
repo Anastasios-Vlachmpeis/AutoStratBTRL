@@ -18,7 +18,7 @@ const filterConfigs = {
     { id: "rework", label: "Rework", states: ["rework"] },
     { id: "validation", label: "Validation", states: ["validation", "capacity_wait"] },
     { id: "market", label: "Market", states: ["incubation", "release_blocked_short", "released", "healthy", "watch", "adjusted"] },
-    { id: "retired", label: "Retired", states: ["development_reject", "holdout_reject", "inconclusive", "dropped", "superseded"] },
+    { id: "retired", label: "Retired", states: ["development_reject", "holdout_reject", "inconclusive", "incubation_reject", "dropped", "superseded"] },
   ],
   testing: [
     { id: "all", label: "All" },
@@ -40,7 +40,7 @@ const filterConfigs = {
 const statusLabels = {
   generated: "Generated", rework: "Rework", validation: "Validation", capacity_wait: "Capacity wait",
   development_reject: "Development reject", incubation: "Incubation", release_blocked_short: "Short release blocked", holdout_reject: "Holdout reject",
-  inconclusive: "Inconclusive", released: "Released", healthy: "Healthy", watch: "Watch", adjusted: "Adjusted",
+  inconclusive: "Inconclusive", incubation_reject: "Incubation reject", released: "Released", healthy: "Healthy", watch: "Watch", adjusted: "Adjusted",
   dropped: "Dropped", superseded: "Superseded"
 };
 
@@ -516,6 +516,21 @@ function renderStrategyContext(strategy) {
     || Number(monitor.adjustments ?? 0) > 0;
   const hasReworkContext = strategy.state === "rework" || Number(rework.attempt ?? 0) > 0;
 
+  if (strategy.state === "incubation") {
+    const evidence = strategy.incubation ?? {};
+    const invalidDays = Object.values(evidence.sessions ?? {}).filter((day) => day.completed && !day.valid);
+    const exclusions = [...new Set(invalidDays.flatMap((day) => day.exclusions ?? []))];
+    const statusText = evidence.status === "incubation_blocked"
+      ? "Counters paused while an operational or data fault is resolved."
+      : "Shadow execution is running on genuinely future five-minute bars; no candidate orders reach Alpaca.";
+    strip.className = `strategy-context-strip ${evidence.status === "incubation_blocked" ? "watch" : "rework"}`;
+    strip.innerHTML = `<span class="context-marker" aria-hidden="true">I</span>
+      <div class="context-copy"><span class="context-kicker">LIVE INCUBATION</span><strong>Future-market release evidence</strong><small>${escapeHtml(statusText)}${exclusions.length ? ` Excluded: ${escapeHtml(exclusions.join(", "))}.` : ""}</small></div>
+      <div class="context-metrics"><div class="context-metric"><span>VALID DAYS</span><strong>${Number(evidence.valid_trading_days ?? 0)}/10</strong><small>20 DAY MAX</small></div><div class="context-metric"><span>ELIGIBLE TRADES</span><strong>${Number(evidence.eligible_trades ?? 0)}/67</strong><small>${Number(evidence.excluded_trades ?? 0)} EXCLUDED</small></div></div>`;
+    strip.hidden = false;
+    return;
+  }
+
   if (strategy.state === "release_blocked_short") {
     strip.className = "strategy-context-strip watch";
     strip.innerHTML = `<span class="context-marker" aria-hidden="true">!</span>
@@ -781,11 +796,14 @@ function renderTable() {
   $("#empty-state").textContent = strategiesForView().length ? "No strategies match this filter." : "No strategies match this desk.";
   $("#strategy-table").innerHTML = strategies.map((strategy) => {
     const m = strategy.metrics;
+    const incubationProgress = strategy.incubation
+      ? `${Number(strategy.incubation.valid_trading_days ?? 0)}/10 days · ${Number(strategy.incubation.eligible_trades ?? 0)}/67 trades`
+      : null;
     return `<tr data-id="${escapeHtml(strategy.id)}" class="${strategy.id === selectedId ? "selected" : ""}">
       <td class="unit-cell"><strong>${escapeHtml(strategy.name)}</strong><span>${escapeHtml(strategy.id)}${strategy.parent ? ` · CHILD OF ${escapeHtml(strategy.parent)}` : ""}${strategy.rework?.attempt ? ` · TRY ${strategy.rework.attempt}/${strategy.rework.max_attempts || 3}` : ""}</span></td>
       <td class="archetype-cell"><strong>${escapeHtml(strategy.archetype)}</strong><span>${escapeHtml(strategy.asset)}</span></td>
       <td><span class="status-badge ${strategy.state}">${escapeHtml(statusLabels[strategy.state] || strategy.state)}</span></td>
-      <td>${strategy.backtests ? `${Math.min(strategy.backtests, 3)} dev${strategy.validation ? " · 1 unseen" : ""}` : "not tested"}</td><td>${m ? number(m.sharpe) : "—"}</td><td>${m ? pct(m.drawdown) : "—"}</td>
+      <td>${incubationProgress ?? (strategy.backtests ? `${Math.min(strategy.backtests, 3)} dev${strategy.validation ? " · 1 unseen" : ""}` : "not tested")}</td><td>${m ? number(m.sharpe) : "—"}</td><td>${m ? pct(m.drawdown) : "—"}</td>
       <td class="score-cell">${m ? number(m.score, 1) : "—"}${m ? `<div class="score-bar"><i style="width:${Math.min(m.score, 100)}%"></i></div>` : ""}</td><td class="row-arrow">›</td></tr>`;
   }).join("");
   $$("#strategy-table tr").forEach((row) => row.addEventListener("click", () => {

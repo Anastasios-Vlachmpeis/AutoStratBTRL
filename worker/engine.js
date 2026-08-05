@@ -3,6 +3,7 @@
 import { buildStrategyDNA, evaluateLatestTarget, evaluateStrategyTargets, hashCanonical } from "./dsl.js";
 import { DSL_FAMILIES, buildGeneratedStrategyDNA } from "./dsl-generation.js";
 import { createEvaluationPolicy, evaluationPolicyHash } from "./evaluation-policy.js";
+import { publicIncubationState } from "./incubation.js";
 import { applyLifecycleCommand, initialLifecycle, transitionId } from "./lifecycle.js";
 import { emptyOrchestrationState, ensureOrchestrationState, publicOrchestrationState } from "./orchestration.js";
 import { emptyResearchState, ensureResearchState, publicResearchState } from "./research-contract.js";
@@ -10,7 +11,7 @@ import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
 
 export const REGIMES = ["Expansion", "Compression", "Stress", "Recovery"];
 export const ASSETS = [...INITIAL_UNIVERSE_SYMBOLS];
-export const CURRENT_SCHEMA_VERSION = 11;
+export const CURRENT_SCHEMA_VERSION = 12;
 
 const NAMES = [
   "Orion Pulse", "Kestrel Drift", "Helix Break", "Cobalt Revert",
@@ -26,7 +27,8 @@ function lifecycleQuality(state) {
     incubation: "incubation", release_blocked_short: "incubation",
     released: "released_paper", healthy: "released_paper", adjusted: "released_paper",
     watch: "watch", development_reject: "development_reject", holdout_reject: "holdout_reject",
-    inconclusive: "inconclusive", superseded: "superseded", dropped: "retired" })[state] ?? "proposed";
+    inconclusive: "inconclusive", incubation_reject: "development_reject",
+    superseded: "superseded", dropped: "retired" })[state] ?? "proposed";
 }
 
 function strategyLifecycle(strategy, { datasetHash = ZERO_HASH, configurationHash = ZERO_HASH,
@@ -627,6 +629,8 @@ function mutateDevelopmentDNA(state, parent) {
         trades: parent.metrics.trades,
         robustness: parent.metrics.robustness,
       } : null,
+      consumed_incubation: parent.rework?.consumed_incubation
+        ? clone(parent.rework.consumed_incubation) : null,
       cycle: state.cycle,
     },
   ];
@@ -636,6 +640,8 @@ function mutateDevelopmentDNA(state, parent) {
     diagnosis: diagnosis.text,
     source_stage: parent.rework?.source_stage ?? "development",
     change,
+    consumed_incubation: parent.rework?.consumed_incubation
+      ? clone(parent.rework.consumed_incubation) : null,
     history,
   };
   parent.state = "superseded";
@@ -1124,6 +1130,9 @@ export function migrateState(state) {
 
 export function snapshot(state) {
   const strategies = clone(state.strategies);
+  for (const strategy of strategies) {
+    if (strategy.incubation) strategy.incubation = publicIncubationState(strategy.incubation);
+  }
   const released = strategies.filter((item) => ACTIVE_STATES.has(item.state));
   const scored = strategies.filter((item) => item.metrics);
   const averageScore = mean(scored.map((item) => item.metrics.score));
@@ -1145,7 +1154,7 @@ export function snapshot(state) {
       testing: strategies.filter((item) => item.state === "rework").length,
       validation: strategies.filter((item) => item.state === "validation" || item.state === "capacity_wait").length,
       released: released.length,
-      dropped: strategies.filter((item) => ["development_reject", "holdout_reject", "inconclusive", "dropped"].includes(item.state)).length,
+      dropped: strategies.filter((item) => ["development_reject", "holdout_reject", "inconclusive", "incubation_reject", "dropped"].includes(item.state)).length,
       average_score: round(averageScore, 1),
       capital: round(capital, 2),
     },

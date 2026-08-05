@@ -20,7 +20,9 @@ import {
   makeDataset, makeMultiSymbolDataset, normalizeMetrics, remoteEnabled, sha256,
 } from "./backtest.js";
 import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
-import { finalizeIncubationSession, recordIncubationBar } from "./incubation.js";
+import { createIncubationPolicy, evaluateIncubationGate, finalizeIncubationSession,
+  recordIncubationEvent, startIncubation } from "./incubation.js";
+import { IncubationStore } from "./incubation-store.js";
 import { createRuntimeGateways } from "./gateways.js";
 import { BrokerStore } from "./broker-store.js";
 import { canReleaseStrategyToPaper } from "./alpaca.js";
@@ -389,6 +391,8 @@ export class AxiomLab extends DurableObject {
     this.controlPlane = createControlPlaneRuntime(ctx.storage, env, SINGLETON_NAME);
     this.gateways = createRuntimeGateways(env);
     this.brokerStore = env.AXIOM_DB ? new BrokerStore(env.AXIOM_DB) : null;
+    this.incubationStore = env.AXIOM_DB && String(env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true"
+      ? new IncubationStore(env.AXIOM_DB) : null;
     this.marketDataRepository = new MarketDataRepository(ctx.storage, env, SINGLETON_NAME);
     this.orchestrationStore = env.AXIOM_DB ? new OrchestrationStore(env.AXIOM_DB, {
       queue: env.AXIOM_JOBS, artifacts: env.AXIOM_ARTIFACTS,
@@ -719,12 +723,109 @@ export class AxiomLab extends DurableObject {
     if (incidents) for (const safety of execution.safety_reasons.filter((item) => item.severity === "critical")) {
       const incidentId = `broker:${bucket}:${safety.symbol ?? safety.broker_fill_id ?? "portfolio"}:${safety.reason}`;
       if (!incidents.some((item) => item.incident_id === incidentId)) incidents.push({
-        incident_id: incidentId, kind: "broker_safety", reason: safety.reason,
+        incident_id: incidentId, kind: "broker_safety", severity: "critical",
+        strategy_id: safety.strategy_id ?? null, reason: safety.reason,
         symbol: safety.symbol ?? null, broker_fill_id: safety.broker_fill_id ?? null,
         opened_at: execution.clock?.timestamp ?? new Date().toISOString(),
       });
     }
     return execution;
+  }
+
+  async persistIncubationDecisionArtifact(state, strategy, decision, timestamp) {
+    if (strategy.incubation?.decision_artifact_id
+        && strategy.incubation?.artifact_decision_id === decision.decision_id) {
+      return strategy.incubation.decision_artifact_id;
+    }
+    const legacyId = `incubation-${decision.decision_id}`;
+    const policyVersionId = this.incubationStore?.policyVersionId(strategy.incubation) ?? null;
+    const content = { schema_version: 1, kind: "incubation.release-decision",
+      strategy_id: strategy.id, decision, evidence: strategy.incubation,
+      frozen_provenance: strategy.incubation.provenance, created_at: timestamp };
+    const resultHash = await sha256(content);
+    const stored = await this.controlPlane.artifacts.putArtifact(legacyId, content, {
+      phase: "incubation", strategy_id: strategy.id, decision_id: decision.decision_id,
+    }, this.controlPlane.artifacts.contentStore ? {
+      strategyId: strategy.id, policyVersionId, resultHash, redactionClass: "private",
+    } : {});
+    const artifactId = stored.mirror?.artifact_id ?? legacyId;
+    strategy.incubation.decision_artifact_id = artifactId;
+    strategy.incubation.artifact_decision_id = decision.decision_id;
+    state.incubationArtifacts ??= {};
+    state.incubationArtifacts[artifactId] = { id: artifactId, strategy_id: strategy.id,
+      decision_id: decision.decision_id, outcome: decision.outcome, created_at: timestamp };
+    return artifactId;
+  }
+
+  async applyIncubationDecision(state, strategy, decision, command) {
+    strategy.incubation.status = decision.outcome;
+    if (["incubation_continue", "incubation_blocked"].includes(decision.outcome)) {
+      if (this.incubationStore) await this.incubationStore.persistEvidence({ workspaceId: SINGLETON_NAME, strategy });
+      return decision.outcome;
+    }
+    const artifactId = await this.persistIncubationDecisionArtifact(state, strategy, decision, command.timestamp);
+    if (decision.outcome === "incubation_rework" || decision.outcome === "incubation_reject") {
+      const rework = decision.outcome === "incubation_rework";
+      strategy.state = rework ? "rework" : "incubation_reject";
+      strategy.release_ready = null;
+      strategy.rework = rework ? { ...(strategy.rework ?? {}), source_stage: "incubation",
+        diagnosis: "Forward incubation exhausted 20 valid sessions without a releasable 67-trade evidence set.",
+        consumed_incubation: { started_at: strategy.incubation.started_at, ended_at: command.timestamp,
+          decision_id: decision.decision_id,
+          event_set_hash: await sha256(strategy.incubation.processed_event_ids) },
+        history: strategy.rework?.history ?? [] } : strategy.rework;
+      if (strategy.lifecycle?.quality?.state === "incubation") transitionStrategyLifecycle(strategy,
+        rework ? "development" : "development_reject", { trigger: "incubation_decision",
+          artifact_id: artifactId, event_id: command.command_id,
+          reason_code: decision.outcome, explanation: decision.findings.join(", ") || decision.outcome,
+          correlation_id: decision.decision_id, timestamp: command.timestamp });
+      if (this.incubationStore) await this.incubationStore.persistEvidence({ workspaceId: SINGLETON_NAME, strategy });
+      this.record(state, rework ? "INCUBATION_REWORK" : "INCUBATION_REJECT",
+        `${strategy.name} ${rework ? "returned to development" : "failed incubation"}`,
+        decision.findings.join(", ") || decision.outcome);
+      return decision.outcome;
+    }
+    strategy.release_ready = { at: command.timestamp, decision_id: decision.decision_id,
+      artifact_id: artifactId, valid_trading_days: decision.summary.valid_trading_days,
+      eligible_trades: decision.summary.eligible_trades };
+    if (state.orchestration?.controls?.release_paused) {
+      strategy.state = "incubation"; strategy.incubation.status = "incubation_blocked";
+      strategy.release_blocked_reason = "release_paused";
+      if (this.incubationStore) await this.incubationStore.persistEvidence({ workspaceId: SINGLETON_NAME, strategy });
+      this.record(state, "RELEASE_PAUSED", `${strategy.name} passed incubation`,
+        "Evidence is frozen; paper release waits for the operator release control to resume.");
+      return "incubation_blocked";
+    }
+    if (!canReleaseStrategyToPaper(this.env, strategy)) {
+      strategy.state = "release_blocked_short"; strategy.incubation.status = "release_blocked_short";
+      strategy.release_blocked_reason = "short_execution_not_enabled";
+      if (strategy.lifecycle?.quality?.state === "incubation") transitionStrategyLifecycle(strategy,
+        "release_blocked_short", { trigger: "incubation_evidence", artifact_id: artifactId,
+          event_id: command.command_id, reason_code: "release_blocked_short",
+          explanation: "Incubation passed; independent paper-short execution remains disabled.",
+          correlation_id: decision.decision_id, timestamp: command.timestamp });
+      if (this.incubationStore) await this.incubationStore.persistEvidence({ workspaceId: SINGLETON_NAME, strategy });
+      this.record(state, "RELEASE_BLOCKED", `${strategy.name} passed incubation`,
+        "Evidence is frozen; paper release waits only for the independent short-execution switch.");
+      return "release_blocked_short";
+    }
+    strategy.state = "released"; strategy.incubation.status = "released_paper";
+    strategy.release_blocked_reason = null;
+    if (this.incubationStore) {
+      await this.incubationStore.persistEvidence({ workspaceId: SINGLETON_NAME, strategy });
+      const release = await this.incubationStore.persistRelease({ workspaceId: SINGLETON_NAME,
+        strategy, decisionArtifactId: artifactId, releasedAt: command.timestamp });
+      strategy.release_id = release.releaseId;
+    }
+    if (["incubation", "release_blocked_short"].includes(strategy.lifecycle?.quality?.state)) {
+      transitionStrategyLifecycle(strategy, "released_paper", { trigger: "incubation_evidence",
+        artifact_id: artifactId, event_id: command.command_id, reason_code: "incubation_passed",
+        explanation: `${decision.summary.valid_trading_days} valid days and ${decision.summary.eligible_trades} eligible trades`,
+        correlation_id: decision.decision_id, timestamp: command.timestamp });
+    }
+    this.record(state, "RELEASE", `${strategy.name} released to paper`,
+      "Frozen live-incubation evidence passed; risk becomes eligible on the next safe canonical bar.");
+    return "released_paper";
   }
 
   async executeOrchestrationActions(state, command, result) {
@@ -931,8 +1032,27 @@ export class AxiomLab extends DurableObject {
           for (const strategy of state.strategies.filter((item) => item.state === "incubation")) {
             const evaluation = cycle.evaluations?.[strategy.id];
             if (!evaluation) continue;
-            recordIncubationBar(strategy, evaluation, { eventId: action.payload?.event_id ?? bucket,
-              sessionDate, bucketClose: action.payload?.bucket_close ?? command.timestamp });
+            const allocated = Object.fromEntries((cycle.allocation?.contributions ?? [])
+              .filter((item) => item.strategy_id === strategy.id)
+              .map((item) => [item.symbol, Number(item.notional)]));
+            const shadowEvaluation = { ...evaluation, symbols: Object.fromEntries(
+              Object.entries(evaluation.symbols ?? {}).map(([symbol, item]) => [symbol,
+                { ...item, shadow_target_notional: allocated[symbol] ?? 0 }])) };
+            const operationalFaults = (cycle.safety_reasons ?? []).filter((item) =>
+              item.severity === "critical" && (!item.strategy_id || item.strategy_id === strategy.id))
+              .map((item) => item.reason);
+            const recorded = recordIncubationEvent(strategy, shadowEvaluation, {
+              eventId: action.payload?.event_id ?? bucket, sessionDate,
+              bucketClose: action.payload?.bucket_close ?? command.timestamp,
+              forceFlatten: cycle.force_flatten, operationalFaults, actualFeed: cycle.feed,
+            });
+            if (!recorded.duplicate && recorded.closed_trades > 0) {
+              const peers = state.strategies.filter((item) => item.id !== strategy.id
+                && ["released", "healthy", "watch", "adjusted"].includes(item.state))
+                .map((item) => item.behavior_hash ?? item.research?.behavior_hash).filter(Boolean);
+              const decision = evaluateIncubationGate(strategy.incubation, { releasedBehaviorHashes: peers });
+              await this.applyIncubationDecision(state, strategy, decision, command);
+            }
           }
         }
       } else if (action.kind === "pipeline.monitor") {
@@ -951,44 +1071,21 @@ export class AxiomLab extends DurableObject {
           ? Math.max(1, Math.floor((toMinutes(close) - toMinutes(open)) / 5)) : 78;
         for (const strategy of candidates) {
           const decision = finalizeIncubationSession(strategy, sessionDate, { expectedBars,
-            marketDataCriticalFault: state.marketData?.live?.status === "critical" });
-          if (decision === "qualified") strategy.release_ready = { at: command.timestamp,
-            valid_trading_days: strategy.incubation.valid_trading_days,
-            closed_trades: strategy.incubation.closed_trades };
-          else if (decision === "rework") {
-            strategy.state = "rework"; strategy.release_ready = null;
-            strategy.rework = { ...(strategy.rework ?? {}), source_stage: "incubation",
-              diagnosis: "Incubation did not satisfy 10 valid sessions and 67 completed trades within 20 sessions.",
-              history: strategy.rework?.history ?? [] };
-            if (strategy.lifecycle?.quality?.state === "incubation") transitionStrategyLifecycle(strategy, "development", {
-              trigger: "incubation_timeout", artifact_id: strategy.incubation?.artifact_id ?? "artifact:incubation",
-              event_id: command.command_id, reason_code: "incubation_timeout", explanation: strategy.rework.diagnosis,
-              correlation_id: command.correlation_id, timestamp: command.timestamp });
-          }
+            marketDataCriticalFault: state.marketData?.live?.status === "critical", sessionOpen: open,
+            operationalFaults: orchestration.incidents.filter((item) => !item.resolved_at
+              && item.strategy_id === strategy.id && item.severity === "critical").map((item) => item.kind) });
+          await this.applyIncubationDecision(state, strategy, decision, command);
         }
       } else if (action.kind === "pipeline.release") {
-        const releaseSession = action.payload?.session_date ?? newYorkClock(command.timestamp).date;
-        const unfinished = state.strategies.find((item) => item.state === "incubation"
-          && !item.incubation?.sessions?.[releaseSession]?.completed);
-        if (unfinished) throw new Error(`Release waits for incubation session evidence for ${unfinished.id}`);
-        for (const strategy of state.strategies.filter((item) =>
-          ["incubation", "release_blocked_short"].includes(item.state) && item.release_ready)) {
-          if (!canReleaseStrategyToPaper(this.env, strategy)) {
-            strategy.state = "release_blocked_short";
-            strategy.release_blocked_reason = "short_execution_not_enabled";
-            this.record(state, "RELEASE_BLOCKED", `${strategy.name} held in incubation`,
-              "Its strategy DNA can open shorts, but autonomous paper shorts are not enabled.");
-            continue;
-          }
-          strategy.release_blocked_reason = null;
-          strategy.state = "released";
-          if (strategy.lifecycle?.quality?.state === "incubation") transitionStrategyLifecycle(strategy, "released_paper", {
-            trigger: "incubation_evidence", artifact_id: strategy.incubation?.artifact_id ?? "artifact:incubation",
-            event_id: command.command_id, reason_code: "incubation_passed",
-            explanation: `${strategy.release_ready.valid_trading_days} valid days and ${strategy.release_ready.closed_trades} closed trades`,
-            correlation_id: command.correlation_id, timestamp: command.timestamp,
-          });
-          this.record(state, "RELEASE", `${strategy.name} released to paper`, "Incubation evidence passed the frozen release gate.");
+        for (const strategy of state.strategies.filter((item) => item.release_ready
+          && ((item.state === "incubation" && item.release_blocked_reason === "release_paused")
+            || (item.state === "release_blocked_short" && canReleaseStrategyToPaper(this.env, item))))) {
+          const peers = state.strategies.filter((item) => item.id !== strategy.id
+            && ["released", "healthy", "watch", "adjusted"].includes(item.state))
+            .map((item) => item.behavior_hash ?? item.research?.behavior_hash).filter(Boolean);
+          const decision = evaluateIncubationGate(strategy.incubation, { releasedBehaviorHashes: peers });
+          if (decision.outcome !== "released_paper") throw new Error(`Frozen incubation replay changed for ${strategy.id}`);
+          await this.applyIncubationDecision(state, strategy, decision, command);
         }
       } else if (action.kind === "report.generate_daily") {
         state.operational_reports ??= { daily: {}, weekly: {} };
@@ -1880,15 +1977,23 @@ export class AxiomLab extends DurableObject {
           input_hash: runShard?.input_hash ?? run.response.input_hash, service_result_hash: runShard?.result_hash ?? run.response.result_hash,
           warnings: runShard?.warnings ?? run.response.warnings ?? [] }, { strategy: strategyResult, metrics: validation,
           holdout_decision: { policy_hash, ...holdoutDecision } });
+        const completedAt = new Date().toISOString();
         strategy.backtest_runs ??= {}; strategy.backtest_runs.holdout = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: runShard?.engine ?? run.response.engine ?? { name: "backtrader" }, input_hash: runShard?.input_hash ?? run.response.input_hash,
           service_result_hash: runShard?.result_hash ?? run.response.result_hash, result_hash: await sha256({ result, validation, policy_hash, holdoutDecision }),
-          policy_hash, decision: holdoutDecision, completed_at: new Date().toISOString() };
+          policy_hash, decision: holdoutDecision, completed_at: completedAt };
         strategy.validation = validation; strategy.backtests = (strategy.backtests ?? 0) + 1;
         const authorization = strategy.holdout_authorization;
         recordSealedHoldoutOutcome(state, { lineage_id: lineageIdentity(strategy), authorization_id: authorization?.authorization_id,
           outcome, result_hash: strategy.backtest_runs.holdout.result_hash, artifact_id: artifactId });
         strategy.holdout_outcome = outcome;
         strategy.state = outcome;
+        if (outcome === "incubation") {
+          startIncubation(strategy, { policy: createIncubationPolicy(), startedAt: completedAt,
+            feed: this.env.ALPACA_DATA_FEED ?? "iex" });
+          if (this.incubationStore) await this.incubationStore.persistEvidence({
+            workspaceId: SINGLETON_NAME, strategy,
+          });
+        }
         strategy.service_status = { phase: "holdout", status: "ok", at: new Date().toISOString() };
         if (strategy.lifecycle?.operational?.state === "running") transitionStrategyLifecycle(strategy, "ready", {
           kind: "operational", trigger: "holdout_result", artifact_id: artifactId, event_id: run.job_id,

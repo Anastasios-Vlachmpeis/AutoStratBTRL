@@ -369,8 +369,8 @@ export function canReleaseStrategyToPaper(env = {}, strategy = {}) {
   return !needsShort || brokerActivation(env).short_enabled;
 }
 
-function strategySymbols(strategy, incubation = false) {
-  if (incubation || strategy.strategy_format !== "dsl-v1" || !strategy.strategy_dna) return [strategy.asset];
+function strategySymbols(strategy) {
+  if (strategy.strategy_format !== "dsl-v1" || !strategy.strategy_dna) return [strategy.asset];
   return [...new Set(strategy.strategy_dna.scope?.symbols ?? [strategy.asset])]
     .filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)).sort();
 }
@@ -444,8 +444,9 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
   let forceFlatten = requestedFlatten || dailyRisk.halted || sessionRisk.force_flatten;
   const permittedStates = options.scope === "incubation"
     ? new Set(["incubation"]) : new Set(["released", "healthy", "watch", "adjusted"]);
-  const active = forceFlatten || options.canary ? [] : appState.strategies.filter((strategy) => permittedStates.has(strategy.state));
-  const scoped = new Map(active.map((strategy) => [strategy.id, strategySymbols(strategy, options.scope === "incubation")]));
+  const active = (forceFlatten && options.scope !== "incubation") || options.canary ? []
+    : appState.strategies.filter((strategy) => permittedStates.has(strategy.state));
+  const scoped = new Map(active.map((strategy) => [strategy.id, strategySymbols(strategy)]));
   const symbols = [...new Set([...scoped.values()].flat())].filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)).sort();
   const dslSymbols = [...new Set(active.filter((strategy) => strategy.strategy_format === "dsl-v1")
     .flatMap((strategy) => scoped.get(strategy.id) ?? []))].sort();
