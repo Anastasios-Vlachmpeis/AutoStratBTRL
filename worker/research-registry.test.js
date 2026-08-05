@@ -31,11 +31,13 @@ test("deterministic retries are idempotent and conflicting retries are rejected"
   const state = {};
   const cohort = beginCohort(state, contract());
   const first = registerTrial(state, proposal(cohort, 0));
+  cohort.status = "screening_queued";
   const retry = registerTrial(state, proposal(cohort, 0));
   assert.equal(first.created, true);
   assert.equal(retry.created, false);
   assert.equal(state.research.total_trials, 1);
   assert.throws(() => registerTrial(state, proposal(cohort, 0, { dna_hash: hash("f") })), /reused/);
+  assert.throws(() => registerTrial(state, proposal(cohort, 1)), /running cohort/);
 });
 
 test("daily sampled, challenger, finalist and validation quotas stop optional work and reset by date", () => {

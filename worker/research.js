@@ -2,7 +2,7 @@ import { explainStrategyDNA } from "./dsl.js";
 import { registerResearchFinalists } from "./engine.js";
 import { proposePopulation } from "./evolution.js";
 import { researchContract } from "./research-contract.js";
-import { screenResearchTrials } from "./research-fitness.js";
+import { finalizeResearchScreen, screenResearchTrials } from "./research-fitness.js";
 import {
   beginCohort,
   compactCohortTrials,
@@ -67,18 +67,15 @@ function archivedBehaviors(research) {
  * is deliberately separate so storage failures can never materialize a strategy.
  */
 export function prepareEvolutionaryResearch(state, input) {
-  if (input?.holdout_bars || input?.validation_bars) throw new Error("Holdout data is forbidden in evolutionary research");
-  if (input?.dataset_scope !== "development_only") throw new Error("Evolution requires a physically development-only dataset");
-  const contract = researchContract(input);
-  const existing = state.research?.cohorts?.find((item) => item.cohort_id === contract.cohort_id);
-  if (existing?.status === "complete") return { duplicate: true, contract, cohort: existing, proposals: [], screen: null, trial_artifacts: [] };
-  const cohort = beginCohort(state, contract, { telemetry: input.telemetry ?? { status: "healthy" } });
-  const proposals = proposePopulation(contract, {
-    parents: input.parents ?? researchParents(state),
-    archiveDnaHashes: state.research.novelty_archive.dna_hashes,
-  });
-  for (const proposal of proposals) registerTrial(state, proposalForRegistry(proposal));
-  const screen = screenResearchTrials(proposals, input.bars_by_symbol, {
+  const generated = generateEvolutionaryResearch(state, input);
+  if (generated.duplicate) return { ...generated, screen: null, trial_artifacts: [] };
+  const { contract, cohort, proposals } = generated;
+  const screen = screenResearchTrials(proposals, input.bars_by_symbol, screenOptions(contract, state, input));
+  return preparedResearch(state, { contract, cohort, proposals, screen });
+}
+
+function screenOptions(contract, state, input = {}) {
+  return {
     finalists: contract.config.finalists,
     minimum_symbols: contract.config.minimum_symbols,
     maximum_symbol_concentration: contract.config.maximum_symbol_concentration,
@@ -88,7 +85,10 @@ export function prepareEvolutionaryResearch(state, input) {
     minimum_trades: input.minimum_trades ?? 8,
     maximum_turnover: input.maximum_turnover ?? 20,
     novelty_archive: archivedBehaviors(state.research),
-  });
+  };
+}
+
+function preparedResearch(state, { contract, cohort, proposals, screen }) {
   const records = new Map(screen.records.map((record) => [record.trial_id, record]));
   for (const proposal of proposals) {
     const record = records.get(proposal.trial_id);
@@ -108,6 +108,40 @@ export function prepareEvolutionaryResearch(state, input) {
     screen: records.get(proposal.trial_id) ?? null,
   }));
   return { duplicate: false, contract, cohort, proposals, screen, trial_artifacts: trialArtifacts };
+}
+
+/** Register deterministic proposals without opening any dataset partition. */
+export function generateEvolutionaryResearch(state, input) {
+  if (input?.holdout_bars || input?.validation_bars) throw new Error("Holdout data is forbidden in evolutionary research");
+  if (input?.dataset_scope !== "development_only") throw new Error("Evolution requires a physically development-only dataset");
+  const contract = researchContract(input);
+  const existing = state.research?.cohorts?.find((item) => item.cohort_id === contract.cohort_id);
+  if (existing?.status === "complete") return { duplicate: true, contract, cohort: existing, proposals: [] };
+  const cohort = beginCohort(state, contract, { telemetry: input.telemetry ?? { status: "healthy" } });
+  const proposals = proposePopulation(contract, {
+    parents: input.parents ?? researchParents(state),
+    archiveDnaHashes: state.research.novelty_archive.dna_hashes,
+  });
+  for (const proposal of proposals) registerTrial(state, proposalForRegistry(proposal));
+  cohort.status = "screening_queued";
+  return { duplicate: false, contract, cohort, proposals };
+}
+
+/** Finalize independently evaluated records in canonical trial order. */
+export function finalizeEvolutionaryResearch(state, { cohort_id, records = [], artifact_ids = {}, options = {} } = {}) {
+  const cohort = state.research?.cohorts?.find((item) => item.cohort_id === cohort_id);
+  if (!cohort) throw new Error("Unknown research cohort");
+  if (cohort.status === "complete") return { duplicate: true, cohort, created: [] };
+  const proposals = Object.values(state.research?.trials ?? {}).filter((trial) => trial.cohort_id === cohort_id)
+    .sort((left, right) => left.ordinal - right.ordinal);
+  const expected = proposals.map((item) => item.trial_id);
+  const received = [...new Set(records.map((item) => item.trial_id))].sort();
+  if (received.length !== expected.length || expected.some((id) => !received.includes(id))) {
+    throw new Error(`Research cohort is incomplete: ${received.length}/${expected.length} trial screens`);
+  }
+  const screen = finalizeResearchScreen(records, screenOptions(cohort.contract, state, options));
+  const prepared = preparedResearch(state, { contract: cohort.contract, cohort, proposals, screen });
+  return commitEvolutionaryResearch(state, prepared, { artifact_ids });
 }
 
 export function commitEvolutionaryResearch(state, prepared, { artifact_ids = {} } = {}) {

@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { buildGeneratedStrategyDNA } from "./dsl-generation.js";
-import { buildDevelopmentFolds, evaluateResearchTrial, paretoRank, screenResearchTrials, selectResearchFinalists } from "./research-fitness.js";
+import { buildDevelopmentFolds, evaluateResearchTrial, finalizeResearchScreen, paretoRank, screenResearchTrials, selectResearchFinalists } from "./research-fitness.js";
 
 const SYMBOLS = ["AAPL", "MSFT", "NVDA", "AMZN", "META", "SPY"];
 function bars(seed, count = 150) {
@@ -74,4 +74,17 @@ test("finalists are capped and vector screen supports long, short, and flat targ
   assert.ok(targets.some((value) => value > 0));
   assert.ok(targets.some((value) => value < 0));
   assert.ok(targets.some((value) => value === 0));
+});
+
+test("queued trial results finalize identically regardless of delivery order", () => {
+  const trials = Array.from({ length: 8 }, (_, index) => trial(["Dual average trend", "Residual reversion", "Range expansion", "Quiet trend"][index % 4], 200 + index));
+  const records = trials.map((value, ordinal) => ({ ...evaluateResearchTrial({ ...value, ordinal }, DATA,
+    { minimum_trades: 1, maximum_symbol_concentration: 1, trial_count: trials.length }), ordinal }));
+  const options = { finalists: 6, maximum_symbol_concentration: 1, cluster_cap: 6 };
+  const ordered = finalizeResearchScreen(records, options);
+  const reversed = finalizeResearchScreen([...records].reverse(), options);
+  assert.deepEqual(reversed.summary, ordered.summary);
+  assert.deepEqual(reversed.finalists.map((item) => item.trial_id), ordered.finalists.map((item) => item.trial_id));
+  assert.deepEqual(reversed.records.map((item) => [item.trial_id, item.status, item.pareto_rank]),
+    ordered.records.map((item) => [item.trial_id, item.status, item.pareto_rank]));
 });

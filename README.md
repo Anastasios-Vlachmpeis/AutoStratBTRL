@@ -1,171 +1,128 @@
 # Axiom Strategy Foundry
 
-A dependency-light strategy generation, multi-regime backtest, reproduction, and paper-release terminal. It can run locally with Python or as an event-driven Cloudflare Worker.
+A self-supervising research and Alpaca paper-trading system for regular-session US equities on canonical five-minute data. It generates typed strategy DNA, screens candidates, runs development and sealed holdout backtests, incubates approved strategies on forward data, and monitors released paper strategies.
 
-## Run
+The checked-in configuration is deliberately safe: observation mode is enabled, market ingestion is off, the legacy control plane remains readable, Backtrader runs in shadow mode, and all Alpaca order submission is disabled.
+
+## How it stays running
+
+There is no permanently running Cloudflare process. A minute Cron Trigger and Durable Object alarms create deterministic work intents. Cloudflare Queues deliver long-running stages and retries. The Python/Backtrader service on Cloud Run scales to zero while idle and starts when a signed backtest request arrives.
+
+```text
+Browser -> Cloudflare Worker API -> Durable Object control state
+                                   -> D1 normalized metadata/outbox
+                                   -> R2 sealed data and artifacts
+Minute Cron -> orchestration -> Queue -> generation/review/validation/incubation
+                                      -> signed Cloud Run Backtrader request
+Alpaca IEX -> canonical 1-minute input -> finalized 5-minute regular-session bars
+Alpaca paper account <- guarded reconciliation only when explicitly enabled
+```
+
+## Local UI
+
+Install Node.js 20 or newer, then:
+
+```powershell
+npm install
+Copy-Item .dev.vars.example .dev.vars
+npm run dev:cloudflare
+```
+
+Open the Wrangler URL, normally `http://127.0.0.1:8787`. Put only local secrets in `.dev.vars`; it is ignored by Git.
+
+The dependency-free legacy Python demo remains available with:
 
 ```powershell
 python main.py
 ```
 
-Open `http://127.0.0.1:8765`. The application uses only the Python standard library.
+## Cloudflare preparation
 
-The local server keeps its state in memory and starts with an empty strategy workspace whenever it restarts. Nothing is generated until you press **Seed cohort**.
-
-## Cloudflare deployment
-
-The Cloudflare version does not keep a process alive. Static assets are served from Cloudflare's edge, API requests wake a Worker, and one SQLite-backed Durable Object stores the complete supervisor state. An hourly Cron Trigger wakes the same object to run one 21-session monitoring window.
-
-```text
-Browser ── static files ──> Workers Static Assets
-        └─ /api/* ───────> Worker ──> AxiomLab Durable Object ──> persistent state
-Cron (hourly) ──────────────────────> AxiomLab Durable Object ──> monitor/adjust/drop
-```
-
-### 1. Install and preview
-
-Install Node.js 20 or newer, then run:
-
-```powershell
-npm install
-Copy-Item .dev.vars.example .dev.vars
-```
-
-Replace the placeholders in `.dev.vars` with a long random admin token and your **paper** Alpaca key pair. The file is ignored by Git. Never use live-account credentials in this project.
-
-```powershell
-npm run dev:cloudflare
-```
-
-Open the URL printed by Wrangler, normally `http://127.0.0.1:8787`. The dashboard asks for the token before loading private API state and keeps it only in that browser tab's session storage.
-
-Test the scheduler locally:
-
-```powershell
-Invoke-WebRequest "http://127.0.0.1:8787/cdn-cgi/handler/scheduled?format=json"
-```
-
-### 2. Authenticate and deploy
+Provision the target resources before enabling normalized/autonomous mode:
 
 ```powershell
 npx wrangler login
+npx wrangler d1 create axiom-control
+npx wrangler r2 bucket create axiom-private-artifacts
+npx wrangler r2 bucket create axiom-private-artifacts-preview
+npx wrangler queues create axiom-jobs
+npx wrangler queues create axiom-jobs-dlq
+```
+
+Copy the returned D1 database ID into `wrangler.target.example.jsonc`, review every setting, then use it as the deployment configuration. Apply migrations before deployment:
+
+```powershell
+npx wrangler d1 migrations apply axiom-control --remote
+```
+
+Set secrets interactively; never put their values in Git or Workers Builds variables:
+
+```powershell
 npx wrangler secret put ADMIN_TOKEN
 npx wrangler secret put ALPACA_API_KEY
 npx wrangler secret put ALPACA_API_SECRET
-npm run deploy
-```
-
-Wrangler prints the resulting `*.workers.dev` URL. Configure a custom domain later from **Cloudflare Dashboard → Workers & Pages → axiom-strategy-foundry → Settings → Domains & Routes**.
-
-Each command asks for the value without writing it to the repository. In the Cloudflare dashboard, the equivalent location is **Worker → Settings → Variables & Secrets → Add → Secret**. These are runtime secrets; do not put them in Workers Builds variables.
-
-Required secrets:
-
-| Secret | Value |
-|---|---|
-| `ADMIN_TOKEN` | Your own long random dashboard password |
-| `ALPACA_API_KEY` | Alpaca paper API key ID |
-| `ALPACA_API_SECRET` | Alpaca paper secret key |
-| `BACKTEST_SERVICE_SECRET` | HMAC secret shared only with that service |
-
-## Remote Backtrader shadow mode
-
-The Worker remains the control plane. It seals each Alpaca history snapshot into
-an immutable 75% development slice and 25% holdout slice inside the Durable
-Object, then sends only the relevant slice to Cloud Run. Start with:
-
-```bash
 npx wrangler secret put BACKTEST_SERVICE_SECRET
 ```
 
-Set `BACKTEST_SERVICE_URL` as a normal Worker variable containing the Cloud Run
-HTTPS URL under **Worker → Settings → Variables & Secrets**. The checked-in
-`BACKTEST_ENGINE` default is `shadow`; without both a
-service URL and secret the Worker safely falls back to the legacy engine. In
-shadow mode legacy results still decide strategy lifecycle while signed remote
-artifacts and comparison metadata are retained. Change it to `backtrader` only
-after reviewing those artifacts. `legacy` is an immediate rollback. Raw holdout
-bars are never returned from `/api/backtest-artifacts/:id`.
+Required runtime values:
 
-Cloud Run is configured with zero minimum instances: it may scale down while
-idle, then wakes when the Worker requests a backtest. The hourly Cloudflare Cron
-continues independently and does not require a permanently running process.
+| Name | Purpose |
+|---|---|
+| `ADMIN_TOKEN` | Long random dashboard/API password |
+| `ALPACA_API_KEY` | Dedicated Alpaca paper key ID |
+| `ALPACA_API_SECRET` | Dedicated Alpaca paper secret |
+| `BACKTEST_SERVICE_SECRET` | HMAC secret shared with Cloud Run |
+| `BACKTEST_SERVICE_URL` | HTTPS URL of the Cloud Run backtester |
 
-The same Alpaca paper key pair authenticates paper-account and market-data requests. No additional data key is needed for the default IEX feed.
+`ADMIN_TOKEN` protects application APIs. Private artifact routes always require strict authorization, including in local/demo mode.
 
-`ADMIN_TOKEN` is never stored in `wrangler.jsonc` or the repository. When configured, it protects both read and write API requests, including account balances and positions. Without the secret, the API is intentionally open for local/demo use. Cloudflare Access can add full identity-based protection in front of the Worker.
+## Backtrader service
 
-## Alpaca paper connection
+The pinned Python 3.11 service is in `backtester_service/`. It verifies the HMAC signature and complete deterministic job identity, rejects malformed or mismatched sealed inputs, and returns content-hashed metrics, curves, orders, fills, trades, and provenance.
 
-The Cloudflare Worker connects only to:
+Deploy it only after reviewing `backtester_service/deploy-cloud-run.ps1`. The script builds a unique image, resolves its immutable digest, deploys that exact digest to Cloud Run in `europe-west1`, and supplies the digest to result provenance. Cloud Run should use 1 vCPU, 512 MiB, concurrency 1, zero minimum instances, three maximum instances, and a 300-second timeout.
 
-- `https://paper-api.alpaca.markets` for the account, positions, clock, assets, open orders, and paper orders.
-- `https://data.alpaca.markets` for historical and monitoring bars.
+Use `BACKTEST_ENGINE=shadow` during engine comparison. Switch to `backtrader` only after the documented golden, determinism, leakage, replay, success-rate, and runtime gates pass. `legacy` is the rollback mode. Production-like deployments should keep `BACKTEST_REQUIRE_IMAGE_DIGEST=true`.
 
-The first integration supports four US equity ETFs: `SPY`, `QQQ`, `IWM`, and `TLT`. It uses three years of daily IEX bars for supervisor reviews and 45 days of hourly IEX bars for monitoring. IEX is Alpaca's free single-exchange feed; it is not the full consolidated SIP market feed.
+## Data and lifecycle
 
-Press **Sync Alpaca** to verify the credentials and load account equity, positions, market status, and current bars. Scheduled hourly runs perform the same synchronization automatically.
+The initial universe is an immutable, hashed set of 40 regular US equities. Research uses Alpaca's free IEX feed and a sealed three-year five-minute dataset:
 
-The **Account** desk is the default landing page. It displays Alpaca's three-month daily P/L history, a locally calculated 20-session rolling Sharpe chart, equity, cash, buying power, daily P/L, open positions, and working paper orders. Sharpe uses the daily portfolio-return series with a zero risk-free rate and annualizes by `sqrt(252)`. Its **Refresh account** button is read-only: it never evaluates strategies or submits orders, even when automated paper trading is enabled. Positions are marked `AXIOM / MIXED` only when Axiom has previously traded that symbol; Alpaca aggregates manual and automated shares, so exact share-level attribution is not implied.
+1. Canonical regular-session data is audited and stored in immutable monthly partitions.
+2. The dataset is split once into 75% development and 25% sealed holdout slices.
+3. Typed DSL strategies are generated through bounded evolutionary search using development data only.
+4. Development confirmation runs three anchored and three rolling, purged/embargoed Backtrader folds with mandatory execution stress.
+5. Approved DNA and policy are frozen before the one-time sealed holdout evaluation.
+6. Passing strategies enter forward paper incubation. Release requires at least 10 valid trading days and 67 completed trades; a strategy that misses the trade gate after 20 valid days returns to rework.
+7. Released strategies are reconciled and monitored on five-minute evidence. Infrastructure failures never create promote, rework, or drop decisions.
 
-Automated orders are disabled by default:
+Raw holdout bars and secrets are never exposed by frontend APIs. Artifacts retain the strategy, DNA, dataset slice, policy, compiler, engine, configuration, input, and result hashes needed for replay.
 
-```json
-"ALPACA_TRADING_ENABLED": "false"
-```
+## Modes and safety
 
-While disabled, the terminal calculates and displays proposed orders but submits nothing. To enable paper orders after reviewing the proposals and logs, change that value in `wrangler.jsonc` to `"true"` and redeploy.
+- `ORCHESTRATION_MODE=observe` plans system work without executing it. Operator commands still work.
+- `ORCHESTRATION_MODE=autonomous` executes durable scheduled stages. Enable it only after D1, R2, Queue, market-data, and backtester health checks pass.
+- `CONTROL_PLANE_MODE=dual_write` mirrors the Durable Object state into normalized D1/R2 storage. Normalized reads remain behind their separate cutover flag.
+- `MARKET_DATA_MODE=shadow` enables canonical ingestion without making it an order-submission switch.
+- `ALPACA_TRADING_ENABLED=false` blocks all submitted paper orders.
+- `ALPACA_SHORT_TRADING_ENABLED=false` independently blocks new paper shorts.
 
-Paper execution is deliberately restricted:
+Paper reconciliation is capped at 0.5% absolute exposure per strategy and 10% portfolio gross exposure. Longs may be fractional. New shorts are whole-share, tradable, shortable, easy-to-borrow paper orders only. Direction flips flatten first and open the opposite direction on a later cycle. Unmanaged positions are skipped. Stable client order IDs and open-order suppression make retries idempotent.
 
-- Signed long/short market targets; no options, crypto, or hard-to-borrow locates.
-- Maximum 2% of account equity per released strategy.
-- Maximum 20% aggregate gross strategy exposure.
-- Orders only while the US equity market is open and the account is not blocked.
-- Long entries may be fractional; short entries are whole-share and require the asset to be tradable, shortable, and easy to borrow.
-- Direction changes flatten the existing position first and open the opposite side on the next scheduler cycle.
-- Existing manual positions are not adopted automatically; mixed or unknown symbols are skipped.
-- Stable client order IDs prevent scheduler retries from placing the same order twice.
+No live-money endpoint, hard-to-borrow locate, options, crypto, or browser-controlled risk-limit changes are included.
 
-Short entries have a separate safety switch and remain unsubmitted until both
-paper trading flags are explicitly enabled:
-
-```json
-"ALPACA_TRADING_ENABLED": "true",
-"ALPACA_SHORT_TRADING_ENABLED": "true"
-```
-
-### Monitoring cadence
-
-The default schedule in `wrangler.jsonc` is hourly, in UTC:
-
-```json
-"crons": ["0 * * * *"]
-```
-
-Each invocation synchronizes the Alpaca paper account and evaluates a new hourly-bar monitor window. For one daily evaluation, change it before deployment to `"0 0 * * *"`. Scheduled invocations and paper orders use stable UTC-hour identifiers so Cloudflare retries do not intentionally duplicate the same cycle.
-
-Cloudflare and local Python states are intentionally separate. Resetting or running one environment does not affect the other.
-
-## Lifecycle
-
-1. **Seed cohort** creates new strategy DNA across momentum, mean-reversion, breakout, and volatility-filter archetypes.
-2. **Run supervisor** evaluates each waiting strategy on the first 75% of its chronological research data. The final quarter is excluded from every development calculation. Strategies in rework are diagnosed from development evidence, archived, and replaced by a traceable child with exactly one adjusted parameter.
-3. Strong candidates enter **Validation**. Parameters are frozen, then **Validate holdout** runs one final backtest on the untouched 25%.
-4. Validation releases strategies only when unseen return, Sharpe, trade count, drawdown, robustness, and degradation gates pass. Soft failures can trigger a new rework child, but holdout values never select its mutation. After three unsuccessful rework attempts, the lineage is dropped.
-5. Hourly Alpaca monitoring moves released strategies through healthy, watch, adjusted, and retired states.
-6. **Reproduce DNA** makes a traceable, mutated child from a released strategy; the child must pass both supervision and validation.
-
-The local Python server uses deterministic synthetic data. The Cloudflare Worker uses Alpaca IEX market data and can route guarded paper orders only when explicitly enabled. It never connects to Alpaca's live-money endpoint.
-
-## Tests
-
-```powershell
-python -m unittest discover -s tests -v
-```
-
-Cloudflare engine tests and syntax checks:
+## Verification
 
 ```powershell
 npm run check
+npm run test:incubation
+python -m unittest discover -s tests -v
 ```
+
+For the service, install its pinned dependencies in an isolated Python 3.11 environment and run:
+
+```powershell
+python -m pytest backtester_service/tests -q
+```
+
+No repository push or cloud deployment is performed by the implementation or test commands above.

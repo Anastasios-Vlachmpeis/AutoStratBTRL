@@ -63,8 +63,8 @@ function sampledParams(family, random) {
   };
 }
 
-function scopedSymbols(random, minimum) {
-  const count = integer(random, minimum, INITIAL_UNIVERSE_SYMBOLS.length);
+function scopedSymbols(random, minimum, maximum = 5) {
+  const count = integer(random, minimum, Math.min(INITIAL_UNIVERSE_SYMBOLS.length, Math.max(minimum, maximum)));
   const symbols = [...INITIAL_UNIVERSE_SYMBOLS];
   // Fisher-Yates is deterministic and avoids accidentally duplicated symbols.
   for (let i = symbols.length - 1; i > 0; i -= 1) {
@@ -77,7 +77,8 @@ function scopedSymbols(random, minimum) {
 function sampledDna(contract, seed, trialId, random, generation = 1, parentStrategyId = null, symbols = null) {
   const family = pick(random, DSL_FAMILIES);
   return buildGeneratedStrategyDNA({ family, params: sampledParams(family, random), seed, trialId, generation,
-    parentStrategyId, symbols: symbols ?? scopedSymbols(random, contract.config.minimum_symbols) }).dna;
+    parentStrategyId, symbols: symbols ?? scopedSymbols(random, contract.config.minimum_symbols,
+      contract.config.maximum_symbols) }).dna;
 }
 
 function parentDna(candidate) {
@@ -179,7 +180,8 @@ function exitMutation(parent, context) {
 
 function universeScopeMutation(parent, context) {
   const child = childOf(parent, context);
-  child.scope.symbols = scopedSymbols(context.random, context.contract.config.minimum_symbols);
+  child.scope.symbols = scopedSymbols(context.random, context.contract.config.minimum_symbols,
+    context.contract.config.maximum_symbols);
   return child;
 }
 
@@ -233,7 +235,8 @@ export function proposePopulation(contract, { parents = [], archiveDnaHashes = [
   if (!Number.isInteger(total) || total < 1) throw new TypeError("contract.config.total_trials must be positive");
   const initialCount = Number(contract.config.sampled_genomes);
   const archive = new Set((archiveDnaHashes ?? []).map(String));
-  const externalParents = normalizedParents(parents);
+  const externalParents = normalizedParents(parents).filter((dna) => dna.scope.symbols.length
+    <= contract.config.maximum_symbols);
   const generatedParents = [];
   const records = [];
   for (let ordinal = 0; ordinal < total; ordinal += 1) {

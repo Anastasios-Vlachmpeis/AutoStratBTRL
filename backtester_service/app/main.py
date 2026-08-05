@@ -42,6 +42,23 @@ def digest(value: Any) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
+def image_digest() -> str:
+    """Return an immutable image identity, never a mutable revision label."""
+    return os.environ.get("BACKTEST_IMAGE_DIGEST", "local-unpinned")
+
+
+def verify_job_binding(raw_object: dict[str, Any], job_id: str) -> None:
+    """Bind every job ID to its complete canonical payload across instances.
+
+    The replay cache remains a short-lived optimization, but correctness does
+    not depend on process memory: a different payload necessarily has a
+    different valid job ID on every Cloud Run instance.
+    """
+    unsigned = {key: value for key, value in raw_object.items() if key != "job_id"}
+    if not hmac.compare_digest(digest(unsigned), str(job_id)):
+        raise HTTPException(409, "job id is not bound to the canonical request payload")
+
+
 def finite(value: float) -> float:
     if not math.isfinite(value):
         raise ValueError("numeric values must be finite")
@@ -528,9 +545,10 @@ async def run_backtests(request: Request) -> dict[str, Any]:
             payload_v2 = BacktestRequestV2.model_validate(raw_object)
         except Exception as exc:
             raise HTTPException(422, str(exc)) from exc
+        verify_job_binding(raw_object, payload_v2.job_id)
         verify_auth(request, raw, payload_v2.job_id)
         engine = {"name": ENGINE_NAME, "version": ENGINE_VERSION,
-                  "image_digest": os.environ.get("BACKTEST_IMAGE_DIGEST", os.environ.get("K_REVISION", "local")),
+                  "image_digest": image_digest(),
                   # Hash the exact signed wire object. Pydantic intentionally
                   # coerces 100000 to 100000.0, which must not break the
                   # JavaScript/Python provenance comparison.
@@ -541,9 +559,11 @@ async def run_backtests(request: Request) -> dict[str, Any]:
         payload = BacktestRequest.model_validate_json(raw)
     except Exception as exc:
         raise HTTPException(422, str(exc)) from exc
+    verify_job_binding(raw_object, payload.job_id)
     verify_auth(request, raw, payload.job_id)
-    payload_without_auth = payload.model_dump(mode="json")
-    input_hash = digest(payload_without_auth)
+    # Bind provenance to the exact signed wire object. Model defaults and
+    # numeric coercion must not change the control plane's input identity.
+    input_hash = digest(raw_object)
     bars = [bar.model_dump(exclude_none=True) for bar in payload.bars]
     results = []
     for dna in payload.strategies:
@@ -559,7 +579,7 @@ async def run_backtests(request: Request) -> dict[str, Any]:
     response = {
         "job_id": payload.job_id,
         "phase": payload.phase,
-        "engine": {"name": ENGINE_NAME, "version": ENGINE_VERSION, "image_digest": os.environ.get("BACKTEST_IMAGE_DIGEST", os.environ.get("K_REVISION", "local")), "config_hash": digest(APPROVED_CONFIG),
+        "engine": {"name": ENGINE_NAME, "version": ENGINE_VERSION, "image_digest": image_digest(), "config_hash": digest(APPROVED_CONFIG),
                    "dsl_compiler": {"dsl_version": DSL_COMPILER_MANIFEST["dsl_version"],
                                     "semantic_version": DSL_COMPILER_MANIFEST["semantic_version"],
                                     "schema_sha256": DSL_COMPILER_MANIFEST["schema_sha256"],
@@ -582,10 +602,11 @@ async def run_backtests_v2(request: Request) -> dict[str, Any]:
         payload = BacktestRequestV2.model_validate(raw_object)
     except Exception as exc:
         raise HTTPException(422, str(exc)) from exc
+    verify_job_binding(raw_object, payload.job_id)
     verify_auth(request, raw, payload.job_id)
     engine = {
         "name": ENGINE_NAME, "version": ENGINE_VERSION,
-        "image_digest": os.environ.get("BACKTEST_IMAGE_DIGEST", os.environ.get("K_REVISION", "local")),
+        "image_digest": image_digest(),
         "configuration_hash": digest(raw_object.get("execution", {})),
         "dsl_compiler": {"dsl_version": DSL_COMPILER_MANIFEST["dsl_version"],
                          "semantic_version": DSL_COMPILER_MANIFEST["semantic_version"],

@@ -16,12 +16,14 @@ import {
 } from "./engine.js";
 import { isAuthorized, isStrictlyAuthorized } from "./auth.js";
 import {
-  aggregateMetrics, buildBacktestPayload, buildBacktestPayloadShardsV2, comparison, engineMode, EXECUTION_CONFIG_V2, frozenDna,
+  aggregateMetrics, buildBacktestPayload, buildBacktestPayloadShardsV2, comparison, engineMode, EXECUTION_CONFIG, EXECUTION_CONFIG_V2, frozenDna,
   makeDataset, makeMultiSymbolDataset, normalizeMetrics, remoteEnabled, sha256,
 } from "./backtest.js";
 import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
+import { finalizeIncubationSession, recordIncubationBar } from "./incubation.js";
 import { createRuntimeGateways } from "./gateways.js";
 import { consumeArchitectureQueue } from "./jobs.js";
+import { combineQueuedBacktest, planQueuedBacktest, recordQueuedBacktestReceipt, strategyScopeSymbols } from "./backtest-queue.js";
 import {
   MarketDataRepository,
   applyLiveMinutePoll,
@@ -42,11 +44,13 @@ import {
 } from "./market-data.js";
 import { initialUniverseManifest } from "./universe.js";
 import {
-  commitEvolutionaryResearch,
   developmentOnlyDataset,
-  failEvolutionaryResearch,
+  finalizeEvolutionaryResearch,
+  generateEvolutionaryResearch,
   prepareEvolutionaryResearch,
 } from "./research.js";
+import { evaluateResearchTrial } from "./research-fitness.js";
+import { planResearchJobs, verifyResearchJob } from "./research-jobs.js";
 import { dispatchExpensiveFinalists, pauseResearch, resumeResearch } from "./research-registry.js";
 import {
   authorizeSealedHoldout,
@@ -57,9 +61,9 @@ import {
   recordSealedHoldoutServiceStatus,
 } from "./research-contract.js";
 import { createEvaluationPolicy, decideHoldout, evaluationPolicyHash, replaySupervisorDecision, selectValidationCapacity, superviseDevelopment } from "./evaluation-policy.js";
-import { applyOrchestrationCommand, createOrchestrationCommand, ensureOrchestrationState, executionAllowed, orchestrationMode } from "./orchestration.js";
+import { applyOrchestrationCommand, createOrchestrationCommand, ensureOrchestrationState, executeOrchestrationActionBatch, executionAllowed, orchestrationCommandDisposition, orchestrationMode, pipelineFollowups } from "./orchestration.js";
 import { OrchestrationStore } from "./orchestration-store.js";
-import { planMarketEvent, planOrchestrationTick } from "./orchestration-schedule.js";
+import { planOrchestrationWork } from "./orchestration-schedule.js";
 import { applyLifecycleCommand, bindLifecycleProvenance, initialLifecycle, transitionId } from "./lifecycle.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
@@ -307,9 +311,13 @@ function newYorkClock(value = Date.now()) {
   };
 }
 
-export function shouldRunPostCloseResearch(value = Date.now()) {
+export function shouldRunPostCloseResearch(value = Date.now(), calendarSessions = null) {
   const clock = newYorkClock(value);
-  return !["Sat", "Sun"].includes(clock.weekday) && clock.hour === 17;
+  if (clock.hour !== 17) return false;
+  if (Array.isArray(calendarSessions)) {
+    return calendarSessions.some((session) => String(session.date) === clock.date);
+  }
+  return !["Sat", "Sun"].includes(clock.weekday);
 }
 
 function boundedInt(value, fallback, low, high) {
@@ -347,6 +355,13 @@ async function runEvolutionWithAlpaca(env, stub, options = {}) {
       config: { sampled_genomes: sampled, challengers, finalists, validation_slots: 3,
         minimum_symbols: 5, maximum_symbol_concentration: .35 },
     }),
+  }));
+}
+
+async function submitOperatorPipelineCommand(stub, kind, payload = {}) {
+  return stub.fetch(new Request("https://axiom.internal/api/orchestration/command", {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ kind, correlation_id: `operator:${kind}:${Date.now()}`, payload }),
   }));
 }
 
@@ -455,38 +470,141 @@ export class AxiomLab extends DurableObject {
         return { paused: true, reason: "storage_quota_pressure" };
       }
     }
-    const loaded = await this.marketDataRepository.loadSealedDataset(datasetId, { scope: "development_only" });
-    if (Object.keys(loaded.bars_by_symbol).length < 5) throw new Error("Sealed development dataset has fewer than five symbols");
-    const dataset = this.registerPartitionedDataset(state, loaded);
+    const manifest = await this.marketDataRepository.loadDatasetManifest(datasetId);
+    if (!manifest || new Set(manifest.partitions.map((item) => item.symbol)).size < 5) {
+      throw new Error("Sealed development dataset has fewer than five symbols");
+    }
+    const developmentHash = await sha256({ schema_version: 1, dataset_root_hash: manifest.sha256,
+      scope: "development_only", split_ratio: .75 });
+    const dataset = this.registerPartitionedDataset(state, { manifest, dataset_hash: developmentHash });
     const sessionDate = command.payload?.session_date ?? newYorkClock(command.timestamp).date;
-    const finalists = boundedInt(this.env.RESEARCH_AUTORUN_FINALISTS, 6, 1, 12);
-    const prepared = prepareEvolutionaryResearch(state, {
+    const finalists = boundedInt(command.payload?.finalists ?? this.env.RESEARCH_AUTORUN_FINALISTS, 6, 1, 12);
+    const generated = generateEvolutionaryResearch(state, {
       seed: (Number(state.seed ?? 0) ^ Number(sessionDate.replaceAll("-", ""))) >>> 0,
-      session_date: sessionDate, dataset_id: dataset.id, dataset_hash: loaded.dataset_hash,
-      dataset_scope: "development_only", bars_by_symbol: loaded.bars_by_symbol,
+      session_date: sessionDate, dataset_id: dataset.id, dataset_hash: developmentHash,
+      dataset_scope: "development_only",
       telemetry: { status: String(this.env.RESEARCH_BUDGET_STATUS ?? "healthy"), at: command.timestamp },
       config: { sampled_genomes: boundedInt(this.env.RESEARCH_AUTORUN_SAMPLED_GENOMES, Math.max(16, finalists * 4), 1, 128),
         challengers: boundedInt(this.env.RESEARCH_AUTORUN_CHALLENGERS, Math.min(32, Math.max(4, finalists * 2)), 0, 32),
-        finalists, validation_slots: 3, minimum_symbols: 5, maximum_symbol_concentration: .35 },
+        finalists, validation_slots: 3, minimum_symbols: 5, maximum_symbols: 5,
+        maximum_symbol_concentration: .35 },
     });
-    if (prepared.duplicate) return { duplicate: true, cohort_id: prepared.cohort.cohort_id };
-    try {
-      const artifactIds = {};
-      for (const artifact of prepared.trial_artifacts) {
-        const stored = await this.controlPlane.artifacts.putResearchTrial(artifact.cohort_id, artifact.trial_id, artifact, {
-          dataset_id: artifact.dataset_id, contract_hash: artifact.contract_hash,
-        });
-        artifactIds[artifact.trial_id] = stored.mirror?.artifact_id ?? `${artifact.cohort_id}:${artifact.trial_id}`;
-      }
-      const committed = commitEvolutionaryResearch(state, prepared, { artifact_ids: artifactIds });
-      for (const strategy of committed.created) strategy.dataset_id = dataset.id;
-      this.record(state, "EVOLVE", `${committed.created.length} evolutionary finalists registered`,
-        `${prepared.screen.summary.attempted} attempts · ${prepared.screen.summary.eligible} eligible · sealed development partitions`);
-      return { duplicate: false, cohort_id: prepared.cohort.cohort_id, finalists: committed.created.length };
-    } catch (error) {
-      failEvolutionaryResearch(state, prepared, error);
-      throw error;
+    if (generated.duplicate) return { duplicate: true, completed: true, cohort_id: generated.cohort.cohort_id };
+    const jobs = planResearchJobs(generated, { workspace_id: SINGLETON_NAME, actor: command.actor });
+    generated.cohort.screen_receipts ??= {};
+    generated.cohort.screen_jobs = jobs.screens.map((item) => item.job_id);
+    generated.cohort.finalize_job = jobs.finalize.job_id;
+    generated.cohort.finalize_job_payload = jobs.finalize;
+    await this.controlPlane.saveState(state);
+    await sendQueueMessages(this.env.AXIOM_JOBS, jobs.all);
+    recordMarketDataUsage(state, { queue_messages: jobs.all.length });
+    this.record(state, "EVOLVE", `${generated.proposals.length} evolutionary trials queued`,
+      "One bounded development-only screen per trial · final selection waits for every receipt");
+    return { duplicate: false, completed: false, queued: true, cohort_id: generated.cohort.cohort_id,
+      screen_jobs: jobs.screens.length };
+  }
+
+  async screenQueuedResearchTrial(state, job) {
+    const cohort = state.research?.cohorts?.find((item) => item.cohort_id === job.cohort_id);
+    verifyResearchJob(job, cohort);
+    const trial = state.research?.trials?.[job.trial_id];
+    if (!trial || trial.cohort_id !== cohort.cohort_id || trial.ordinal !== job.ordinal) {
+      throw new Error("Research screen job references an unknown trial");
     }
+    const symbols = [...new Set(trial.dna?.scope?.symbols ?? [])].sort();
+    if (JSON.stringify(symbols) !== JSON.stringify(job.symbols)
+        || symbols.length > cohort.contract.config.maximum_symbols) {
+      throw new Error("Research screen job changed the frozen symbol scope");
+    }
+    cohort.screen_receipts ??= {};
+    const prior = cohort.screen_receipts[trial.trial_id];
+    if (prior) {
+      if (prior.job_id !== job.job_id) throw new Error("Trial screen already has a different job identity");
+      await this.queueResearchFinalizerWhenReady(state, cohort);
+      return { duplicate: true, receipt: prior };
+    }
+    const loaded = await this.marketDataRepository.loadSealedDataset(job.dataset_id, {
+      scope: "development_only", symbols,
+    });
+    if (loaded.dataset_scope !== "development_only" || loaded.manifest.id !== job.dataset_id) {
+      throw new Error("Research screen did not receive its sealed development slice");
+    }
+    const screen = evaluateResearchTrial(trial, loaded.bars_by_symbol, {
+      trial_count: cohort.contract.config.total_trials,
+      minimum_symbols: cohort.contract.config.minimum_symbols,
+      maximum_symbol_concentration: cohort.contract.config.maximum_symbol_concentration,
+      minimum_fold_bars: 40, minimum_trades: 8, maximum_turnover: 20,
+    });
+    const resultHash = await sha256(screen);
+    const artifact = { schema_version: 2, job_id: job.job_id, cohort_id: cohort.cohort_id,
+      trial_id: trial.trial_id, contract_hash: cohort.contract_hash, dataset_id: job.dataset_id,
+      dataset_hash: job.dataset_hash, dataset_scope: "development_only",
+      partition_ids: loaded.partition_ids, proposal: { ...trial }, screen, result_hash: resultHash };
+    const stored = await this.controlPlane.artifacts.putResearchTrial(cohort.cohort_id, trial.trial_id, artifact, {
+      dataset_id: job.dataset_id, contract_hash: cohort.contract_hash, job_id: job.job_id,
+    });
+    const receipt = { job_id: job.job_id, result_hash: resultHash,
+      artifact_id: stored.mirror?.artifact_id ?? `${cohort.cohort_id}:${trial.trial_id}` };
+    cohort.screen_receipts[trial.trial_id] = receipt;
+    await this.controlPlane.saveState(state);
+    await this.queueResearchFinalizerWhenReady(state, cohort);
+    return { duplicate: false, receipt };
+  }
+
+  async queueResearchFinalizerWhenReady(state, cohort) {
+    const receipts = Object.keys(cohort.screen_receipts ?? {}).length;
+    if (receipts !== cohort.screen_jobs?.length || cohort.finalize_queued) return false;
+    if (!cohort.finalize_job_payload || cohort.finalize_job_payload.job_id !== cohort.finalize_job) {
+      throw new Error("Research cohort is missing its frozen finalizer job");
+    }
+    await sendQueueMessages(this.env.AXIOM_JOBS, [cohort.finalize_job_payload]);
+    cohort.finalize_queued = true;
+    cohort.finalize_queued_at = new Date().toISOString();
+    await this.controlPlane.saveState(state);
+    return true;
+  }
+
+  async finalizeQueuedResearchCohort(state, job) {
+    const cohort = state.research?.cohorts?.find((item) => item.cohort_id === job.cohort_id);
+    verifyResearchJob(job, cohort);
+    const duplicate = cohort.status === "complete";
+    let finalistCount = cohort.finalists?.length ?? 0;
+    if (!duplicate) {
+      const expected = [...job.trial_ids].sort();
+      const receipts = cohort.screen_receipts ?? {};
+      if (expected.some((trialId) => !receipts[trialId])) {
+        const error = new Error(`Research screens are incomplete: ${Object.keys(receipts).length}/${expected.length}`);
+        error.status = 409; throw error;
+      }
+      const artifacts = await Promise.all(expected.map((trialId) => this.controlPlane.artifacts
+        .getResearchTrial(cohort.cohort_id, trialId)));
+      const records = []; const artifactIds = {};
+      for (let index = 0; index < expected.length; index += 1) {
+        const trialId = expected[index], artifact = artifacts[index], receipt = receipts[trialId];
+        if (!artifact || artifact.job_id !== receipt.job_id || artifact.result_hash !== receipt.result_hash
+            || await sha256(artifact.screen) !== receipt.result_hash) {
+          throw new Error(`Research screen artifact verification failed for ${trialId}`);
+        }
+        records.push(artifact.screen); artifactIds[trialId] = receipt.artifact_id;
+      }
+      const committed = finalizeEvolutionaryResearch(state, { cohort_id: cohort.cohort_id, records, artifact_ids: artifactIds });
+      for (const strategy of committed.created) strategy.dataset_id = cohort.contract.dataset_id;
+      finalistCount = committed.created.length;
+      this.record(state, "EVOLVE", `${finalistCount} evolutionary finalists registered`,
+        `${records.length} bounded screens · deterministic cohort-wide selection`);
+      await this.controlPlane.saveState(state);
+    }
+    if (!cohort.review_dispatched) {
+      const followup = createOrchestrationCommand({ kind: "pipeline_review", actor: job.actor,
+        timestamp: cohort.completed_at ?? new Date().toISOString(), correlation_id: job.job_id,
+        intent_id: `pipeline:development:${cohort.cohort_id}`,
+        payload: { cohort_id: cohort.cohort_id } });
+      await this.submitOrchestrationCommand(state, followup);
+      cohort.review_dispatched = true;
+      cohort.review_command_id = followup.command_id;
+      await this.controlPlane.saveState(state);
+    }
+    return { duplicate, cohort_id: cohort.cohort_id, finalists: finalistCount };
   }
 
   async buildWorkspaceResetSnapshot() {
@@ -557,16 +675,17 @@ export class AxiomLab extends DurableObject {
 
   async executeOrchestrationActions(state, command, result) {
     const orchestration = ensureOrchestrationState(state, orchestrationMode(this.env));
+    const followups = [];
     orchestration.executed_command_ids ??= [];
     if (orchestration.executed_command_ids.includes(command.command_id)) return { duplicate: true };
-    for (const action of result.actions ?? []) {
+    try {
+      await executeOrchestrationActionBatch(result.actions, async (action) => {
       if (action.kind === "watchdog.repair" && this.orchestrationStore) {
         await this.orchestrationStore.repairExpiredLeases();
         await this.orchestrationStore.dispatchOutbox();
       } else if (action.kind === "broker.cancel_unsafe_orders") {
         if (!this.env.ALPACA_API_KEY || !this.env.ALPACA_API_SECRET) {
-          orchestration.incidents.push({ kind: "broker_blocked", action: action.kind, command_id: command.command_id,
-            reason: "alpaca_credentials_missing", opened_at: command.timestamp });
+          throw new Error("Broker order cancellation requires configured Alpaca paper credentials");
         } else {
           const cancellation = await this.gateways.broker.cancelManagedOpenOrders();
           this.record(state, "BROKER_SAFETY", "Managed open orders cancelled",
@@ -574,8 +693,7 @@ export class AxiomLab extends DurableObject {
         }
       } else if (action.kind === "broker.verify_flat") {
         if (!this.env.ALPACA_API_KEY || !this.env.ALPACA_API_SECRET) {
-          orchestration.incidents.push({ kind: "broker_blocked", action: action.kind, command_id: command.command_id,
-            reason: "alpaca_credentials_missing", opened_at: command.timestamp });
+          throw new Error("Flat-position verification requires configured Alpaca paper credentials");
         } else {
           const overview = await this.gateways.broker.accountOverview();
           const managed = new Set(state.alpaca?.managed_symbols ?? []);
@@ -585,7 +703,26 @@ export class AxiomLab extends DurableObject {
           else orchestration.controls.flatten_requested = false;
         }
       } else if (action.kind === "broker.flatten_all") {
-        this.record(state, "BROKER_SAFETY", "Managed flatten requested", "The next reconciliation cycle targets every framework-managed position to zero.");
+        if (!this.env.ALPACA_API_KEY || !this.env.ALPACA_API_SECRET) {
+          throw new Error("Managed flatten requires configured Alpaca paper credentials");
+        }
+        const bucket = `flatten:${command.command_id}`;
+        const cycle = await this.gateways.broker.buildCycle(state, bucket, command.timestamp, {
+          scope: "released", tradingEnabled: true, safetyFlatten: true,
+        });
+        applyAlpacaCycle(state, cycle);
+        if (cycle.order_errors?.length) {
+          throw new Error(`Managed flatten order failed: ${cycle.order_errors.map((item) => `${item.symbol}: ${item.message}`).join(", ")}`);
+        }
+        const managed = new Set(state.alpaca?.managed_symbols ?? []);
+        const exposed = (cycle.positions ?? []).filter((position) => managed.has(position.symbol));
+        const closePending = new Set((cycle.safety_reasons ?? [])
+          .filter((item) => item.reason === "open_order_pending").map((item) => item.symbol));
+        if (exposed.some((position) => !closePending.has(position.symbol)) && !cycle.can_trade_now) {
+          throw new Error("Managed flatten could not submit because the paper account or market is unavailable");
+        }
+        this.record(state, "BROKER_SAFETY", "Managed flatten reconciled",
+          `${cycle.submitted_orders?.length ?? 0} close orders submitted; ${closePending.size} symbols already had an open order`);
       } else if (action.kind === "operational.retry") {
         const strategy = state.strategies.find((item) => item.id === action.strategy_id);
         if (!strategy?.lifecycle) throw new Error(`Unknown lifecycle strategy ${action.strategy_id}`);
@@ -668,29 +805,144 @@ export class AxiomLab extends DurableObject {
         Object.assign(state, fresh);
         return { duplicate: false, reset: true };
       } else if (action.kind === "pipeline.validate") {
+        const pending = new Set(state.strategies.filter((item) => item.state === "validation").map((item) => item.id));
         await this.validateRemote(state, this.env, { advanceClock: false, silent: true });
+        const failed = state.strategies.find((item) => pending.has(item.id)
+          && item.service_status?.phase === "holdout" && item.service_status.status === "infrastructure_error");
+        if (failed) throw new Error(`Validation remains retryable for ${failed.id}: ${failed.service_status.error}`);
       } else if (action.kind === "pipeline.review") {
+        const pending = new Set(state.strategies.filter((item) => ["generated", "rework"].includes(item.state)).map((item) => item.id));
         await this.reviewRemote(state, this.env, { dsl: {}, legacy: {} });
+        const failed = state.strategies.find((item) => pending.has(item.id)
+          && item.service_status?.phase === "development" && item.service_status.status === "infrastructure_error");
+        if (failed) throw new Error(`Development review remains retryable for ${failed.id}: ${failed.service_status.error}`);
+        followups.push(...pipelineFollowups(action.kind, {
+          hasValidation: state.strategies.some((item) => item.state === "validation"),
+        }));
       } else if (action.kind === "research.schedule") {
         if (!state.marketData?.backfill?.dataset_id) throw new Error("Sealed market dataset is not ready for research");
       } else if (action.kind === "research.run_cohort") {
         const cohort = await this.runSealedResearchCohort(state, command);
-        if (!cohort.paused) {
-          await this.reviewRemote(state, this.env, { dsl: {}, legacy: {} });
-          await this.validateRemote(state, this.env, { advanceClock: false, silent: true });
-        }
+        if (cohort.completed) followups.push(...pipelineFollowups(action.kind, {
+          paused: cohort.paused, cohortId: cohort.cohort_id,
+        }));
       } else if (action.kind === "market.reconcile_session" && state.marketData?.calendar?.id) {
         const calendar = await this.marketDataRepository.loadCalendar(state.marketData.calendar.id);
         if (calendar) await this.reconcileLiveSession(state, new Date(command.timestamp), calendar);
+      } else if (action.kind === "broker.stop_entries") {
+        this.record(state, "BROKER_SAFETY", "New entries stopped",
+          `Entry generation paused for session ${action.payload?.session_date ?? command.timestamp.slice(0, 10)}`);
+      } else if (action.kind === "pipeline.compute_targets") {
+        if (!this.env.ALPACA_API_KEY || !this.env.ALPACA_API_SECRET) {
+          throw new Error("Target computation requires configured Alpaca paper credentials");
+        }
+        const bucket = String(action.payload?.event_id ?? action.payload?.bucket_close ?? command.command_id);
+        const cycle = await this.gateways.broker.buildCycle(state, bucket, action.payload?.bucket_close ?? bucket,
+          { scope: action.scope, tradingEnabled: action.scope === "released" });
+        if (action.scope === "released") {
+          applyAlpacaCycle(state, cycle);
+        } else {
+          if ((cycle.submitted_orders ?? []).length) throw new Error("Incubation must never submit broker orders");
+          orchestration.latest_targets ??= {};
+          orchestration.latest_targets.incubation = { bucket, computed_at: command.timestamp,
+            evaluations: cycle.evaluations ?? {}, proposed_orders: cycle.proposed_orders ?? [] };
+          const sessionDate = action.payload?.session_date ?? newYorkClock(action.payload?.bucket_close ?? command.timestamp).date;
+          for (const strategy of state.strategies.filter((item) => item.state === "incubation")) {
+            const evaluation = cycle.evaluations?.[strategy.id];
+            if (!evaluation) continue;
+            recordIncubationBar(strategy, evaluation, { eventId: action.payload?.event_id ?? bucket,
+              sessionDate, bucketClose: action.payload?.bucket_close ?? command.timestamp });
+          }
+        }
+      } else if (action.kind === "pipeline.monitor") {
+        const bucket = String(action.payload?.event_id ?? action.payload?.bucket_close ?? "");
+        if (bucket && state.alpaca?.last_cycle_bucket !== bucket) {
+          throw new Error(`Monitoring evidence is unavailable until target cycle ${bucket} completes`);
+        }
+        orchestration.latest_monitoring_at = command.timestamp;
+      } else if (action.kind === "pipeline.incubation") {
+        const candidates = state.strategies.filter((strategy) => strategy.state === "incubation");
+        const sessionDate = action.payload?.session_date ?? newYorkClock(command.timestamp).date;
+        const open = action.payload?.session_open, close = action.payload?.session_close;
+        const toMinutes = (value) => { const [hours, minutes] = String(value ?? "").split(":").map(Number);
+          return Number.isFinite(hours + minutes) ? hours * 60 + minutes : null; };
+        const expectedBars = toMinutes(open) !== null && toMinutes(close) !== null
+          ? Math.max(1, Math.floor((toMinutes(close) - toMinutes(open)) / 5)) : 78;
+        for (const strategy of candidates) {
+          const decision = finalizeIncubationSession(strategy, sessionDate, { expectedBars,
+            marketDataCriticalFault: state.marketData?.live?.status === "critical" });
+          if (decision === "qualified") strategy.release_ready = { at: command.timestamp,
+            valid_trading_days: strategy.incubation.valid_trading_days,
+            closed_trades: strategy.incubation.closed_trades };
+          else if (decision === "rework") {
+            strategy.state = "rework"; strategy.release_ready = null;
+            strategy.rework = { ...(strategy.rework ?? {}), source_stage: "incubation",
+              diagnosis: "Incubation did not satisfy 10 valid sessions and 67 completed trades within 20 sessions.",
+              history: strategy.rework?.history ?? [] };
+            if (strategy.lifecycle?.quality?.state === "incubation") transitionStrategyLifecycle(strategy, "development", {
+              trigger: "incubation_timeout", artifact_id: strategy.incubation?.artifact_id ?? "artifact:incubation",
+              event_id: command.command_id, reason_code: "incubation_timeout", explanation: strategy.rework.diagnosis,
+              correlation_id: command.correlation_id, timestamp: command.timestamp });
+          }
+        }
+      } else if (action.kind === "pipeline.release") {
+        const releaseSession = action.payload?.session_date ?? newYorkClock(command.timestamp).date;
+        const unfinished = state.strategies.find((item) => item.state === "incubation"
+          && !item.incubation?.sessions?.[releaseSession]?.completed);
+        if (unfinished) throw new Error(`Release waits for incubation session evidence for ${unfinished.id}`);
+        for (const strategy of state.strategies.filter((item) => item.state === "incubation" && item.release_ready)) {
+          strategy.state = "released";
+          if (strategy.lifecycle?.quality?.state === "incubation") transitionStrategyLifecycle(strategy, "released_paper", {
+            trigger: "incubation_evidence", artifact_id: strategy.incubation?.artifact_id ?? "artifact:incubation",
+            event_id: command.command_id, reason_code: "incubation_passed",
+            explanation: `${strategy.release_ready.valid_trading_days} valid days and ${strategy.release_ready.closed_trades} closed trades`,
+            correlation_id: command.correlation_id, timestamp: command.timestamp,
+          });
+          this.record(state, "RELEASE", `${strategy.name} released to paper`, "Incubation evidence passed the frozen release gate.");
+        }
+      } else if (action.kind === "report.generate_daily") {
+        state.operational_reports ??= { daily: {}, weekly: {} };
+        const date = action.payload?.session_date ?? command.timestamp.slice(0, 10);
+        state.operational_reports.daily[date] = { generated_at: command.timestamp,
+          strategies: state.strategies.length,
+          active: state.strategies.filter((item) => ["released", "healthy", "watch", "adjusted"].includes(item.state)).length,
+          incidents: orchestration.incidents.filter((item) => !item.resolved_at).length,
+          market_data_status: state.marketData?.live?.status ?? "unknown" };
+      } else if (action.kind === "review.weekly") {
+        state.operational_reports ??= { daily: {}, weekly: {} };
+        const week = action.payload?.week_start ?? action.payload?.session_date ?? command.timestamp.slice(0, 10);
+        const byArchetype = {};
+        for (const strategy of state.strategies) {
+          const key = strategy.archetype ?? strategy.strategy_format ?? "unknown";
+          byArchetype[key] = (byArchetype[key] ?? 0) + 1;
+        }
+        state.operational_reports.weekly[week] = { generated_at: command.timestamp,
+          strategy_count: state.strategies.length, by_archetype: byArchetype };
+      } else {
+        throw new Error(`Unhandled orchestration action: ${action.kind}`);
       }
+      });
+    } catch (error) {
+      orchestration.incidents.push({ kind: "orchestration_action_failed", command_id: command.command_id,
+        command_kind: command.kind, reason: error instanceof Error ? error.message : String(error),
+        opened_at: new Date().toISOString() });
+      orchestration.incidents = orchestration.incidents.slice(-512);
+      state.orchestration = orchestration;
+      await this.controlPlane.saveState(state);
+      throw error;
     }
     orchestration.executed_command_ids.push(command.command_id);
     orchestration.executed_command_ids = orchestration.executed_command_ids.slice(-2048);
-    return { duplicate: false };
+    return { duplicate: false, followups };
   }
 
   async submitOrchestrationCommand(state, command, { forceDirect = false } = {}) {
     const current = ensureOrchestrationState(state, orchestrationMode(this.env));
+    if (orchestrationCommandDisposition(current.mode, command.actor) === "observe") {
+      return { schema_version: command.schema_version, command_id: command.command_id,
+        intent_id: command.intent_id, status: "observed", actions: [], reason: "observe_mode",
+        completed_at: command.timestamp, queued: false, idempotent: false };
+    }
     const applied = applyOrchestrationCommand(current, command);
     if (applied.blocked) return { ...applied.result, queued: false, idempotent: false };
     if (!applied.idempotent) {
@@ -710,19 +962,27 @@ export class AxiomLab extends DurableObject {
       }
       state.orchestration = applied.state;
     }
-    await this.executeOrchestrationActions(state, command, applied.result);
-    return { ...applied.result, queued: false, idempotent: applied.idempotent };
+    const executed = await this.executeOrchestrationActions(state, command, applied.result);
+    const followupResults = [];
+    if (executed.followups?.length) await this.controlPlane.saveState(state);
+    for (const followup of executed.followups ?? []) {
+      const next = createOrchestrationCommand({ kind: followup.kind,
+        intent_id: `${command.intent_id ?? command.command_id}:${followup.suffix}`,
+        actor: command.actor, timestamp: command.timestamp,
+        correlation_id: command.correlation_id, payload: { parent_command_id: command.command_id } });
+      followupResults.push(await this.submitOrchestrationCommand(state, next));
+    }
+    return { ...applied.result, queued: false, idempotent: applied.idempotent,
+      ...(followupResults.length ? { followups: followupResults } : {}) };
   }
 
   async planAndSubmitOrchestration(state, timestamp, events = []) {
     const orchestration = ensureOrchestrationState(state, orchestrationMode(this.env));
-    if (orchestration.controls.ingestion_paused) return [];
-    const intents = [];
-    for (const event of events) intents.push(...planMarketEvent(event, { completed_intent_ids: orchestration.completed_intent_ids }));
     const calendar = state.marketData?.calendar?.id
       ? await this.marketDataRepository.loadCalendar(state.marketData.calendar.id) : null;
-    if (calendar) intents.push(...planOrchestrationTick({ calendar, now: timestamp,
-      completed_intent_ids: orchestration.completed_intent_ids }).intents);
+    const intents = planOrchestrationWork({ events, calendar, now: timestamp,
+      completed_intent_ids: orchestration.completed_intent_ids,
+      ingestion_paused: orchestration.controls.ingestion_paused });
     const results = [];
     for (const intent of intents) {
       const command = createOrchestrationCommand({ kind: intent.kind, intent_id: intent.id, actor: "system",
@@ -992,6 +1252,9 @@ export class AxiomLab extends DurableObject {
 
   async runMarketDataTick(state, scheduledAt) {
     if (marketDataMode(this.env) !== "shadow") return { skipped: true, reason: "market_data_off" };
+    if (ensureOrchestrationState(state, orchestrationMode(this.env)).controls.ingestion_paused) {
+      return { skipped: true, reason: "ingestion_paused", changed: false };
+    }
     const now = new Date(scheduledAt);
     if (Number.isNaN(now.getTime())) throw new Error("Invalid market-data schedule timestamp");
     const bucket = now.toISOString().slice(0, 16);
@@ -1009,9 +1272,28 @@ export class AxiomLab extends DurableObject {
 
   async persistArtifact(state, artifact, result) {
     const legacyId = `artifact-${artifact.job_id}-${artifact.strategy_id}`;
+    let provenance = {};
+    if (this.controlPlane.normalized) {
+      const policy = artifact.policy ?? result.supervision?.policy;
+      const policyHash = artifact.policy_hash ?? result.supervision?.policy_hash
+        ?? result.holdout_decision?.policy_hash;
+      const configuration = artifact.dataset?.schema_version === 2 ? EXECUTION_CONFIG_V2 : EXECUTION_CONFIG;
+      const datasetHash = artifact.dataset_slice_hash ?? (artifact.phase === "holdout"
+        ? artifact.dataset?.holdout_hash : artifact.dataset?.development_hash);
+      provenance = await this.controlPlane.normalized.ensureArtifactProvenance({ workspaceId: SINGLETON_NAME,
+        strategyId: artifact.strategy_id, dnaHash: artifact.dna_hash,
+        datasetId: artifact.dataset?.id, datasetHash,
+        datasetRangeStart: artifact.dataset_slice_start, datasetRangeEnd: artifact.dataset_slice_end,
+        phase: artifact.phase,
+        policyHash, policy, engine: artifact.engine,
+        compiler: artifact.engine?.dsl_compiler ?? artifact.strategy_dna?.compiler ?? {},
+        configHash: artifact.config_hash, config: configuration });
+      provenance = { ...provenance, inputHash: artifact.input_hash,
+        resultHash: artifact.service_result_hash, redactionClass: "private" };
+    }
     const stored = await this.controlPlane.artifacts.putArtifact(legacyId, { ...artifact, result }, {
       phase: artifact.phase, strategy_id: artifact.strategy_id, dataset_id: artifact.dataset?.id,
-    });
+    }, provenance);
     const artifactId = stored.mirror?.artifact_id ?? legacyId;
     state.backtestArtifacts ??= {};
     state.backtestArtifacts[artifactId] = { id: artifactId, phase: artifact.phase,
@@ -1107,12 +1389,97 @@ export class AxiomLab extends DurableObject {
     return candidates.length > 0;
   }
 
+  async enqueueBacktestRun(state, phase, strategies, dataset) {
+    if (!this.env.AXIOM_JOBS) throw new Error("AXIOM_JOBS binding is required for partitioned Backtrader runs");
+    state.backtest_queue ??= { runs: {} };
+    const planned = await planQueuedBacktest({ phase, dataset, strategies });
+    const run = state.backtest_queue.runs[planned.run_id] ?? planned;
+    state.backtest_queue.runs[run.run_id] ??= run;
+    await this.controlPlane.saveState(state);
+    const pending = run.shards.filter((shard) => !run.receipts?.[shard.shard_id]).map((shard) => ({
+      kind: "backtest.run-shard.v1", workspace_id: SINGLETON_NAME, run_id: run.run_id, shard_id: shard.shard_id,
+    }));
+    if (pending.length) await sendQueueMessages(this.env.AXIOM_JOBS, pending);
+    else await this.env.AXIOM_JOBS.send({ kind: "backtest.finalize-run.v1", workspace_id: SINGLETON_NAME,
+      run_id: run.run_id }, { contentType: "json" });
+    return run;
+  }
+
+  async processQueuedBacktestShard(state, body) {
+    const run = state.backtest_queue?.runs?.[String(body.run_id)];
+    const shard = run?.shards?.find((item) => item.shard_id === String(body.shard_id));
+    if (!run || !shard) throw new Error("Unknown queued Backtrader shard");
+    if (run.status === "finalized") return { duplicate: true, finalized: true };
+    if (!run.receipts?.[shard.shard_id]) {
+      const dataset = state.datasets?.[run.dataset_id];
+      const strategies = shard.strategy_ids.map((id) => state.strategies.find((item) => String(item.id) === id));
+      if (!dataset || strategies.some((item) => !item)) throw new Error("Queued Backtrader shard inputs are unavailable");
+      for (const frozen of run.strategies.filter((item) => shard.strategy_ids.includes(item.id))) {
+        const strategy = strategies.find((item) => String(item.id) === frozen.id);
+        if (String(strategy.dna_hash) !== frozen.dna_hash) throw new Error("Queued Backtrader strategy DNA changed");
+      }
+      const result = await this.invokeBacktrader(state, run.phase, strategies, dataset, {
+        beforeDispatch: run.phase === "holdout" ? async (jobs) => {
+          const wire = await Promise.all(jobs.map(async (job) => ({ job_id: job.job_id,
+            payload_hash: await sha256(job.payload), strategy_ids: (job.payload?.strategies ?? []).map((item) => String(item.id)) })));
+          for (const strategy of strategies) bindSealedHoldoutDispatch(state, { lineage_id: lineageIdentity(strategy),
+            authorization_id: strategy.holdout_authorization?.authorization_id,
+            jobs: wire.filter((job) => job.strategy_ids.includes(String(strategy.id))) });
+          await this.controlPlane.saveState(state);
+        } : null,
+      });
+      const contentHash = await sha256(result.response);
+      const legacyId = `queued-backtest-${run.run_id}-${shard.shard_id}`;
+      const stored = await this.controlPlane.artifacts.putArtifact(legacyId, result.response, {
+        phase: run.phase, run_id: run.run_id, shard_id: shard.shard_id, dataset_id: run.dataset_id,
+      });
+      if (stored.mirror?.content_hash && stored.mirror.content_hash !== contentHash) throw new Error("Queued Backtrader artifact hash mismatch");
+      recordQueuedBacktestReceipt(run, { run_id: run.run_id, shard_id: shard.shard_id,
+        artifact_id: stored.mirror?.artifact_id ?? legacyId, content_hash: contentHash,
+        job_id: result.job_id, result_hash: result.response.result_hash, config_hash: result.config_hash, dna: result.dna });
+      run.status = Object.keys(run.receipts).length === run.shards.length ? "ready_to_finalize" : "running";
+      await this.controlPlane.saveState(state);
+    }
+    if (Object.keys(run.receipts ?? {}).length === run.shards.length) {
+      await this.env.AXIOM_JOBS.send({ kind: "backtest.finalize-run.v1", workspace_id: SINGLETON_NAME,
+        run_id: run.run_id }, { contentType: "json" });
+      run.finalize_queued = true;
+      await this.controlPlane.saveState(state);
+    }
+    return { duplicate: Boolean(run.receipts?.[shard.shard_id]), status: run.status };
+  }
+
+  async finalizeQueuedBacktest(state, body) {
+    const run = state.backtest_queue?.runs?.[String(body.run_id)];
+    if (!run) throw new Error("Unknown queued Backtrader run");
+    if (run.status === "finalized") return { duplicate: true, finalized: true };
+    if (Object.keys(run.receipts ?? {}).length !== run.shards.length) {
+      const error = new Error("Queued Backtrader run is incomplete"); error.status = 409; throw error;
+    }
+    const artifacts = {};
+    for (const shard of run.shards) {
+      const receipt = run.receipts[shard.shard_id];
+      const response = await this.controlPlane.artifacts.getArtifact(receipt.artifact_id);
+      if (!response || await sha256(response) !== receipt.content_hash) throw new Error("Queued Backtrader artifact content changed");
+      artifacts[shard.shard_id] = response;
+    }
+    const combined = await combineQueuedBacktest(run, artifacts);
+    combined.dataset = state.datasets?.[run.dataset_id];
+    if (run.phase === "development") await this.reviewRemote(state, this.env, { dsl: {}, legacy: {} }, { queuedRun: { run, result: combined } });
+    else await this.validateRemote(state, this.env, { advanceClock: false, silent: true, queuedRun: { run, result: combined } });
+    run.status = "finalized"; run.finalized_at = new Date().toISOString();
+    await this.controlPlane.saveState(state);
+    return { finalized: true, run_id: run.run_id };
+  }
+
   async invokeBacktrader(state, phase, strategies, dataset, options = {}) {
     let bars;
     if (dataset.storage_family === "partitioned-v1") {
       const loaded = await this.marketDataRepository.loadSealedDataset(dataset.partition_dataset_id ?? dataset.id, {
+        symbols: strategyScopeSymbols(strategies),
         scope: phase === "holdout" ? "holdout_only" : "development_only",
         access: phase === "holdout" ? { purpose: "sealed_validation", actor: "system",
+          strategyId: strategies.length === 1 ? strategies[0].id : null,
           decisionId: await sha256(strategies.map((item) => item.holdout_authorization?.authorization_id ?? item.id).sort()) } : null,
       });
       bars = loaded.bars_by_symbol;
@@ -1126,8 +1493,7 @@ export class AxiomLab extends DurableObject {
       const sealed = { ...dataset, [phase === "holdout" ? "holdout" : "development"]: bars };
       const shards = await buildBacktestPayloadShardsV2(phase, strategies, sealed);
       if (options.beforeDispatch) await options.beforeDispatch(shards.map((shard) => ({ job_id: shard.job_id, payload: shard.payload })));
-      const responses = [];
-      for (const shard of shards) {
+      const responses = await Promise.all(shards.map(async (shard) => {
         const response = await this.gateways.research.run(shard.payload);
         if (response.job_id !== shard.job_id || response.phase !== phase) throw new Error("Backtest service provenance does not match the v2 request");
         if (response.schema_version !== "backtest-artifact-v2" || response.dataset?.sha256 !== shard.slice_hash
@@ -1135,8 +1501,8 @@ export class AxiomLab extends DurableObject {
             || (response.engine?.configuration_hash ?? response.engine?.config_hash) !== shard.config_hash) {
           throw new Error("Backtest service returned an unexpected v2 dataset or execution configuration");
         }
-        responses.push({ response, shard });
-      }
+        return { response, shard };
+      }));
       return {
         response: {
           schema_version: "backtest-artifact-v2", job_id: await sha256(responses.map((item) => item.shard.job_id)), phase,
@@ -1219,9 +1585,11 @@ export class AxiomLab extends DurableObject {
     return strategies.filter((strategy) => allowed.has(strategy.id));
   }
 
-  async reviewRemote(state, env, barsByFormat) {
-    reworkCandidates(state);
-    const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
+  async reviewRemote(state, env, barsByFormat, options = {}) {
+    if (!options.queuedRun) reworkCandidates(state);
+    const queuedIds = new Set(options.queuedRun?.run?.strategies?.map((item) => item.id) ?? []);
+    const candidates = state.strategies.filter((item) => queuedIds.size ? queuedIds.has(String(item.id))
+      : item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
     if (!candidates.length) {
       applyHoldoutCapacity(state);
       return this.record(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
@@ -1255,7 +1623,7 @@ export class AxiomLab extends DurableObject {
     }
     for (const { dataset, strategies } of byDataset.values()) {
       try {
-        const authorized = this.authorizeResearchDispatch(state, strategies, "development");
+        const authorized = options.queuedRun ? strategies : this.authorizeResearchDispatch(state, strategies, "development");
         if (!authorized.length) continue;
         const policyHash = evaluationPolicyHash(createEvaluationPolicy());
         const configurationHash = await sha256(EXECUTION_CONFIG_V2);
@@ -1273,7 +1641,11 @@ export class AxiomLab extends DurableObject {
             kind: "operational", trigger: "development_dispatch", artifact_id: `dataset:${dataset.id}`,
             event_id: `dispatch:${strategy.id}`, reason_code: "backtest_running", explanation: "Development backtest is running." });
         }
-        const run = await this.invokeBacktrader(state, "development", authorized, dataset);
+        if (!options.queuedRun && dataset.storage_family === "partitioned-v1" && dataset.schema_version === 2) {
+          await this.enqueueBacktestRun(state, "development", authorized, dataset);
+          continue;
+        }
+        const run = options.queuedRun?.result ?? await this.invokeBacktrader(state, "development", authorized, dataset);
         const candidateFoldScores = Object.fromEntries((run.response.results ?? []).map((candidate) => [
           String(candidate.strategy_id ?? candidate.id), (candidate.windows ?? [candidate]).map((window) => {
             const result = window.stress ?? window.ideal ?? window;
@@ -1301,11 +1673,14 @@ export class AxiomLab extends DurableObject {
           const supervisionArtifact = { policy, policy_hash, evidence, decision: supervision.decision, reasons: supervision.reasons,
             status: supervision.status, replay: { evidence_protocol_hash: evidence.protocol_hash,
               replay_hash: replay.replay_hash, decision: replay.supervision.decision } };
-          const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "development", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
-            input_hash: run.response.input_hash, service_result_hash: run.response.result_hash,
-            warnings: run.response.warnings ?? [] }, { strategy: strategyResult, metrics, supervision: supervisionArtifact });
-          strategy.backtest_runs ??= {}; strategy.backtest_runs.development = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: run.response.engine ?? { name: "backtrader" }, input_hash: run.response.input_hash,
-            service_result_hash: run.response.result_hash, result_hash: await sha256({ results, metrics }),
+          const runShard = run.response.shards?.find((item) => item.strategy_ids?.includes(String(strategy.id)));
+          const serviceDataset = runShard?.dataset ?? run.response.dataset;
+          const sliceBounds = (serviceDataset?.symbols ?? []).flatMap((item) => [item.start, item.end]).filter(Boolean).sort();
+          const artifactId = await this.persistArtifact(state, { job_id: runShard?.job_id ?? run.job_id, strategy_id: strategy.id, phase: "development", created_at: new Date().toISOString(), engine: runShard?.engine ?? run.response.engine ?? { name: "backtrader" }, dataset, dataset_slice_hash: serviceDataset?.sha256, dataset_slice_start: sliceBounds.at(0), dataset_slice_end: sliceBounds.at(-1), strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
+            input_hash: runShard?.input_hash ?? run.response.input_hash, service_result_hash: runShard?.result_hash ?? run.response.result_hash,
+            warnings: runShard?.warnings ?? run.response.warnings ?? [] }, { strategy: strategyResult, metrics, supervision: supervisionArtifact });
+          strategy.backtest_runs ??= {}; strategy.backtest_runs.development = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: runShard?.engine ?? run.response.engine ?? { name: "backtrader" }, input_hash: runShard?.input_hash ?? run.response.input_hash,
+            service_result_hash: runShard?.result_hash ?? run.response.result_hash, result_hash: await sha256({ results, metrics }),
             folds: windows.map((window, index) => ({ window_id: window.window_id ?? `fold-${index + 1}`,
               fold_manifest: window.fold_manifest ?? null, metrics: (window.stress ?? window.ideal ?? window).metrics ?? {} })),
             completed_at: new Date().toISOString() };
@@ -1346,7 +1721,8 @@ export class AxiomLab extends DurableObject {
   }
 
   async validateRemote(state, env, options = {}) {
-    const candidates = state.strategies.filter((item) => item.state === "validation"
+    const queuedIds = new Set(options.queuedRun?.run?.strategies?.map((item) => item.id) ?? []);
+    const candidates = state.strategies.filter((item) => (queuedIds.size ? queuedIds.has(String(item.id)) : item.state === "validation")
       && ((item.engine_family ?? "legacy") === "backtrader"
         || (options.includeShadow && item.backtest_runs?.shadow)));
     if (!candidates.length) {
@@ -1356,7 +1732,7 @@ export class AxiomLab extends DurableObject {
     const groups = new Map();
     for (const strategy of candidates) { const dataset = state.datasets?.[strategy.dataset_id]; if (!dataset) { this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, "sealed dataset missing"); continue; } const groupKey = `${strategy.strategy_format ?? "legacy-archetype-v0"}:${dataset.id}`; const group = groups.get(groupKey) ?? { dataset, strategies: [] }; group.strategies.push(strategy); groups.set(groupKey, group); }
     for (const { dataset, strategies } of groups.values()) try {
-      const authorized = this.authorizeResearchDispatch(state, strategies, "holdout");
+      const authorized = options.queuedRun ? strategies : this.authorizeResearchDispatch(state, strategies, "holdout");
       if (!authorized.length) continue;
       for (const strategy of authorized) {
         if (["ready", "retry_wait", "service_unavailable", "data_blocked"].includes(strategy.lifecycle?.operational?.state)) {
@@ -1371,7 +1747,11 @@ export class AxiomLab extends DurableObject {
       // First durable checkpoint: the lineage is burned before the sealed
       // slice is read. A process restart can only retry this reservation.
       await this.controlPlane.saveState(state);
-      const run = await this.invokeBacktrader(state, "holdout", authorized, dataset, {
+      if (!options.queuedRun && dataset.storage_family === "partitioned-v1" && dataset.schema_version === 2) {
+        await this.enqueueBacktestRun(state, "holdout", authorized, dataset);
+        continue;
+      }
+      const run = options.queuedRun?.result ?? await this.invokeBacktrader(state, "holdout", authorized, dataset, {
         beforeDispatch: async (jobs) => {
           const wire = await Promise.all(jobs.map(async (job) => ({ job_id: job.job_id,
             payload_hash: await sha256(job.payload), strategy_ids: (job.payload?.strategies ?? []).map((item) => String(item.id)) })));
@@ -1403,12 +1783,15 @@ export class AxiomLab extends DurableObject {
         const policy_hash = evaluationPolicyHash(policy);
         if (strategy.holdout_authorization?.policy_hash !== policy_hash) throw new Error(`sealed policy changed for ${strategy.id}`);
         const [outcome, reason, holdoutDecision] = sealedHoldoutOutcome(strategy, validation, policy);
-        const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "holdout", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
-          input_hash: run.response.input_hash, service_result_hash: run.response.result_hash,
-          warnings: run.response.warnings ?? [] }, { strategy: strategyResult, metrics: validation,
+        const runShard = run.response.shards?.find((item) => item.strategy_ids?.includes(String(strategy.id)));
+        const serviceDataset = runShard?.dataset ?? run.response.dataset;
+        const sliceBounds = (serviceDataset?.symbols ?? []).flatMap((item) => [item.start, item.end]).filter(Boolean).sort();
+        const artifactId = await this.persistArtifact(state, { job_id: runShard?.job_id ?? run.job_id, strategy_id: strategy.id, phase: "holdout", created_at: new Date().toISOString(), engine: runShard?.engine ?? run.response.engine ?? { name: "backtrader" }, dataset, dataset_slice_hash: serviceDataset?.sha256, dataset_slice_start: sliceBounds.at(0), dataset_slice_end: sliceBounds.at(-1), strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash, policy, policy_hash,
+          input_hash: runShard?.input_hash ?? run.response.input_hash, service_result_hash: runShard?.result_hash ?? run.response.result_hash,
+          warnings: runShard?.warnings ?? run.response.warnings ?? [] }, { strategy: strategyResult, metrics: validation,
           holdout_decision: { policy_hash, ...holdoutDecision } });
-        strategy.backtest_runs ??= {}; strategy.backtest_runs.holdout = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: run.response.engine ?? { name: "backtrader" }, input_hash: run.response.input_hash,
-          service_result_hash: run.response.result_hash, result_hash: await sha256({ result, validation, policy_hash, holdoutDecision }),
+        strategy.backtest_runs ??= {}; strategy.backtest_runs.holdout = { artifact_id: artifactId, dataset_id: dataset.id, dna_hash: strategy.dna_hash, config_hash: run.config_hash, engine: runShard?.engine ?? run.response.engine ?? { name: "backtrader" }, input_hash: runShard?.input_hash ?? run.response.input_hash,
+          service_result_hash: runShard?.result_hash ?? run.response.result_hash, result_hash: await sha256({ result, validation, policy_hash, holdoutDecision }),
           policy_hash, decision: holdoutDecision, completed_at: new Date().toISOString() };
         strategy.validation = validation; strategy.backtests = (strategy.backtests ?? 0) + 1;
         const authorization = strategy.holdout_authorization;
@@ -1707,6 +2090,32 @@ export class AxiomLab extends DurableObject {
         applyAlpacaOverview(state, overview);
         return this.save(state);
       }
+      if (request.method === "POST" && url.pathname === "/internal/research/screen-trial") {
+        const result = await this.screenQueuedResearchTrial(state, await request.json());
+        return json({ ok: true, result });
+      }
+      if (request.method === "POST" && url.pathname === "/internal/research/finalize-cohort") {
+        try {
+          const result = await this.finalizeQueuedResearchCohort(state, await request.json());
+          return json({ ok: true, result });
+        } catch (error) {
+          if (error?.status === 409) return json({ error: error.message }, 409);
+          throw error;
+        }
+      }
+      if (request.method === "POST" && url.pathname === "/internal/backtest/run-shard") {
+        const result = await this.processQueuedBacktestShard(state, await request.json());
+        return json({ ok: true, result });
+      }
+      if (request.method === "POST" && url.pathname === "/internal/backtest/finalize-run") {
+        try {
+          const result = await this.finalizeQueuedBacktest(state, await request.json());
+          return json({ ok: true, result });
+        } catch (error) {
+          if (error?.status === 409) return json({ error: error.message }, 409);
+          throw error;
+        }
+      }
       if (request.method === "POST" && url.pathname === "/internal/orchestration/command") {
         const body = await request.json();
         const command = body.command;
@@ -1769,13 +2178,18 @@ export default {
         }
         if (request.method === "POST" && url.pathname === "/api/generate") {
           const body = await request.json().catch(() => ({}));
-          return await runEvolutionWithAlpaca(env, stub, { finalists: body.count });
+          return orchestrationMode(env) === "legacy"
+            ? await runEvolutionWithAlpaca(env, stub, { finalists: body.count })
+            : await submitOperatorPipelineCommand(stub, "run_daily_cohort", {
+              finalists: boundedInt(body.count, 6, 1, 12), session_date: newYorkClock().date });
         }
         if (request.method === "POST" && url.pathname === "/api/review") {
-          return await reviewWithAlpaca(env, stub);
+          return orchestrationMode(env) === "legacy" ? await reviewWithAlpaca(env, stub)
+            : await submitOperatorPipelineCommand(stub, "pipeline_review");
         }
         if (request.method === "POST" && url.pathname === "/api/validate") {
-          return await validateWithAlpaca(env, stub);
+          return orchestrationMode(env) === "legacy" ? await validateWithAlpaca(env, stub)
+            : await submitOperatorPipelineCommand(stub, "pipeline_validate");
         }
         return stub.fetch(request);
       } catch (error) {
@@ -1789,14 +2203,17 @@ export default {
     const stub = labStub(env);
     const work = [];
     const hasBrokerCredentials = Boolean(env.ALPACA_API_KEY && env.ALPACA_API_SECRET);
-    if (controller.cron === "0 * * * *" && orchestrationMode(env) !== "autonomous" && hasBrokerCredentials) {
+    // The old hourly path is opt-in only. Observe mode must never mutate the
+    // broker, research registry, or lifecycle merely because credentials exist.
+    if (controller.cron === "0 * * * *" && orchestrationMode(env) === "legacy" && hasBrokerCredentials) {
       const bucket = new Date(controller.scheduledTime).toISOString().slice(0, 13);
       work.push((async () => {
         await synchronizeAlpaca(env, stub, bucket);
+        const sessionDate = newYorkClock(controller.scheduledTime).date;
+        const calendar = await createRuntimeGateways(env).marketData.calendar(sessionDate, sessionDate);
         if (String(env.RESEARCH_AUTORUN_ENABLED ?? "true").toLowerCase() === "true"
-            && shouldRunPostCloseResearch(controller.scheduledTime)) {
+            && shouldRunPostCloseResearch(controller.scheduledTime, calendar)) {
           const current = await stateFrom(stub);
-          const sessionDate = newYorkClock(controller.scheduledTime).date;
           if (!current.research?.paused && current.research?.last_completed_session !== sessionDate) {
             const generated = await runEvolutionWithAlpaca(env, stub, {
               scheduled_at: controller.scheduledTime,
@@ -1815,7 +2232,9 @@ export default {
       work.push((async () => {
         if (marketDataMode(env) === "shadow") await tickMarketData(env, stub, controller.scheduledTime);
         await tickOrchestration(stub, controller.scheduledTime);
-        if (!hasBrokerCredentials) return;
+        // Autonomous target computation is owned by queued orchestration
+        // actions. Only the explicit legacy mode retains this direct sync.
+        if (!hasBrokerCredentials || orchestrationMode(env) !== "legacy") return;
         const current = await stateFrom(stub);
         const latest = [...(current.market_data?.live?.latest_events ?? [])]
           .filter((event) => event.actionable && !event.retroactive)

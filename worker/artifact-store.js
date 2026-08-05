@@ -17,6 +17,8 @@ export const ARTIFACT_KINDS = Object.freeze([
 const ARTIFACT_KIND_SET = new Set(ARTIFACT_KINDS);
 const VISIBILITIES = new Set(["public_summary", "private", "sealed_holdout", "secret"]);
 const HEX_256 = /^[a-f0-9]{64}$/;
+const SAFE_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
+const SECRET_KEY = /(secret|password|token|api[_-]?key|hmac|credential|private[_-]?key)/i;
 
 function stable(value) {
   if (value === null || typeof value !== "object") return JSON.stringify(value);
@@ -48,7 +50,41 @@ function cleanMetadata(value) {
   if (value == null) return {};
   if (Array.isArray(value)) return value.map(cleanMetadata);
   if (typeof value !== "object") return value;
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, cleanMetadata(item)]));
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !SECRET_KEY.test(key))
+    .map(([key, item]) => [key, cleanMetadata(item)]));
+}
+
+function optionalId(value, label) {
+  if (value == null || value === "") return null;
+  if (typeof value !== "string" || !SAFE_ID.test(value)) throw new Error(`${label} is invalid`);
+  return value;
+}
+
+function optionalHash(value, label) {
+  if (value == null || value === "") return null;
+  if (typeof value !== "string" || !HEX_256.test(value)) throw new Error(`${label} must be a lowercase SHA-256 digest`);
+  return value;
+}
+
+function cleanProvenance(value = {}, visibility = "private") {
+  const result = {
+    strategy_id: optionalId(value.strategyId ?? value.strategy_id, "strategyId"),
+    dna_id: optionalId(value.dnaId ?? value.dna_id, "dnaId"),
+    dataset_slice_id: optionalId(value.datasetSliceId ?? value.dataset_slice_id, "datasetSliceId"),
+    policy_version_id: optionalId(value.policyVersionId ?? value.policy_version_id, "policyVersionId"),
+    engine_version_id: optionalId(value.engineVersionId ?? value.engine_version_id, "engineVersionId"),
+    compiler_version_id: optionalId(value.compilerVersionId ?? value.compiler_version_id, "compilerVersionId"),
+    config_version_id: optionalId(value.configVersionId ?? value.config_version_id, "configVersionId"),
+    input_hash: optionalHash(value.inputHash ?? value.input_hash, "inputHash"),
+    result_hash: optionalHash(value.resultHash ?? value.result_hash, "resultHash"),
+    redaction_class: value.redactionClass ?? value.redaction_class ?? visibility,
+  };
+  if (!VISIBILITIES.has(result.redaction_class)) throw new Error("artifact redactionClass is invalid");
+  if (visibility === "sealed_holdout" && result.redaction_class !== "sealed_holdout") {
+    throw new Error("sealed holdout artifacts require sealed_holdout redactionClass");
+  }
+  return result;
 }
 
 function assertKind(kind) {
@@ -60,7 +96,7 @@ function assertWorkspace(workspaceId) {
 }
 
 function coreFromRow(row) {
-  return {
+  const core = {
     artifact_id: row.artifact_id,
     workspace_id: row.workspace_id,
     workspace_hash: row.workspace_hash,
@@ -73,6 +109,14 @@ function coreFromRow(row) {
     metadata: json(row.metadata_json),
     created_at: row.created_at,
   };
+  if (Number(row.schema_version ?? 1) >= 2) core.provenance = {
+    strategy_id: row.strategy_id ?? null, dna_id: row.dna_id ?? null,
+    dataset_slice_id: row.dataset_slice_id ?? null, policy_version_id: row.policy_version_id ?? null,
+    engine_version_id: row.engine_version_id ?? null, compiler_version_id: row.compiler_version_id ?? null,
+    config_version_id: row.config_version_id ?? null, input_hash: row.input_hash ?? null,
+    result_hash: row.result_hash ?? null, redaction_class: row.redaction_class ?? row.visibility,
+  };
+  return core;
 }
 
 async function objectBytes(object) {
@@ -127,7 +171,7 @@ export class ArtifactStore {
     return core;
   }
 
-  async put({ workspaceId, kind, content, expectedHash = null, mediaType = "application/octet-stream", visibility = "private", metadata = {} }) {
+  async put({ workspaceId, kind, content, expectedHash = null, mediaType = "application/octet-stream", visibility = "private", metadata = {}, provenance = {} }) {
     assertWorkspace(workspaceId);
     assertKind(kind);
     if (!VISIBILITIES.has(visibility)) throw new Error("artifact visibility is invalid");
@@ -138,6 +182,7 @@ export class ArtifactStore {
     const identity = await this.identity(workspaceId, kind, contentHash);
     const existing = await this.manifestById(workspaceId, identity.artifactId);
     const createdAt = existing?.created_at ?? this.now();
+    const normalizedProvenance = cleanProvenance(provenance, visibility);
     const core = {
       artifact_id: identity.artifactId,
       workspace_id: workspaceId,
@@ -150,11 +195,27 @@ export class ArtifactStore {
       visibility,
       metadata: cleanMetadata(metadata),
       created_at: createdAt,
+      provenance: normalizedProvenance,
     };
     const manifestHash = await digestText(stable(core));
     if (existing) {
       const verified = await this.verifyManifest(existing);
-      if (stable(verified) !== stable(core)) throw new Error("immutable artifact manifest conflict");
+      if (stable(verified) !== stable(core)) {
+        const legacyCore = { ...core };
+        delete legacyCore.provenance;
+        if (Number(existing.schema_version ?? 1) !== 1 || stable(verified) !== stable(legacyCore)) {
+          throw new Error("immutable artifact manifest conflict");
+        }
+        await this.statement(`UPDATE artifact_manifests SET schema_version=2,manifest_hash=?,strategy_id=?,dna_id=?,dataset_slice_id=?,
+          policy_version_id=?,engine_version_id=?,compiler_version_id=?,config_version_id=?,input_hash=?,result_hash=?,redaction_class=?
+          WHERE workspace_id=? AND artifact_id=? AND schema_version=1`, manifestHash, normalizedProvenance.strategy_id,
+        normalizedProvenance.dna_id, normalizedProvenance.dataset_slice_id, normalizedProvenance.policy_version_id,
+        normalizedProvenance.engine_version_id, normalizedProvenance.compiler_version_id, normalizedProvenance.config_version_id,
+        normalizedProvenance.input_hash, normalizedProvenance.result_hash, normalizedProvenance.redaction_class,
+        workspaceId, identity.artifactId).run();
+        await this.verifyStoredObject(core);
+        return { ...core, manifest_hash: manifestHash, idempotent: true, provenance_upgraded: true };
+      }
       await this.verifyStoredObject(verified);
       return { ...verified, manifest_hash: manifestHash, idempotent: true };
     }
@@ -167,10 +228,15 @@ export class ArtifactStore {
     } });
     await this.verifyStoredObject(core);
     const result = await this.statement(`INSERT INTO artifact_manifests
-      (artifact_id,workspace_id,workspace_hash,artifact_kind,object_key,content_hash,byte_length,media_type,visibility,metadata_json,manifest_hash,verified_at,created_at)
-      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(artifact_id) DO NOTHING`,
+      (artifact_id,workspace_id,workspace_hash,artifact_kind,object_key,content_hash,byte_length,media_type,visibility,metadata_json,manifest_hash,
+       schema_version,strategy_id,dna_id,dataset_slice_id,policy_version_id,engine_version_id,compiler_version_id,config_version_id,input_hash,result_hash,
+       redaction_class,verified_at,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(artifact_id) DO NOTHING`,
     identity.artifactId, workspaceId, identity.workspaceHash, kind, identity.objectKey, contentHash, bytes.byteLength,
-    mediaType, visibility, stable(core.metadata), manifestHash, createdAt, createdAt).run();
+    mediaType, visibility, stable(core.metadata), manifestHash, 2, normalizedProvenance.strategy_id, normalizedProvenance.dna_id,
+    normalizedProvenance.dataset_slice_id, normalizedProvenance.policy_version_id, normalizedProvenance.engine_version_id,
+    normalizedProvenance.compiler_version_id, normalizedProvenance.config_version_id, normalizedProvenance.input_hash,
+    normalizedProvenance.result_hash, normalizedProvenance.redaction_class, createdAt, createdAt).run();
     if ((result.meta?.changes ?? result.changes ?? 0) === 0) {
       const raced = await this.manifestById(workspaceId, identity.artifactId);
       const verified = await this.verifyManifest(raced);

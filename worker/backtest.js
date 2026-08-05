@@ -121,24 +121,24 @@ export async function buildBacktestPayload(phase, strategies, dataset, bars) {
     ...strategy, dna_hash: strategy.dna_hash ?? await frozenDna(strategy),
   })));
   const sliceHash = await sha256(bars);
-  const job_id = await sha256({ phase, dataset: dataset.sha256, slice: sliceHash,
-    strategies: dna.map((item) => [item.id, item.dna_hash]), config_hash });
+  const unsignedPayload = {
+    phase, strategies: dna.map((item) => item.strategy_format === "dsl-v1" ? ({
+      strategy_format: "dsl-v1", id: item.id, asset: item.asset,
+      dna: item.strategy_dna, dna_hash: item.strategy_dna.dna_hash,
+    }) : ({
+      strategy_format: "legacy-archetype-v0", id: item.id, asset: item.asset,
+      archetype: item.archetype, params: item.params, dna_hash: item.dna_hash,
+    })),
+    dataset: { snapshot_id: dataset.id, symbol: dataset.symbol, timeframe: dataset.timeframe,
+      start: bars.at(0).t, end: bars.at(-1).t, bar_count: bars.length, sha256: sliceHash },
+    bars, windows: phase === "development" ? developmentWindows(bars)
+      : [{ id: "holdout", start: 0, end: bars.length }],
+    execution: { ...EXECUTION_CONFIG },
+  };
+  const job_id = await sha256(unsignedPayload);
   return {
     config_hash, dna, slice_hash: sliceHash,
-    payload: {
-      job_id, phase, strategies: dna.map((item) => item.strategy_format === "dsl-v1" ? ({
-        strategy_format: "dsl-v1", id: item.id, asset: item.asset,
-        dna: item.strategy_dna, dna_hash: item.strategy_dna.dna_hash,
-      }) : ({
-        strategy_format: "legacy-archetype-v0", id: item.id, asset: item.asset,
-        archetype: item.archetype, params: item.params, dna_hash: item.dna_hash,
-      })),
-      dataset: { snapshot_id: dataset.id, symbol: dataset.symbol, timeframe: dataset.timeframe,
-        start: bars.at(0).t, end: bars.at(-1).t, bar_count: bars.length, sha256: sliceHash },
-      bars, windows: phase === "development" ? developmentWindows(bars)
-        : [{ id: "holdout", start: 0, end: bars.length }],
-      execution: { ...EXECUTION_CONFIG },
-    },
+    payload: { job_id, ...unsignedPayload },
   };
 }
 
@@ -363,12 +363,11 @@ export async function buildBacktestPayloadV2(phase, strategies, dataset, options
     })), sha256: slice_sha256,
   };
   const shard_index = Math.max(0, Math.floor(Number(options.shard_index ?? 0)));
-  const identity = { schema_version: BACKTEST_CONTRACT_V2, phase, strategies: normalizedStrategies,
+  const unsignedPayload = { schema_version: BACKTEST_CONTRACT_V2, phase, strategies: normalizedStrategies,
     dataset: datasetManifest, bars_by_symbol, windows, execution, shard_index };
-  const job_id = await sha256(identity);
+  const job_id = await sha256(unsignedPayload);
   return { job_id, config_hash, slice_hash: slice_sha256, dna: normalizedStrategies,
-    payload: { schema_version: BACKTEST_CONTRACT_V2, job_id, phase, strategies: normalizedStrategies,
-      dataset: datasetManifest, bars_by_symbol, windows, execution } };
+    payload: { job_id, ...unsignedPayload } };
 }
 
 /** Stable shards: ordering changes never move a strategy between shards. */
@@ -402,7 +401,38 @@ export async function buildBacktestPayloadShardsV2(phase, strategies, dataset, o
     .then((built) => ({ ...built, shard_index: index, shard_count: shards.length }))));
 }
 
+export async function verifyBacktestResponse(payload, result, { requireImageDigest = true } = {}) {
+  if (!payload || typeof payload !== "object" || !result || typeof result !== "object") {
+    throw new Error("Backtest request and response objects are required");
+  }
+  const { job_id: suppliedJobId, ...unsignedPayload } = payload;
+  if (!/^[a-f0-9]{64}$/.test(String(suppliedJobId ?? ""))
+      || suppliedJobId !== await sha256(unsignedPayload)) {
+    throw new Error("Backtest job ID is not bound to the canonical request payload");
+  }
+  if (result.job_id !== suppliedJobId) throw new Error("Backtest response job ID does not match the request");
+  if (result.input_hash !== await sha256(payload)) throw new Error("Backtest response input hash does not match the signed request");
+  const serviceResultHash = result.result_hash;
+  if (!/^[a-f0-9]{64}$/.test(String(serviceResultHash ?? ""))) {
+    throw new Error("Backtest response is missing a valid result hash");
+  }
+  const { result_hash: ignored, ...unsignedResult } = result;
+  if (serviceResultHash !== await sha256(unsignedResult)) {
+    throw new Error("Backtest response result hash does not match its canonical contents");
+  }
+  const imageDigest = result.engine?.image_digest;
+  if (requireImageDigest && !/^sha256:[a-f0-9]{64}$/.test(String(imageDigest ?? ""))) {
+    throw new Error("Backtest response is missing an immutable container image digest");
+  }
+  return result;
+}
+
 export async function signedBacktest(env, payload) {
+  const { job_id: suppliedJobId, ...unsignedPayload } = payload ?? {};
+  if (!/^[a-f0-9]{64}$/.test(String(suppliedJobId ?? ""))
+      || suppliedJobId !== await sha256(unsignedPayload)) {
+    throw new Error("Backtest job ID is not bound to the canonical request payload");
+  }
   const body = JSON.stringify(payload);
   const timestamp = String(Math.floor(Date.now() / 1000));
   const signatureBytes = await crypto.subtle.sign("HMAC", await crypto.subtle.importKey(
@@ -416,7 +446,9 @@ export async function signedBacktest(env, payload) {
   const result = await response.json().catch(() => ({}));
   if (!response.ok) throw new Error(`Backtest service ${response.status}: ${result.error || result.detail || "request failed"}`);
   if (!Array.isArray(result.results)) throw new Error("Backtest service response is missing results");
-  return result;
+  return verifyBacktestResponse(payload, result, {
+    requireImageDigest: String(env.BACKTEST_REQUIRE_IMAGE_DIGEST ?? "true").toLowerCase() !== "false",
+  });
 }
 
 export function normalizeMetrics(source = {}) {

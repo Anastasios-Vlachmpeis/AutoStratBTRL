@@ -21,6 +21,7 @@ import {
   normalizeCalendarSessions,
   publicMarketDataState,
   recordMarketDataUsage,
+  recordNormalizedHoldoutAccess,
 } from "./market-data.js";
 import { sha256 } from "./backtest.js";
 import { initialUniverseManifest } from "./universe.js";
@@ -256,6 +257,20 @@ test("verified partition loading physically separates development and holdout ba
   assert.notEqual(development.dataset_hash, holdout.dataset_hash);
   objects.set("partition", [...values, bar("2026-01-06T14:30:00Z", 999)]);
   await assert.rejects(repository.loadSealedDataset(manifest.id), /content verification/);
+});
+
+test("normalized holdout access records a sealed slice without requiring an artifact", async () => {
+  const calls = [];
+  const db = { prepare(sql) { let args = []; return { bind(...values) { args = values; return this; },
+    async run() { calls.push({ sql, args }); return { meta: { changes: 1 } }; } }; } };
+  const first = await recordNormalizedHoldoutAccess(db, { workspaceId: "ws", datasetSliceId: "slice-holdout",
+    strategyId: "strategy-1", actor: "validator", decisionId: "decision-1", accessedAt: "2026-08-05T12:00:00.000Z" });
+  const second = await recordNormalizedHoldoutAccess(db, { workspaceId: "ws", datasetSliceId: "slice-holdout",
+    strategyId: "strategy-1", actor: "validator", decisionId: "decision-1", accessedAt: "2026-08-05T12:01:00.000Z" });
+  assert.equal(first.requestHash, second.requestHash);
+  assert.equal(calls[0].args[2], "slice-holdout");
+  assert.equal(calls[0].args[3], null);
+  assert.match(calls[0].sql, /ON CONFLICT/);
 });
 
 test("reset preparation inventories exact legacy D1 and R2 market targets", async () => {

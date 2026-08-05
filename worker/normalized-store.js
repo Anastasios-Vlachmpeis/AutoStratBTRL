@@ -140,8 +140,10 @@ export class NormalizedStore {
     for (const item of exported.cohorts ?? []) statements.push(this.cohortStatement(workspaceId, item, now));
     for (const item of exported.datasets ?? []) statements.push(this.datasetStatement(workspaceId, item, now));
     for (const item of exported.datasetSlices ?? []) statements.push(this.datasetSliceStatement(workspaceId, item, now));
+    for (const item of exported.artifactManifests ?? exported.artifact_manifests ?? []) statements.push(await this.importedArtifactStatement(workspaceId, item, now));
     for (const item of exported.trials ?? []) statements.push(this.trialStatement(workspaceId, item, now));
     for (const item of exported.lifecycleTransitions ?? []) statements.push(await this.lifecycleStatement(workspaceId, item, now));
+    for (const item of exported.operationalStatus ?? exported.operational_status ?? []) statements.push(await this.operationalStatusStatement(workspaceId, item, now));
     for (const item of exported.auditEvents ?? []) statements.push(await this.auditStatement(workspaceId, item, now));
     await this.batch(statements);
 
@@ -160,6 +162,76 @@ export class NormalizedStore {
     workspaceId, readModelId, sourceCheckpointHash, schemaVersion, json(response), responseHash,
     exported.comparisonStatus ?? "pending", now).run();
     return { workspaceId, readModelId, sourceCheckpointHash, responseHash, schemaVersion };
+  }
+
+  /** Materialize and resolve the exact FK chain required by an artifact.
+   * Content-derived IDs keep this idempotent across Worker and queue retries. */
+  async ensureArtifactProvenance({ workspaceId, strategyId, dnaHash, datasetId, datasetHash, datasetRangeStart = null,
+    datasetRangeEnd = null, phase,
+    policyHash, policy = {}, engine = {}, compiler = {}, configHash, config = {} }) {
+    if (!validHash(dnaHash) || !validHash(datasetHash) || !validHash(policyHash) || !validHash(configHash)) {
+      throw new Error("Artifact provenance requires DNA, dataset, policy, and configuration SHA-256 values");
+    }
+    if (await sha256(policy) !== policyHash) throw new Error("Artifact policy content does not match its hash");
+    if (await sha256(config) !== configHash) throw new Error("Artifact configuration content does not match its hash");
+    const strategy = await this.statement("SELECT strategy_id FROM strategies WHERE workspace_id=? AND strategy_id=?",
+      workspaceId, strategyId).first();
+    if (!strategy) throw new Error(`Normalized strategy ${strategyId} is unavailable`);
+    const dna = await this.statement(`SELECT dna_id FROM strategy_dna
+      WHERE workspace_id=? AND strategy_id=? AND dna_hash=?`, workspaceId, strategyId, dnaHash).first();
+    if (!dna) throw new Error(`Normalized DNA ${dnaHash} is unavailable for ${strategyId}`);
+    const dataset = await this.statement("SELECT range_start,range_end,manifest_object_key FROM datasets WHERE workspace_id=? AND dataset_id=?",
+      workspaceId, datasetId).first();
+    if (!dataset) throw new Error(`Normalized dataset ${datasetId} is unavailable`);
+    const sliceKind = phase === "holdout" ? "holdout" : "development";
+    let slice = await this.statement(`SELECT dataset_slice_id FROM dataset_slices
+      WHERE workspace_id=? AND dataset_id=? AND slice_kind=? AND slice_hash=?`,
+    workspaceId, datasetId, sliceKind, datasetHash).first();
+    if (!slice) {
+      const datasetSliceId = `slice-${sliceKind}-${datasetHash.slice(0, 32)}`;
+      await this.statement(`INSERT INTO dataset_slices
+        (workspace_id,dataset_slice_id,dataset_id,slice_kind,ordinal,range_start,range_end,sealed,slice_hash,manifest_object_key,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,dataset_slice_id) DO NOTHING`, workspaceId,
+      datasetSliceId, datasetId, sliceKind, sliceKind === "holdout" ? 1 : 0,
+      datasetRangeStart ?? dataset.range_start, datasetRangeEnd ?? dataset.range_end,
+      sliceKind === "holdout" ? 1 : 0, datasetHash, dataset.manifest_object_key, this.now()).run();
+      slice = { dataset_slice_id: datasetSliceId };
+    }
+    let policyRow = await this.statement("SELECT policy_version_id FROM supervisor_policy_versions WHERE workspace_id=? AND policy_hash=?",
+      workspaceId, policyHash).first();
+    if (!policyRow) {
+      const policyVersionId = `policy-${policyHash.slice(0, 32)}`;
+      await this.policyVersionStatement(workspaceId, { policyVersionId, policyHash, policy,
+        approvedBy: "system", effectiveFrom: this.now(), createdAt: this.now() }, this.now()).run();
+      policyRow = { policy_version_id: policyVersionId };
+    }
+    const compilerHash = compiler.semantic_sha256 ?? compiler.implementation_hash ?? await sha256(compiler);
+    if (!validHash(compilerHash)) throw new Error("Compiler provenance hash is invalid");
+    let compilerRow = await this.statement("SELECT compiler_version_id FROM compiler_versions WHERE workspace_id=? AND implementation_hash=?",
+      workspaceId, compilerHash).first();
+    if (!compilerRow) {
+      const compilerVersionId = `compiler-${compilerHash.slice(0, 32)}`;
+      await this.compilerVersionStatement(workspaceId, { compilerVersionId,
+        languageVersion: compiler.dsl_version ?? compiler.language_version ?? "dsl-v1",
+        compilerVersion: compiler.semantic_version ?? compiler.version ?? "unknown",
+        implementationHash: compilerHash }, this.now()).run();
+      compilerRow = { compiler_version_id: compilerVersionId };
+    }
+    const rawImage = String(engine.image_digest ?? "");
+    const engineHash = /^sha256:[a-f0-9]{64}$/.test(rawImage) ? rawImage.slice(7) : await sha256(engine);
+    const engineVersionId = `engine-${engineHash.slice(0, 32)}`;
+    await this.statement(`INSERT INTO engine_versions
+      (workspace_id,engine_version_id,engine_family,engine_version,container_digest,implementation_hash,created_at)
+      VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id,engine_version_id) DO NOTHING`, workspaceId, engineVersionId,
+    engine.name ?? "backtrader", engine.version ?? "unknown", rawImage || null, engineHash, this.now()).run();
+    const configVersionId = `config-${configHash.slice(0, 32)}`;
+    await this.statement(`INSERT INTO system_config_versions
+      (workspace_id,config_version_id,config_kind,schema_version,content_json,content_hash,effective_from,created_at,created_by)
+      VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,config_version_id) DO NOTHING`, workspaceId, configVersionId,
+    "backtest_execution", 1, json(config), configHash, this.now(), this.now(), "system").run();
+    return { strategyId, dnaId: dna.dna_id, datasetSliceId: slice.dataset_slice_id,
+      policyVersionId: policyRow.policy_version_id, engineVersionId,
+      compilerVersionId: compilerRow.compiler_version_id, configVersionId };
   }
 
   compilerVersionStatement(workspaceId, item, now) {
@@ -298,6 +370,40 @@ export class NormalizedStore {
     item.actor ?? "system", field(item, "command_id", "commandId") ?? transitionId, idempotencyKey,
     optional(field(item, "policy_version_id", "policyVersionId")), optional(field(item, "evidence_artifact_id", "evidenceArtifactId")), inputHash, resultHash,
     optional(field(item, "supersedes_transition_id", "supersedesTransitionId")), field(item, "occurred_at", "occurredAt") ?? now);
+  }
+
+  async importedArtifactStatement(workspaceId, item, now) {
+    const contentHash = required(field(item, "content_hash", "contentHash"), "artifact contentHash");
+    if (!validHash(contentHash)) throw new Error("artifact contentHash must be a SHA-256 digest");
+    const objectKey = required(field(item, "object_key", "objectKey"), "artifact objectKey");
+    const artifactId = required(field(item, "artifact_id", "artifactId"), "artifactId");
+    const workspaceHash = await sha256(workspaceId);
+    const metadata = item.metadata ?? { source: item.source ?? "legacy_migration", legacy_artifact_id: artifactId };
+    const artifactKind = field(item, "artifact_kind", "artifactKind") ?? "backtest.result";
+    const byteLength = Number(item.byteLength ?? item.byte_length ?? 0);
+    const mediaType = item.mediaType ?? item.media_type ?? "application/json";
+    const createdAt = field(item, "created_at", "createdAt") ?? now;
+    const manifestHash = await sha256({ artifact_id: artifactId, workspace_id: workspaceId, workspace_hash: workspaceHash,
+      artifact_kind: artifactKind, object_key: objectKey, content_hash: contentHash, byte_length: byteLength,
+      media_type: mediaType, visibility: "private", metadata, created_at: createdAt });
+    return this.statement(`INSERT INTO artifact_manifests
+      (workspace_id,artifact_id,workspace_hash,artifact_kind,object_key,content_hash,byte_length,media_type,visibility,metadata_json,
+       manifest_hash,schema_version,redaction_class,verified_at,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,artifact_id) DO NOTHING`, workspaceId, artifactId,
+    workspaceHash, artifactKind, objectKey, contentHash, byteLength, mediaType, "private",
+    json(metadata), manifestHash, 1, "private", null, createdAt);
+  }
+
+  async operationalStatusStatement(workspaceId, item, now) {
+    const strategyId = required(field(item, "strategy_id", "strategyId"), "operational strategyId");
+    const sequence = Math.max(1, Number(item.sequence ?? item.version ?? 1));
+    const statusId = field(item, "operational_status_id", "operationalStatusId")
+      ?? await deterministicId("operational", { workspaceId, strategyId, sequence, status: item.state ?? item.status });
+    return this.statement(`INSERT INTO operational_status
+      (workspace_id,operational_status_id,strategy_id,sequence,status,reason_code,source_job_id,observed_at)
+      VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,operational_status_id) DO NOTHING`, workspaceId, statusId,
+    strategyId, sequence, item.state ?? item.status ?? "ready", optional(item.reasonCode ?? item.reason_code),
+    optional(item.sourceJobId ?? item.source_job_id), item.observedAt ?? item.observed_at ?? now);
   }
 
   async auditStatement(workspaceId, item, now) {

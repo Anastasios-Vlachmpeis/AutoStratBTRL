@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { NormalizedStore, NORMALIZED_WORKSPACE_TABLES } from "./normalized-store.js";
+import { sha256 } from "./backtest.js";
 
 class MemoryD1 {
   constructor() { this.calls = []; this.readModel = null; this.counts = { strategies: 0, incidents: 0, artifacts: 0 }; this.migrationStatus = null; this.resetRows = new Map(); }
@@ -55,8 +56,10 @@ const exported = () => ({
   cohorts: [{ cohortId: "cohort-1", universeVersionId: "universe-1", policyVersionId: "policy-1", generationSeed: "seed", requestedTrials: 1 }],
   datasets: [{ datasetId: "dataset-1", datasetRootHash: hash("1"), universeVersionId: "universe-1", calendarVersionId: "calendar-1", rangeStart: "2026-01-01", rangeEnd: "2026-08-05", manifestObjectKey: "datasets/d1.json", manifestHash: hash("2") }],
   datasetSlices: [{ datasetSliceId: "slice-1", datasetId: "dataset-1", rangeStart: "2026-01-01", rangeEnd: "2026-06-01", sliceHash: hash("3"), manifestObjectKey: "datasets/s1.json" }],
+  artifactManifests: [{ artifactId: "legacy-artifact-1", objectKey: "legacy/artifact-1.json", contentHash: hash("4"), metadata: { source: "migration" } }],
   trials: [{ trialId: "trial-1", cohortId: "cohort-1", strategyId: "strategy-1", dnaId: "dna-1", datasetSliceId: "slice-1", trialSeed: "trial-seed" }],
   lifecycleTransitions: [{ strategyId: "strategy-1", sequence: 1, toState: "development" }],
+  operationalStatus: [{ strategyId: "strategy-1", sequence: 1, status: "ready" }],
   auditEvents: [{ action: "migration.import", subjectKind: "strategy", subjectId: "strategy-1" }],
   readModel: { strategies: [{ id: "strategy-1" }], version: 8 },
 });
@@ -69,6 +72,7 @@ test("export writes dependency-ordered normalized domains and a deterministic re
   assert.equal(first.responseHash, second.responseHash);
   const inserts = db.calls.map((call) => call.sql.match(/INSERT INTO ([a-z_]+)/)?.[1]).filter(Boolean);
   assert.ok(inserts.includes("strategies")); assert.ok(inserts.includes("strategy_dna")); assert.ok(inserts.includes("lifecycle_transitions"));
+  assert.ok(inserts.includes("artifact_manifests")); assert.ok(inserts.includes("operational_status"));
   assert.equal(inserts.at(-1), "normalized_read_models");
   assert.deepEqual((await store.loadLatestReadModel("workspace-1")).response, exported().readModel);
 });
@@ -84,6 +88,44 @@ test("live dual-write projection mirrors strategy state and frontend response", 
   assert.equal(first.readModelId, second.readModelId);
   assert.equal((await store.loadLatestReadModel("workspace-1")).response.strategies[0].id, "s1");
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO strategies")));
+});
+
+test("artifact provenance materializes a complete deterministic foreign-key chain", async () => {
+  const calls = [];
+  const database = { prepare(sql) { let args = []; return {
+    bind(...values) { args = values; return this; },
+    async first() {
+      if (sql.includes("FROM strategies")) return { strategy_id: "strategy-1" };
+      if (sql.includes("FROM strategy_dna")) return { dna_id: "dna-1" };
+      if (sql.includes("FROM datasets")) return { range_start: "2026-01-01", range_end: "2026-08-01",
+        manifest_object_key: "datasets/root.json" };
+      return null;
+    },
+    async run() { calls.push({ sql, args }); return { meta: { changes: 1 } }; },
+  }; } };
+  const store = new NormalizedStore(database, { clock });
+  const policy = { schema_version: 1, release: { minimum_score: .5 } };
+  const config = { version: "execution-v2", initial_cash: 100000 };
+  const result = await store.ensureArtifactProvenance({ workspaceId: "workspace-1",
+    strategyId: "strategy-1", dnaHash: hash("d"), datasetId: "dataset-1",
+    datasetHash: hash("e"), phase: "holdout", policy, policyHash: await sha256(policy),
+    engine: { name: "backtrader", version: "1.9.78.123", image_digest: `sha256:${hash("f")}` },
+    compiler: { dsl_version: "dsl-v1", semantic_version: "1", semantic_sha256: hash("c") },
+    config, configHash: await sha256(config) });
+  assert.deepEqual(result, { strategyId: "strategy-1", dnaId: "dna-1",
+    datasetSliceId: `slice-holdout-${hash("e").slice(0, 32)}`,
+    policyVersionId: `policy-${(await sha256(policy)).slice(0, 32)}`,
+    engineVersionId: `engine-${hash("f").slice(0, 32)}`,
+    compilerVersionId: `compiler-${hash("c").slice(0, 32)}`,
+    configVersionId: `config-${(await sha256(config)).slice(0, 32)}` });
+  for (const table of ["dataset_slices", "supervisor_policy_versions", "compiler_versions",
+    "engine_versions", "system_config_versions"]) {
+    assert.ok(calls.some((call) => call.sql.includes(`INSERT INTO ${table}`)), `${table} provenance was not materialized`);
+  }
+  await assert.rejects(store.ensureArtifactProvenance({ workspaceId: "workspace-1",
+    strategyId: "strategy-1", dnaHash: hash("d"), datasetId: "dataset-1", datasetHash: hash("e"),
+    phase: "development", policy, policyHash: await sha256(policy), engine: {}, compiler: {},
+    config, configHash: hash("0") }), /configuration content does not match/);
 });
 
 test("read model corruption is rejected and cutover health reports every blocker", async () => {

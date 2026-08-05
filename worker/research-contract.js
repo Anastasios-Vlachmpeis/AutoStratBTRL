@@ -29,7 +29,8 @@ export function normalizeResearchConfig(value = {}) {
     validation_slots: integer(value.validation_slots, RESEARCH_LIMITS.validation_slots, 1, RESEARCH_LIMITS.validation_slots),
     behavior_clusters: integer(value.behavior_clusters, RESEARCH_LIMITS.behavior_clusters, 1, RESEARCH_LIMITS.behavior_clusters),
     max_runtime_ms: integer(value.max_runtime_ms, RESEARCH_LIMITS.max_runtime_ms, 100, RESEARCH_LIMITS.max_runtime_ms),
-    minimum_symbols: integer(value.minimum_symbols, 5, 5, 40),
+    minimum_symbols: integer(value.minimum_symbols, 5, 5, 5),
+    maximum_symbols: integer(value.maximum_symbols, 5, 5, 5),
     maximum_symbol_concentration: decimal(value.maximum_symbol_concentration, .35, .05, .35),
     near_duplicate_correlation: decimal(value.near_duplicate_correlation, .995, .90, .9999),
   });

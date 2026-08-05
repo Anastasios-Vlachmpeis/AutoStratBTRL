@@ -55,8 +55,8 @@ export class AlpacaPaperBrokerGateway {
     return getAccountOverview(this.env);
   }
 
-  async buildCycle(appState, scheduledBucket, orderBucket = scheduledBucket) {
-    return buildPaperCycle(this.env, appState, scheduledBucket, orderBucket);
+  async buildCycle(appState, scheduledBucket, orderBucket = scheduledBucket, options = {}) {
+    return buildPaperCycle(this.env, appState, scheduledBucket, orderBucket, options);
   }
 
   async cancelManagedOpenOrders() {

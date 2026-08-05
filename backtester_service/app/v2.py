@@ -1,10 +1,8 @@
 """Version 2 authoritative intraday portfolio evaluator.
 
-This uses Backtrader for deterministic multi-feed scheduling while retaining
-an explicit fractional participation broker ledger: Backtrader's stock broker
-does not natively express the required per-bar partial-fill semantics.  The
-DSL itself is evaluated by the shared reference compiler and every fill is
-recorded in a complete replay artifact.
+Backtrader owns scheduling, orders, partial fills, cash and positions. The
+returned ledger is a projection of broker notifications, never a second
+post-run execution simulator.
 """
 from __future__ import annotations
 
@@ -16,6 +14,7 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from statistics import median
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 import backtrader as bt
@@ -27,6 +26,7 @@ from .replay import ARTIFACT_SCHEMA_VERSION, build_replay_metadata
 INITIAL_CASH = 100_000.0
 RESULT_SCHEMA_VERSION = "backtest-artifact-v2"
 SAFETY_WARMUP_BARS = 2
+NEW_YORK = ZoneInfo("America/New_York")
 
 
 def digest(value: Any) -> str:
@@ -67,9 +67,12 @@ class V2Bar(BaseModel):
 
     @model_validator(mode="after")
     def sensible(self) -> "V2Bar":
-        iso(self.t)
+        local = iso(self.t).astimezone(NEW_YORK)
         if min(self.o, self.h, self.l, self.c) <= 0 or self.h < max(self.o, self.l, self.c) or self.l > min(self.o, self.h, self.c):
             raise ValueError("invalid OHLC range")
+        minute = local.hour * 60 + local.minute
+        if local.weekday() >= 5 or minute < 9 * 60 + 30 or minute >= 16 * 60 or minute % 5:
+            raise ValueError("bar timestamp is outside the regular-session five-minute grid")
         return self
 
 
@@ -211,6 +214,7 @@ class BacktestRequestV2(BaseModel):
     model_config = ConfigDict(extra="forbid")
     schema_version: Literal["backtest-request-v2"] = "backtest-request-v2"
     job_id: str = Field(min_length=1, max_length=200)
+    shard_index: int = Field(default=0, ge=0, le=10_000)
     phase: Literal["development", "holdout", "shadow"]
     strategies: list[V2Strategy] = Field(min_length=1, max_length=12)
     dataset: DatasetManifestV2
@@ -660,17 +664,265 @@ class _V2BarFeed(bt.feed.DataBase):
 
 
 class _V2PortfolioAdapter(bt.Strategy):
-    """Backtrader-authoritative multi-feed lifecycle with a deterministic broker ledger.
+    """Authoritative Backtrader strategy and broker-event ledger.
 
-    Backtrader controls feed synchronization and lifecycle; the ledger is kept
-    explicit because its stock broker cannot represent partial fractional fills
-    capped by each bar's participation volume.  It is invoked from ``stop``
-    after the exact feed run, so a custom fill does not bypass the engine run.
+    Every position, cash movement and fill below originates from a Backtrader
+    order notification.  Decisions are made in ``next`` after a bar closes, so
+    market orders can only execute on a later eligible bar open.
     """
     params = (("dna", None), ("bars_by_symbol", None), ("window", None), ("config", None), ("stress", False), ("target_multiplier", 1.0), ("gap_stress", False))
-    def __init__(self) -> None: self.result: dict[str, Any] | None = None
+    def __init__(self) -> None:
+        self.result: dict[str, Any] | None = None
+        self.frozen = validate_strategy_dna(self.p.dna)
+        self.symbols = sorted(set(self.frozen.scope["symbols"]) & {data._name for data in self.datas})
+        self.by_symbol = {data._name: data for data in self.datas if data._name in self.symbols}
+        self.rows = {symbol: {self._canonical_stamp(row["t"]): row for row in self.p.bars_by_symbol[symbol]
+                             if iso(row["t"]) >= iso(self.p.window.start) and iso(row["t"]) < iso(self.p.window.end)}
+                     for symbol in self.symbols}
+        self.machines = {symbol: TargetStateMachine(self.frozen) for symbol in self.symbols}
+        self.warmup = int(self.frozen.warmup_bars) + self.p.config.warmup_safety_bars
+        self.seen = defaultdict(int)
+        self.active_orders: dict[str, Any] = {}
+        self.order_sequence = 0
+        self.order_meta: dict[int, dict[str, Any]] = {}
+        self.order_records: dict[int, dict[str, Any]] = {}
+        self.processed_bits = defaultdict(int)
+        self.reversal_targets: dict[str, float] = {}
+        self.latest_targets: dict[str, float] = {}
+        self.signals: list[dict[str, Any]] = []; self.targets: list[dict[str, Any]] = []
+        self.fills: list[dict[str, Any]] = []; self.closed: list[dict[str, Any]] = []
+        self.rejected: list[dict[str, Any]] = []; self.flatten_events: list[dict[str, Any]] = []
+        self.curve: list[dict[str, Any]] = []
+        self.symbol_curves = {symbol: [] for symbol in self.symbols}
+        self.symbol_cash = {symbol: 0.0 for symbol in self.symbols}
+        self.entry_size = defaultdict(float)
+        self.entry_direction = defaultdict(int)
+        self.trade_extra_cost = defaultdict(float)
+        self.last_signal: dict[str, tuple[float, str]] = {}
+        self.last_target: dict[str, tuple[float, str]] = {}
+        self.boundary_decisions: dict[str, set[str]] = {}
+        self.session_final_bars: dict[str, set[str]] = {}
+        for symbol, records in self.rows.items():
+            grouped: dict[str, list[str]] = defaultdict(list)
+            for stamp in sorted(records, key=iso): grouped[iso(stamp).date().isoformat()].append(stamp)
+            # Submit a close after the penultimate completed bar; Backtrader
+            # then fills it at the final regular bar's open.
+            self.boundary_decisions[symbol] = {stamps[-2] for stamps in grouped.values() if len(stamps) >= 2}
+            self.session_final_bars[symbol] = {stamps[-1] for stamps in grouped.values() if stamps}
+
+    @staticmethod
+    def _canonical_stamp(value: Any) -> str:
+        parsed = value if isinstance(value, datetime) else iso(str(value))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+    @staticmethod
+    def _stamp(data: Any, value: float | None = None) -> str:
+        number = data.datetime[0] if value is None else value
+        return _V2PortfolioAdapter._canonical_stamp(bt.num2date(number).replace(tzinfo=timezone.utc))
+
+    def _submit(self, symbol: str, target: float, stamp: str, reason: str) -> None:
+        forced = reason in {"session_flatten", "unhealthy_data", "outside_regular_session", "sealed_session_forced_close"}
+        if symbol in self.active_orders:
+            if forced:
+                self.cancel(self.active_orders.pop(symbol))
+            else:
+                self.latest_targets[symbol] = target
+                return
+        data = self.by_symbol[symbol]
+        position = float(self.getposition(data).size)
+        if position and target and position * target < 0:
+            self.reversal_targets[symbol] = target
+            target = 0.0
+            reason = "flatten_first_reversal"
+        # Backtrader's stocklike target-percent helper rounds through the
+        # commission-info sizer. Submit the exact fractional delta explicitly;
+        # the Backtrader broker still owns acceptance, partial fills, cash and
+        # the resulting position.
+        mark = float(data.close[0])
+        desired_size = target * float(self.broker.getvalue()) / mark if mark > 0 else position
+        delta = desired_size - position
+        if abs(delta) < 1e-12: return
+        order = self.buy(data=data, size=delta) if delta > 0 else self.sell(data=data, size=abs(delta))
+        if order is None: return
+        self.order_sequence += 1
+        local_order_id = f"bt-order-{self.order_sequence}"
+        order.addinfo(axiom_reason=reason, axiom_target=round(target, 10), axiom_order_id=local_order_id)
+        self.active_orders[symbol] = order
+        self.order_meta[order.ref] = {"symbol": symbol, "submitted_at": stamp, "target": target,
+            "reason": reason, "order_id": local_order_id, "sequence": self.order_sequence}
+        self.order_records[order.ref] = {"order_id": local_order_id, "t": stamp, "symbol": symbol,
+            "target": round(target, 10), "requested_size": round(float(order.created.size), 10), "status": "submitted"}
+
+    def notify_order(self, order: Any) -> None:
+        meta = self.order_meta.get(order.ref)
+        if meta is None: return
+        symbol = meta["symbol"]
+        bits = list(order.executed.exbits or [])
+        for bit in bits[self.processed_bits[order.ref]:]:
+            size = float(bit.size); broker_price = float(bit.price); broker_commission = float(bit.comm)
+            stamp = self._stamp(order.data, float(bit.dt))
+            row = self.rows[symbol].get(stamp, {})
+            volume = max(float(row.get("v", order.data.volume[0] or 0)), 1e-12)
+            participation = abs(size) / volume
+            opening_price = max(float(row.get("o", broker_price)), 1e-12)
+            bar_range = max(0.0, (float(row.get("h", opening_price)) - float(row.get("l", opening_price))) / opening_price)
+            slip_scale = self.p.config.stress_slippage_multiplier if self.p.stress else 1.0
+            required_slippage = slip_scale * (self.p.config.base_slippage_bps / 10_000
+                + self.p.config.range_slippage_multiplier * bar_range
+                + self.p.config.participation_slippage_multiplier * participation * .0001)
+            if self.p.gap_stress: required_slippage += .001
+            broker_slippage = abs(broker_price / opening_price - 1)
+            extra_cost = abs(size * opening_price) * max(0.0, required_slippage - broker_slippage)
+            if extra_cost:
+                self.broker.add_cash(-extra_cost)
+            self.trade_extra_cost[symbol] += extra_cost
+            commission = broker_commission
+            price = broker_price + (extra_cost / abs(size) if size > 0 else -extra_cost / abs(size))
+            self.fills.append({"order_id": meta["order_id"], "t": stamp, "symbol": symbol,
+                "side": "buy" if size > 0 else "sell", "size": round(size, 10), "price": round(price, 10),
+                "notional": round(abs(size * price), 10), "commission": round(commission, 10),
+                "supplemental_slippage_cost": round(extra_cost, 10),
+                "slippage": round(abs(price / opening_price - 1), 10),
+                "participation": round(participation, 10), "bar_volume": volume,
+                "max_participation": self.p.config.max_participation})
+            self.symbol_cash[symbol] -= size * broker_price + broker_commission + extra_cost
+            self.entry_size[symbol] = max(self.entry_size[symbol], abs(float(self.getposition(order.data).size)))
+        self.processed_bits[order.ref] = len(bits)
+        record = self.order_records[order.ref]
+        if order.status == order.Partial:
+            record["status"] = "partial"
+        elif order.status == order.Completed:
+            record["status"] = "filled"
+            if self.active_orders.get(symbol) is order:
+                self.active_orders.pop(symbol, None)
+            if meta["reason"] in {"session_flatten", "unhealthy_data", "outside_regular_session", "sealed_session_forced_close"}:
+                self.flatten_events.append({"t": self._stamp(order.data), "symbol": symbol, "reason": meta["reason"]})
+        elif order.status in {order.Canceled, order.Margin, order.Rejected, order.Expired}:
+            record["status"] = order.getstatusname().lower()
+            if self.active_orders.get(symbol) is order:
+                self.active_orders.pop(symbol, None)
+            self.rejected.append({"t": self._stamp(order.data), "symbol": symbol,
+                                  "reason": f"broker_{order.getstatusname().lower()}"})
+
+    def notify_trade(self, trade: Any) -> None:
+        symbol = trade.data._name
+        if trade.justopened:
+            self.entry_size[symbol] = abs(float(trade.size))
+            self.entry_direction[symbol] = 1 if float(trade.size) > 0 else -1
+        if trade.isclosed:
+            self.closed.append({"symbol": symbol,
+                "opened": self._stamp(trade.data, float(trade.dtopen)),
+                "closed": self._stamp(trade.data, float(trade.dtclose)),
+                "size": round(self.entry_size[symbol] * self.entry_direction[symbol], 10), "pnl": round(float(trade.pnl), 10),
+                "pnl_after_costs": round(float(trade.pnlcomm) - self.trade_extra_cost[symbol], 10), "bar_length": int(trade.barlen)})
+            self.entry_size[symbol] = 0.0
+            self.entry_direction[symbol] = 0
+            self.trade_extra_cost[symbol] = 0.0
+
+    def prenext(self) -> None: self.next()
+
+    def next(self) -> None:
+        now = max(self._stamp(data) for data in self.datas)
+        available = {symbol: self.rows[symbol][now] for symbol in self.symbols if now in self.rows[symbol]}
+        desired: dict[str, tuple[float, str]] = {}
+        for symbol, row in available.items():
+            self.seen[symbol] += 1
+            decision = self.machines[symbol].step(row)
+            signal = (round(float(decision["target"]), 10), str(decision["reason"]))
+            if self.last_signal.get(symbol) != signal:
+                self.signals.append({"t": now, "symbol": symbol, "target": signal[0], "reason": signal[1]})
+                self.last_signal[symbol] = signal
+            if self.seen[symbol] >= self.warmup:
+                desired[symbol] = (float(decision["target"]), str(decision["reason"]))
+            if now in self.boundary_decisions[symbol]:
+                desired[symbol] = (0.0, "sealed_session_forced_close")
+            elif now in self.session_final_bars[symbol]:
+                # The flatten submitted after the penultimate close has just
+                # executed at this bar's open. Never create a new position on
+                # the final regular-session bar with no same-session exit.
+                desired[symbol] = (0.0, "outside_regular_session")
+        value_before_orders = float(self.broker.getvalue())
+        unavailable_gross = sum(abs(float(self.getposition(data).size) * float(data.close[0]))
+            for symbol, data in self.by_symbol.items() if symbol not in available) / max(value_before_orders, 1)
+        available_budget = max(0.0, self.p.config.strategy_gross_limit - unavailable_gross)
+        gross = sum(abs(target * self.p.target_multiplier) for target, _ in desired.values())
+        scale = min(1.0, available_budget / gross) if gross else 1.0
+        for symbol, (target, reason) in sorted(desired.items()):
+            normalized = target * self.p.target_multiplier * scale
+            state = (round(normalized, 10), reason)
+            if self.last_target.get(symbol) != state:
+                self.targets.append({"t": now, "symbol": symbol, "target": state[0], "reason": reason,
+                    "execute_at": "next_eligible_bar_open"})
+                self.last_target[symbol] = state
+            if symbol in self.reversal_targets and self.getposition(self.by_symbol[symbol]).size:
+                normalized = 0.0
+            elif symbol in self.reversal_targets:
+                normalized = self.reversal_targets.pop(symbol)
+            self._submit(symbol, normalized, now, reason)
+        value = float(self.broker.getvalue())
+        exposures = {symbol: float(self.getposition(data).size) * float(data.close[0])
+                     for symbol, data in self.by_symbol.items()}
+        gross_exposure = sum(abs(item) for item in exposures.values()) / max(value, 1)
+        signed_exposure = sum(exposures.values()) / max(value, 1)
+        self.curve.append({"t": now, "value": round(value, 10), "exposure": round(gross_exposure, 10),
+                           "signed_exposure": round(signed_exposure, 10)})
+        allocation = self.p.config.initial_cash / max(len(self.symbols), 1)
+        for symbol, data in self.by_symbol.items():
+            position = float(self.getposition(data).size)
+            self.symbol_curves[symbol].append({"t": now,
+                "value": round(allocation + self.symbol_cash[symbol] + position * float(data.close[0]), 10),
+                "exposure": round(exposures[symbol] / max(value, 1), 10)})
+
     def stop(self) -> None:
-        self.result = _simulate_v2_ledger(self.p.dna, self.p.bars_by_symbol, self.p.window, self.p.config, stress=self.p.stress, target_multiplier=self.p.target_multiplier, gap_stress=self.p.gap_stress)
+        for symbol, order in self.active_orders.items():
+            record = self.order_records.get(order.ref)
+            if record and record.get("status") == "submitted":
+                record["status"] = "expired_no_next_open"
+            self.rejected.append({"t": self._stamp(order.data), "symbol": symbol,
+                "reason": "no_next_eligible_open_for_pending_order"})
+        for symbol, data in self.by_symbol.items():
+            if abs(float(self.getposition(data).size)) > 1e-10:
+                self.rejected.append({"t": self._stamp(data), "symbol": symbol,
+                    "reason": "no_next_eligible_open_for_forced_flatten"})
+        indexed = {symbol: dict(rows) for symbol, rows in self.rows.items()}
+        capacity = min((float(row["v"]) * float(row["c"]) * self.p.config.max_participation
+                        for rows in indexed.values() for row in rows.values()), default=0.0)
+        legacy_metrics = _metrics(self.curve, self.closed, self.fills, self.p.config.initial_cash, capacity)
+        exposure_curve = [{"t": point["t"], "value": point["signed_exposure"]} for point in self.curve]
+        orders = [self.order_records[key] for key in sorted(self.order_records)]
+        computed = compute_metrics([{"t": point["t"], "value": point["value"]} for point in self.curve],
+            self.closed, self.fills, orders, exposure_curve, per_symbol_equity=self.symbol_curves, interval_minutes=5)
+        drawdown_curve = computed.pop("drawdown_curve"); turnover_curve = computed.pop("turnover_curve")
+        metrics = {**legacy_metrics, **computed, "return": computed["net_return"],
+            "annualized": computed["annualized_return"], "volatility": computed["bar_volatility"],
+            "sharpe": computed["daily_sharpe"], "sortino": computed["daily_sortino"],
+            "drawdown": computed["max_drawdown"], "win_rate": computed["hit_rate"],
+            "trades": computed["closed_trades"], "drawdown_duration": computed["drawdown_duration_bars"],
+            "average_trade_duration_bars": computed["mean_trade_duration_bars"],
+            "capacity_proxy": computed["capacity_proxy_notional"], "exposure": computed["average_abs_exposure"]}
+        metrics["regimes"] = _regime_summary(self.curve, indexed)
+        metrics["positive_regimes"] = sum(1 for item in metrics["regimes"].values() if item["score"] > 0)
+        metrics["concentration"] = metrics["symbol_concentration_hhi"]
+        per_symbol = {symbol: {**values, "trades": sum(1 for trade in self.closed if trade.get("symbol") == symbol)}
+                      for symbol, values in metrics["per_symbol_stability"].items()}
+        sampled = _sample_curve(self.curve, 512)
+        sampled_exposure = [{"t": point["t"], "value": point["signed_exposure"]} for point in sampled]
+        self.result = {"metrics": metrics, "portfolio_curve": sampled,
+            "equity_curve": [{"t": point["t"], "value": point["value"]} for point in sampled],
+            "exposure_curve": sampled_exposure, "signed_exposure_curve": sampled_exposure,
+            "drawdown_curve": _sample_curve(drawdown_curve, 512), "turnover_curve": _sample_curve(turnover_curve, 512),
+            "per_symbol_curves": {symbol: _sample_curve(rows, 128) for symbol, rows in self.symbol_curves.items()},
+            "per_symbol": per_symbol, "signals": self.signals, "targets": self.targets, "orders": orders,
+            "fills": self.fills, "closed_trades": self.closed, "rejected_fills": self.rejected,
+            "session_flatten_events": self.flatten_events, "warmup_bars": self.warmup,
+            "broker": {"cash": round(float(self.broker.getcash()), 10),
+                "value": round(float(self.broker.getvalue()), 10),
+                "positions": {symbol: round(float(self.getposition(data).size), 10)
+                              for symbol, data in self.by_symbol.items()}},
+            "warnings": (["No closed trades in this window."] if not self.closed else [])
+                + (["Partial or rejected fills occurred."] if self.rejected else [])}
 
 
 def simulate_v2(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict[str, Any]]], window: V2Window, config: ExecutionConfigV2, *, stress: bool = False, target_multiplier: float = 1.0, gap_stress: bool = False) -> dict[str, Any]:
@@ -679,10 +931,37 @@ def simulate_v2(dna: dict[str, Any], bars_by_symbol: dict[str, list[dict[str, An
     for symbol in sorted(bars_by_symbol):
         rows = [row for row in bars_by_symbol[symbol] if iso(row["t"]) >= iso(window.start) and iso(row["t"]) < iso(window.end)]
         if rows: cerebro.adddata(_V2BarFeed(bars=rows), name=symbol)
+    cerebro.broker.setcash(config.initial_cash)
+    cerebro.broker.setcommission(commission=config.costs.commission_bps / 10_000)
+    slip = (config.base_slippage_bps / 10_000) * (config.stress_slippage_multiplier if stress else 1.0)
+    if gap_stress: slip += .001
+    cerebro.broker.set_slippage_perc(slip, slip_open=True, slip_match=True, slip_out=False)
+    row_maps = {symbol: {_V2PortfolioAdapter._canonical_stamp(row["t"]): row for row in rows}
+                for symbol, rows in bars_by_symbol.items()}
+    delayed: dict[int, int] = defaultdict(int)
+    def participation_filler(order: Any, price: float, ago: int) -> float:
+        stamp = _V2PortfolioAdapter._stamp(order.data, float(order.data.datetime[ago]))
+        row = row_maps.get(order.data._name, {}).get(stamp)
+        if row is None or not _healthy(row, float(validate_strategy_dna(dna).risk["minimum_data_coverage"])):
+            return 0.0
+        forced = order.info.get("axiom_reason") in {
+            "session_flatten", "unhealthy_data", "outside_regular_session", "sealed_session_forced_close"}
+        if stress and not forced and delayed[order.ref] < config.stress.delayed_bars:
+            delayed[order.ref] += 1; return 0.0
+        if stress and not forced:
+            miss_key = int(digest({"symbol": order.data._name, "t": stamp,
+                "target": order.info.get("axiom_target"),
+                "order_id": order.info.get("axiom_order_id")})[:8], 16) / 0xFFFFFFFF
+            if miss_key < config.stress.missed_fill_probability:
+                return 0.0
+        remaining = abs(float(order.executed.remsize))
+        if forced: return remaining
+        return min(remaining, float(row["v"]) * config.max_participation)
+    cerebro.broker.set_filler(participation_filler)
     cerebro.addstrategy(_V2PortfolioAdapter, dna=dna, bars_by_symbol=bars_by_symbol, window=window, config=config, stress=stress, target_multiplier=target_multiplier, gap_stress=gap_stress)
     result = cerebro.run(runonce=False, preload=True)[0].result
     if result is None: raise RuntimeError("Backtrader v2 adapter produced no artifact")
-    result["execution_adapter"] = "backtrader-multifeed-v2"
+    result["execution_adapter"] = "backtrader-broker-authoritative-v2"
     return result
 
 

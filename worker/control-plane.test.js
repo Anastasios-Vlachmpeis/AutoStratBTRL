@@ -157,3 +157,31 @@ test("bar redaction is recursive and leaves its input untouched", () => {
   assert.deepEqual(redactPrivateBars(source), { nested: { safe: [3] } });
   assert.deepEqual(source.bars, [1]);
 });
+
+test("normalized migration is deterministic, resumable, persists domains, and completes only after parity", async () => {
+  const runtime = createControlPlaneRuntime(new MemoryStorage(), {});
+  const calls = { manifests: [], steps: [], exports: [] };
+  runtime.normalized = {
+    async recordMigrationManifest(value) { calls.manifests.push(structuredClone(value));
+      return { migrationManifestId: value.migrationManifestId, manifestHash: value.manifestHash }; },
+    async recordMigrationStep(value) { calls.steps.push(structuredClone(value)); return { stepId: value.stepKind }; },
+    async persistExport(value) { calls.exports.push(structuredClone(value)); return { readModelId: "read-1" }; },
+  };
+  const state = { schemaVersion: 5, strategies: [{ id: "AX-1", name: "One", state: "generated" }],
+    events: [{ id: "event-1", type: "GENERATED" }], research: { cohorts: [], trials: {} } };
+  const first = await runtime.mirrorNormalizedState(state);
+  const second = await runtime.mirrorNormalizedState(state);
+  assert.equal(first.status, "matched"); assert.equal(second.migration_manifest_id, first.migration_manifest_id);
+  assert.equal(calls.manifests.filter((item) => item.status === "complete").length, 2);
+  assert.equal(calls.steps.length, 12); assert.equal(calls.exports.length, 2);
+  assert.equal(calls.exports[0].strategies[0].strategyId, "AX-1");
+  assert.equal(calls.exports[0].lineages[0].childStrategyId, "AX-1");
+  assert.equal(calls.exports[0].auditEvents[0].subjectId, "event-1");
+
+  const blocked = await runtime.mirrorNormalizedState({ ...state,
+    strategies: [{ ...state.strategies[0], dataset_id: "missing-dataset" }] });
+  assert.equal(blocked.status, "degraded");
+  assert.match(blocked.error, /references are invalid/);
+  assert.equal(calls.manifests.at(-1).status, "failed");
+  assert.equal(calls.exports.length, 2, "invalid references must not persist or complete a cutover candidate");
+});

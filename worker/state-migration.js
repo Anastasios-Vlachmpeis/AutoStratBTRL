@@ -8,7 +8,7 @@
 import { canonicalJson, hashCanonical, sha256 } from "./dsl.js";
 
 export const STATE_MIGRATION_SCHEMA_VERSION = 1;
-export const NORMALIZED_STATE_SCHEMA_VERSION = 1;
+export const NORMALIZED_STATE_SCHEMA_VERSION = 8;
 export const MIGRATION_STEPS = Object.freeze([
   "verify_export", "normalize_records", "verify_references",
   "rebuild_read_model", "compare_parity", "ready_for_cutover",
@@ -390,6 +390,114 @@ export function compareMigrationParity(bundle, normalized, readModel = rebuildNo
   const integrity = validateNormalizedState(normalized);
   return Object.freeze({ passed: mismatches.length === 0 && integrity.valid, cutover_ready: mismatches.length === 0 && !integrity.cutover_blocked,
     mismatches, integrity, parity_hash: hashCanonical({ export_hash: bundle.export_hash, normalized_hash: normalized.normalized_hash, mismatches, issues: integrity.issues }) });
+}
+
+/**
+ * Adapt the snake-case normalization contract to the dependency-ordered D1
+ * writer contract. Version identities are derived from the versioned content
+ * itself, so routine state checkpoints do not manufacture new versions.
+ */
+export function normalizedPersistenceExport(bundle, normalized, readModel, parity) {
+  verifyLegacyExport(bundle);
+  if (normalized.workspace.source_export_hash !== bundle.export_hash) throw new Error("Normalized export source mismatch");
+  const compiler = normalized.strategy_dna.map((item) => item.document?.compiler).find(Boolean)
+    ?? { dsl_version: "legacy", semantic_version: "migration-v1" };
+  const compilerHash = HASH.test(String(compiler.semantic_sha256)) ? compiler.semantic_sha256 : hashCanonical(compiler);
+  const policy = normalized.strategies.map((item) => item.snapshot?.supervision?.policy).find(Boolean)
+    ?? { source: "legacy-migration" };
+  const storedPolicyHash = normalized.strategies.map((item) => item.snapshot?.supervision?.policy_hash).find((item) => HASH.test(String(item)));
+  const computedPolicyHash = hashCanonical(policy);
+  if (storedPolicyHash && storedPolicyHash !== computedPolicyHash) throw new Error("Supervisor policy hash does not match its content");
+  const policyHash = storedPolicyHash ?? computedPolicyHash;
+  const universe = normalized.workspace.market_data?.universe ?? {};
+  const universeHash = HASH.test(String(universe.sha256)) ? universe.sha256 : hashCanonical(universe);
+  const calendar = normalized.workspace.market_data?.calendar ?? {};
+  const calendarHash = HASH.test(String(calendar.sha256)) ? calendar.sha256 : hashCanonical(calendar);
+  const compilerVersionId = `compiler-${compilerHash.slice(0, 32)}`;
+  const policyVersionId = `policy-${policyHash.slice(0, 32)}`;
+  const universeVersionId = `universe-${universeHash.slice(0, 32)}`;
+  const calendarVersionId = `calendar-${calendarHash.slice(0, 32)}`;
+  const firstDate = normalized.datasets.map((item) => item.range_start ?? item.start ?? "1970-01-01").sort()[0] ?? "1970-01-01";
+  const lastDate = normalized.datasets.map((item) => item.range_end ?? item.end ?? "1970-01-01").sort().at(-1) ?? "1970-01-01";
+  const strategies = normalized.strategies.map((item) => ({
+    strategyId: item.strategy_id, name: item.snapshot?.name ?? item.strategy_id,
+    archetype: item.snapshot?.archetype ?? "legacy", generation: finite(item.snapshot?.generation),
+    qualityState: item.snapshot?.lifecycle?.quality?.state ?? item.state,
+    operationalState: item.snapshot?.lifecycle?.operational?.state ?? "ready",
+    createdAt: item.snapshot?.lifecycle?.created_at ?? bundle.exported_at,
+  }));
+  const strategyDna = normalized.strategy_dna.map((item) => ({
+    dnaId: `dna-${item.strategy_id}-${String(item.dna_hash).slice(0, 16)}`, strategyId: item.strategy_id,
+    compilerVersionId, dnaHash: requireHash(item.dna_hash, "dna_hash"), dna: item.document,
+    schemaVersion: item.document?.schema_version ?? 1,
+    languageVersion: item.document?.dsl_version ?? "legacy", createdAt: bundle.exported_at,
+  }));
+  const dnaByHash = new Map(strategyDna.map((item) => [item.dnaHash, item]));
+  const datasets = normalized.datasets.map((item) => {
+    const datasetHash = HASH.test(String(item.sha256 ?? item.dataset_hash)) ? String(item.sha256 ?? item.dataset_hash)
+      : hashCanonical(item);
+    return { datasetId: item.dataset_id, datasetRootHash: datasetHash, universeVersionId, calendarVersionId,
+      feed: item.feed ?? "iex", timeframe: item.timeframe_label === "5m" ? "5Min" : item.timeframe ?? "legacy",
+      adjustment: item.adjustment ?? "all", rangeStart: item.range_start ?? item.start ?? firstDate,
+      rangeEnd: item.range_end ?? item.end ?? lastDate, manifestObjectKey: item.manifest_object_key ?? `migration/datasets/${item.dataset_id}.json`,
+      manifestHash: HASH.test(String(item.manifest_hash)) ? item.manifest_hash : hashCanonical(item),
+      rowCount: finite(item.row_count ?? item.bar_count), createdAt: bundle.exported_at };
+  });
+  const sourceDatasetById = new Map(normalized.datasets.map((item) => [item.dataset_id, item]));
+  const datasetSlices = datasets.flatMap((item) => {
+    const source = sourceDatasetById.get(item.datasetId) ?? {};
+    const developmentHash = HASH.test(String(source.development_hash)) ? source.development_hash : item.datasetRootHash;
+    const holdoutHash = HASH.test(String(source.holdout_hash)) ? source.holdout_hash : null;
+    const development = { datasetSliceId: `slice-development-${developmentHash.slice(0, 32)}`,
+      datasetId: item.datasetId, sliceKind: "development", ordinal: 0, rangeStart: item.rangeStart,
+      rangeEnd: item.rangeEnd, sealed: false, sliceHash: developmentHash,
+      manifestObjectKey: item.manifestObjectKey, createdAt: bundle.exported_at };
+    return holdoutHash ? [development, { datasetSliceId: `slice-holdout-${holdoutHash.slice(0, 32)}`,
+      datasetId: item.datasetId, sliceKind: "holdout", ordinal: 1, rangeStart: item.rangeStart,
+      rangeEnd: item.rangeEnd, sealed: true, sliceHash: holdoutHash,
+      manifestObjectKey: item.manifestObjectKey, createdAt: bundle.exported_at }] : [development];
+  });
+  const developmentSliceByDataset = new Map(datasetSlices.filter((item) => item.sliceKind === "development")
+    .map((item) => [item.datasetId, item]));
+  const firstSlice = datasetSlices.find((item) => item.sliceKind === "development");
+  const cohorts = normalized.cohorts.map((item) => ({ cohortId: item.cohort_id, universeVersionId, policyVersionId,
+    generationSeed: String(item.generation_seed ?? item.seed ?? item.session_date ?? item.cohort_id),
+    requestedTrials: Math.max(1, finite(item.requested_trials ?? item.attempted, 1)), status: item.status ?? "complete",
+    createdAt: item.created_at ?? item.session_date ?? bundle.exported_at, completedAt: item.completed_at ?? null }));
+  const trials = normalized.trials.map((item) => {
+    const dna = dnaByHash.get(item.dna_hash) ?? strategyDna.find((candidate) => candidate.strategyId === item.strategy_id);
+    if (!dna || !firstSlice) throw new Error(`Trial ${item.trial_id} cannot be linked to migrated DNA and dataset evidence`);
+    const slice = developmentSliceByDataset.get(item.dataset_id) ?? firstSlice;
+    return { trialId: item.trial_id, cohortId: item.cohort_id, strategyId: item.strategy_id ?? dna.strategyId,
+      dnaId: dna.dnaId, datasetSliceId: item.dataset_slice_id ?? slice.datasetSliceId,
+      trialSeed: String(item.trial_seed ?? item.seed ?? item.trial_id), trialKind: item.trial_kind ?? "development",
+      status: item.status ?? "complete", metrics: item.metrics ?? null, createdAt: item.created_at ?? bundle.exported_at,
+      completedAt: item.completed_at ?? null };
+  });
+  return {
+    workspace: { workspaceId: bundle.workspace_id, displayName: bundle.workspace_id, environment: "development" },
+    schemaVersion: bundle.source_schema_version, sourceCheckpointHash: bundle.export_hash,
+    comparisonStatus: parity.cutover_ready ? "matched" : "mismatched",
+    compilerVersions: [{ compilerVersionId, languageVersion: compiler.dsl_version ?? "legacy",
+      compilerVersion: compiler.semantic_version ?? "migration-v1", implementationHash: compilerHash }],
+    supervisorPolicyVersions: [{ policyVersionId, policyHash, policy }],
+    universeVersions: [{ universeVersionId, symbolsObjectKey: `migration/universe/${universeHash}.json`, symbolsHash: universeHash,
+      symbolCount: finite(normalized.workspace.market_data?.universe?.symbols?.length) }],
+    calendarVersions: [{ calendarVersionId, firstSession: firstDate, lastSession: lastDate, sessionCount: 0,
+      objectKey: `migration/calendar/${calendarHash}.json`, contentHash: calendarHash }],
+    strategies, strategyDna,
+    lineages: normalized.lineages.map((item) => ({ lineageId: item.lineage_id, childStrategyId: item.strategy_id,
+      parentStrategyId: item.parent_strategy_id, operation: item.parent_strategy_id ? "migration" : "origin",
+      mutationSeed: null, mutation: { generation: item.generation }, createdAt: bundle.exported_at })),
+    cohorts, datasets, datasetSlices, artifactManifests: normalized.artifact_manifests,
+    trials, operationalStatus: normalized.operational_status,
+    lifecycleTransitions: normalized.lifecycle_transitions.map((item, index) => ({ ...item,
+      strategyId: item.strategy_id, transitionId: item.transition_id, sequence: finite(item.sequence, index + 1),
+      toState: item.to_state ?? item.target ?? "proposed" })),
+    auditEvents: normalized.events.map((item, index) => ({ actor: "migration", action: item.type ?? "legacy.event",
+      subjectKind: "legacy_event", subjectId: String(item.id ?? index), details: item, occurredAt: item.at ?? bundle.exported_at })),
+    readModel, normalizedReadModel: readModel,
+  };
 }
 
 export function createMigrationPlan(bundle) {

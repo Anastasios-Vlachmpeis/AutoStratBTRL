@@ -30,12 +30,15 @@ test("research contracts and trial IDs are deterministic and dataset-bound", () 
 
 test("research configuration cannot exceed launch ceilings", () => {
   const config = normalizeResearchConfig({ sampled_genomes: 999, challengers: 999, finalists: 999,
-    validation_slots: 999, behavior_clusters: 999, max_runtime_ms: 999999 });
+    validation_slots: 999, behavior_clusters: 999, max_runtime_ms: 999999,
+    minimum_symbols: 999, maximum_symbols: 999 });
   assert.equal(config.sampled_genomes, RESEARCH_LIMITS.sampled_genomes);
   assert.equal(config.challengers, RESEARCH_LIMITS.challengers);
   assert.equal(config.finalists, RESEARCH_LIMITS.finalists);
   assert.equal(config.validation_slots, RESEARCH_LIMITS.validation_slots);
   assert.equal(config.max_runtime_ms, RESEARCH_LIMITS.max_runtime_ms);
+  assert.equal(config.maximum_symbols, 5);
+  assert.equal(config.minimum_symbols, 5);
 });
 
 test("non-finite decimal configuration falls back to safe policy defaults", () => {

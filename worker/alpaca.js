@@ -309,10 +309,12 @@ function wholeSharesForNotional(notional, position) {
   return price > 0 ? Math.floor(Math.abs(notional) / price) : 0;
 }
 
-export async function buildPaperCycle(env, appState, scheduledBucket, orderBucket = scheduledBucket) {
+export async function buildPaperCycle(env, appState, scheduledBucket, orderBucket = scheduledBucket, options = {}) {
   const overview = await getAccountOverview(env);
   const forceFlatten = Boolean(appState.orchestration?.controls?.flatten_requested);
-  const active = forceFlatten ? [] : appState.strategies.filter((strategy) => ["released", "healthy", "watch", "adjusted"].includes(strategy.state));
+  const permittedStates = options.scope === "incubation"
+    ? new Set(["incubation"]) : new Set(["released", "healthy", "watch", "adjusted"]);
+  const active = forceFlatten ? [] : appState.strategies.filter((strategy) => permittedStates.has(strategy.state));
   const symbols = [...new Set(active.map((strategy) => strategy.asset).filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)))];
   const dslSymbols = [...new Set(active.filter((strategy) => strategy.strategy_format === "dsl-v1")
     .map((strategy) => strategy.asset).filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol)))];
@@ -325,9 +327,9 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
   const evaluations = {};
   const desiredBySymbol = Object.fromEntries(SUPPORTED_SYMBOLS.map((symbol) => [symbol, 0]));
   const equity = overview.account.equity;
-  const strategyCap = equity * Math.min(Math.max(Number(env.ALPACA_MAX_STRATEGY_PCT || 0.02), 0), 0.05);
+  const strategyCap = equity * Math.min(Math.max(Number(env.ALPACA_MAX_STRATEGY_PCT || 0.005), 0), 0.05);
   const portfolioCap = Math.min(
-    equity * Math.min(Math.max(Number(env.ALPACA_MAX_PORTFOLIO_PCT || 0.20), 0), 0.50),
+    equity * Math.min(Math.max(Number(env.ALPACA_MAX_PORTFOLIO_PCT || 0.10), 0), 0.50),
     overview.account.buying_power * 0.50,
   );
 
@@ -344,6 +346,7 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
       ...evaluation,
       signal,
       latest_price: prices.at(-1),
+      latest_open: symbolBars.at(-1)?.o ?? prices.at(-1),
       bar_time: symbolBars.at(-1).t,
     };
     const desired = isDsl
@@ -357,7 +360,8 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
   const positionBySymbol = Object.fromEntries(overview.positions.map((position) => [position.symbol, position]));
   const openSymbols = new Set(overview.open_orders.map((order) => order.symbol));
   const managedSymbols = new Set(appState.alpaca?.managed_symbols ?? []);
-  const candidateSymbols = SUPPORTED_SYMBOLS.filter((symbol) => desiredBySymbol[symbol] !== 0 || managedSymbols.has(symbol));
+  const candidateSymbols = SUPPORTED_SYMBOLS.filter((symbol) => desiredBySymbol[symbol] !== 0
+    || (options.scope !== "incubation" && managedSymbols.has(symbol)));
   const assets = candidateSymbols.length ? await getAssets(env, candidateSymbols) : {};
   const proposed = [];
   const safety_reasons = [];
@@ -445,7 +449,12 @@ export async function buildPaperCycle(env, appState, scheduledBucket, orderBucke
     }
   }
 
-  const tradingEnabled = env.ALPACA_TRADING_ENABLED === "true";
+  // A verified safety flatten contains only closes of framework-managed
+  // positions. It must remain available after entries/trading are disabled;
+  // otherwise the pre-close stop-entry phase can strand open exposure.
+  const tradingEnabled = options.tradingEnabled === false ? false
+    : options.safetyFlatten === true && forceFlatten ? true
+      : env.ALPACA_TRADING_ENABLED === "true";
   const shortTradingEnabled = env.ALPACA_SHORT_TRADING_ENABLED === "true";
   const canTrade = tradingEnabled && overview.clock.is_open
     && String(overview.account.status || "").toUpperCase() === "ACTIVE"

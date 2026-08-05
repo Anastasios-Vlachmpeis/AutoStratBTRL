@@ -312,7 +312,7 @@ CREATE TABLE IF NOT EXISTS holdout_access_ledger (
   workspace_id TEXT NOT NULL,
   access_id TEXT NOT NULL,
   dataset_slice_id TEXT,
-  artifact_id TEXT NOT NULL,
+  artifact_id TEXT,
   strategy_id TEXT,
   purpose TEXT NOT NULL,
   actor TEXT NOT NULL,

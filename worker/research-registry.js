@@ -197,15 +197,18 @@ export function registerTrial(state, proposal) {
   const research = researchOf(state);
   const cohort = cohortById(research, proposal?.cohort_id);
   if (!cohort) throw new Error("Unknown research cohort");
-  if (cohort.status !== "running") throw new Error("Trials can only be registered for a running cohort");
-  const kind = proposal.kind ?? "sampled";
-  if (!["sampled", "challenger"].includes(kind)) throw new Error("Trial kind must be sampled or challenger");
   const trialId = proposal.trial_id ?? deterministicTrialId(cohort.cohort_id, proposal.ordinal);
   const existing = research.trials[trialId];
   if (existing) {
     if (existing.dna_hash !== (proposal.dna_hash ?? null) || existing.behavior_hash !== (proposal.behavior_hash ?? null)) throw new Error("Trial ID was reused with different proposal data");
     return { trial: existing, created: false, duplicate_retry: true };
   }
+  // The cohort is persisted before its deterministic Queue jobs are sent.
+  // Replaying an existing trial must work if that send is retried, while new
+  // trial identities remain forbidden once registration has closed.
+  if (cohort.status !== "running") throw new Error("Trials can only be registered for a running cohort");
+  const kind = proposal.kind ?? "sampled";
+  if (!["sampled", "challenger"].includes(kind)) throw new Error("Trial kind must be sampled or challenger");
   const allowed = canStartResearch(state, { kind });
   if (!allowed.ok) throw new Error(`Research trial rejected: ${allowed.reason}`);
   const structural = proposal.structural_validation ?? { valid: proposal.valid !== false, rejection_reason: proposal.rejection_reason ?? null };

@@ -3,7 +3,7 @@ import test from "node:test";
 import { aggregateMetrics, buildBacktestPayload, cleanBars, comparison, developmentWindows, frozenDna, makeDataset, normalizeMetrics,
   remoteEnabled, sha256, signedBacktest, validationDecision, makeMultiSymbolDataset, buildBacktestPayloadV2,
   buildBacktestPayloadShardsV2, dynamicWarmup, normalizeBacktestResultV2, shardBacktestStrategies,
-  approvedExecutionConfig } from "./backtest.js";
+  approvedExecutionConfig, verifyBacktestResponse } from "./backtest.js";
 import { buildGeneratedStrategyDNA } from "./dsl-generation.js";
 
 test("sealed datasets split immutable development and holdout slices", async () => {
@@ -81,9 +81,13 @@ test("remote requests use the service timestamp and HMAC contract", async () => 
   let captured;
   globalThis.fetch = async (url, init) => {
     captured = { url, init };
-    return Response.json({ results: [] });
+    const request = JSON.parse(init.body);
+    const unsigned = { job_id: request.job_id, phase: request.phase,
+      engine: { image_digest: `sha256:${"a".repeat(64)}` }, input_hash: await sha256(request), results: [] };
+    return Response.json({ ...unsigned, result_hash: await sha256(unsigned) });
   };
-  const payload = { job_id: "job-contract", phase: "development" };
+  const unsignedPayload = { phase: "development" };
+  const payload = { job_id: await sha256(unsignedPayload), ...unsignedPayload };
   await signedBacktest({ BACKTEST_SERVICE_URL: "https://backtester.example/", BACKTEST_SERVICE_SECRET: "shared-secret" }, payload);
   const timestamp = captured.init.headers["x-axiom-timestamp"];
   assert.match(timestamp, /^\d{10}$/);
@@ -95,6 +99,20 @@ test("remote requests use the service timestamp and HMAC contract", async () => 
   const expected = [...new Uint8Array(bytes)].map((value) => value.toString(16).padStart(2, "0")).join("");
   assert.equal(captured.init.headers["x-axiom-signature"], expected);
   assert.equal(captured.url, "https://backtester.example/v1/backtests/batch");
+});
+
+test("remote response hashes and immutable image provenance are independently verified", async () => {
+  const unsignedPayload = { schema_version: "backtest-request-v2", phase: "development", shard_index: 0 };
+  const payload = { job_id: await sha256(unsignedPayload), ...unsignedPayload };
+  const unsignedResponse = { job_id: payload.job_id, phase: payload.phase,
+    engine: { image_digest: `sha256:${"b".repeat(64)}` }, input_hash: await sha256(payload), results: [] };
+  const response = { ...unsignedResponse, result_hash: await sha256(unsignedResponse) };
+  assert.equal(await verifyBacktestResponse(payload, response), response);
+  await assert.rejects(verifyBacktestResponse(payload, { ...response, results: [{ forged: true }] }), /result hash/);
+  await assert.rejects(verifyBacktestResponse(payload, { ...response, input_hash: "0".repeat(64) }), /input hash/);
+  await assert.rejects(verifyBacktestResponse(payload, { ...response,
+    engine: { image_digest: "mutable-revision" }, result_hash: await sha256({ ...unsignedResponse,
+      engine: { image_digest: "mutable-revision" } }) }), /immutable container image digest/);
 });
 
 test("remote metrics retain the existing validation shape", () => {
@@ -151,6 +169,9 @@ test("v2 payload canonicalizes symbols and bars, with a stable immutable identit
   const reordered = { ...dataset, development: { SPY: [...dataset.development.SPY].reverse(), QQQ: [...dataset.development.QQQ].reverse() } };
   const second = await buildBacktestPayloadV2("development", [strategy], reordered);
   assert.equal(first.payload.schema_version, "backtest-request-v2");
+  assert.equal(first.payload.shard_index, 0);
+  const { job_id: ignored, ...unsigned } = first.payload;
+  assert.equal(first.job_id, await sha256(unsigned));
   assert.equal(first.job_id, second.job_id);
   assert.deepEqual(Object.keys(first.payload.bars_by_symbol), ["QQQ", "SPY"]);
   assert.deepEqual(first.payload.dataset.symbols.map((item) => item.symbol), ["QQQ", "SPY"]);

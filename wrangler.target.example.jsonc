@@ -45,9 +45,10 @@
     "ALPACA_DATA_FEED": "iex",
     "ALPACA_TRADING_ENABLED": "false",
     "ALPACA_SHORT_TRADING_ENABLED": "false",
-    "ALPACA_MAX_STRATEGY_PCT": "0.02",
-    "ALPACA_MAX_PORTFOLIO_PCT": "0.20",
-    "BACKTEST_ENGINE": "shadow"
+    "ALPACA_MAX_STRATEGY_PCT": "0.005",
+    "ALPACA_MAX_PORTFOLIO_PCT": "0.10",
+    "BACKTEST_ENGINE": "shadow",
+    "BACKTEST_REQUIRE_IMAGE_DIGEST": "true"
   },
   "observability": { "enabled": true }
 }

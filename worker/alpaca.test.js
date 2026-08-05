@@ -17,8 +17,8 @@ const credentials = {
   ALPACA_API_SECRET: "paper-secret",
   ALPACA_DATA_FEED: "iex",
   ALPACA_TRADING_ENABLED: "false",
-  ALPACA_MAX_STRATEGY_PCT: "0.02",
-  ALPACA_MAX_PORTFOLIO_PCT: "0.20",
+  ALPACA_MAX_STRATEGY_PCT: "0.005",
+  ALPACA_MAX_PORTFOLIO_PCT: "0.10",
 };
 
 function momentumStrategy(asset = "SPY", size = 0.5) {
@@ -260,6 +260,16 @@ test("signed signals propose a whole-share ETB short but do not submit it by def
   assert.match(cycle.safety_reasons[0].reason, /short_trading_disabled/);
 });
 
+test("incubation evaluation exposes the next-open price and can never submit orders", async () => {
+  const mock = fixtureFetch(); globalThis.fetch = mock;
+  const strategy = { ...momentumStrategy(), state: "incubation" };
+  const cycle = await buildPaperCycle({ ...credentials, ALPACA_TRADING_ENABLED: "true" }, stateFor(strategy),
+    "2026-08-03T16", "2026-08-03T16", { scope: "incubation", tradingEnabled: false });
+  assert.ok(cycle.evaluations[strategy.id].latest_open > 0);
+  assert.equal(cycle.trading_enabled, false); assert.deepEqual(cycle.submitted_orders, []);
+  assert.equal(mock.submitted.length, 0);
+});
+
 test("ETB shorts submit only with explicit short enablement", async () => {
   const mock = fixtureFetch({ descendingSymbols: ["SPY"] });
   globalThis.fetch = mock;
@@ -305,6 +315,22 @@ test("operator flatten overrides strategy targets but closes only managed exposu
   assert.equal(mock.submitted[0].qty, "4");
 });
 
+test("safety flatten can close managed exposure after normal trading is disabled", async () => {
+  const mock = fixtureFetch({
+    positions: [{ symbol: "SPY", side: "long", qty: "4", market_value: "1000", current_price: "250" }],
+  });
+  globalThis.fetch = mock;
+  const appState = stateFor(momentumStrategy());
+  appState.alpaca.managed_symbols = ["SPY"];
+  appState.orchestration = { controls: { flatten_requested: true, entries_paused: true } };
+  const cycle = await buildPaperCycle(credentials, appState, "2026-08-03T19:55",
+    "2026-08-03T19:55", { safetyFlatten: true });
+  assert.equal(cycle.trading_enabled, true);
+  assert.equal(cycle.submitted_orders.length, 1);
+  assert.equal(mock.submitted[0].side, "sell");
+  assert.equal(mock.submitted[0].qty, "4");
+});
+
 test("direction flips flatten the managed position before opening the opposite side", async () => {
   globalThis.fetch = fixtureFetch({
     positions: [{ symbol: "SPY", side: "long", qty: "4", market_value: "1000", current_price: "250" }],
@@ -340,4 +366,14 @@ test("gross portfolio cap scales opposing and same-direction strategy targets by
   const cycle = await buildPaperCycle({ ...credentials, ALPACA_MAX_STRATEGY_PCT: "0.05", ALPACA_MAX_PORTFOLIO_PCT: "0.05" }, stateFor(...strategies), "2026-08-03T23");
   assert.equal(cycle.proposed_orders.length, 3);
   assert.ok(cycle.proposed_orders.reduce((sum, order) => sum + order.notional, 0) <= 5000);
+});
+
+test("frozen default risk caps are 0.5% per strategy and 10% portfolio gross", async () => {
+  globalThis.fetch = fixtureFetch();
+  const env = { ...credentials };
+  delete env.ALPACA_MAX_STRATEGY_PCT;
+  delete env.ALPACA_MAX_PORTFOLIO_PCT;
+  const cycle = await buildPaperCycle(env, stateFor(momentumStrategy("SPY", 1)), "2026-08-03T24");
+  assert.equal(cycle.proposed_orders.length, 1);
+  assert.ok(Number(cycle.proposed_orders[0].notional) <= 500);
 });

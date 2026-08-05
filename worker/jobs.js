@@ -39,6 +39,46 @@ async function processMarketBackfill(body, env) {
   }
 }
 
+async function processResearchJob(body, env) {
+  if (!env.AXIOM_LAB) throw new Error("AXIOM_LAB binding is required for research jobs");
+  if (body.workspace_id !== CONTROL_PLANE_WORKSPACE || !body.job_id || !body.cohort_id) {
+    throw new Error("Research job targets an unknown workspace or is malformed");
+  }
+  const path = body.kind === "research.screen-trial.v1" ? "screen-trial"
+    : body.kind === "research.finalize-cohort.v1" ? "finalize-cohort" : null;
+  if (!path) throw new Error("Unsupported research job");
+  const stub = env.AXIOM_LAB.get(env.AXIOM_LAB.idFromName(CONTROL_PLANE_WORKSPACE));
+  const response = await stub.fetch(new Request(`https://axiom.internal/internal/research/${path}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }));
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    const error = new Error(payload.error ?? `Research job returned ${response.status}`);
+    error.retryDelaySeconds = response.status === 409 ? 15 : 30;
+    throw error;
+  }
+}
+
+async function processBacktestJob(body, env) {
+  if (!env.AXIOM_LAB) throw new Error("AXIOM_LAB binding is required for queued backtests");
+  if (body.workspace_id !== CONTROL_PLANE_WORKSPACE || !body.run_id) {
+    throw new Error("Queued backtest job targets an unknown workspace or is malformed");
+  }
+  const path = body.kind === "backtest.run-shard.v1" ? "run-shard"
+    : body.kind === "backtest.finalize-run.v1" ? "finalize-run" : null;
+  if (!path || (path === "run-shard" && !body.shard_id)) throw new Error("Unsupported queued backtest job");
+  const stub = env.AXIOM_LAB.get(env.AXIOM_LAB.idFromName(CONTROL_PLANE_WORKSPACE));
+  const response = await stub.fetch(new Request(`https://axiom.internal/internal/backtest/${path}`, {
+    method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body),
+  }));
+  if (!response.ok) {
+    const payload = await response.json().catch(() => ({}));
+    const error = new Error(payload.error ?? `Queued backtest returned ${response.status}`);
+    error.retryDelaySeconds = response.status === 409 ? 15 : 30;
+    throw error;
+  }
+}
+
 async function processOrchestrationCommand(body, env, messageId = "queue") {
   if (!env.AXIOM_DB || !env.AXIOM_ARTIFACTS || !env.AXIOM_LAB) throw new Error("Orchestration jobs require AXIOM_DB, AXIOM_ARTIFACTS, and AXIOM_LAB");
   if (body.workspace_id !== CONTROL_PLANE_WORKSPACE || !body.command?.command_id) throw new Error("Orchestration command job is malformed");
@@ -83,6 +123,8 @@ export async function consumeArchitectureQueue(batch, env) {
       const body = message.body ?? {};
       if (body.kind === "architecture.verify-checkpoint.v1") await verifyCheckpoint(body, env);
       else if (body.kind === "market-data.backfill-partition.v1") await processMarketBackfill(body, env);
+      else if (["research.screen-trial.v1", "research.finalize-cohort.v1"].includes(body.kind)) await processResearchJob(body, env);
+      else if (["backtest.run-shard.v1", "backtest.finalize-run.v1"].includes(body.kind)) await processBacktestJob(body, env);
       else if (body.kind === "orchestration.command.v1") await processOrchestrationCommand(body, env, message.id);
       else throw new Error(`Unsupported architecture job: ${body.kind ?? "missing"}`);
       message.ack();

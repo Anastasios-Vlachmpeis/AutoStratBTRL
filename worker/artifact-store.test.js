@@ -27,7 +27,9 @@ class MemoryD1 {
         }
         if (!sql.includes("INSERT INTO artifact_manifests")) return { meta: { changes: 0 } };
         if (db.manifests.has(args[0])) return { meta: { changes: 0 } };
-        const names = ["artifact_id", "workspace_id", "workspace_hash", "artifact_kind", "object_key", "content_hash", "byte_length", "media_type", "visibility", "metadata_json", "manifest_hash", "verified_at", "created_at"];
+        const names = ["artifact_id", "workspace_id", "workspace_hash", "artifact_kind", "object_key", "content_hash", "byte_length", "media_type", "visibility", "metadata_json", "manifest_hash",
+          "schema_version", "strategy_id", "dna_id", "dataset_slice_id", "policy_version_id", "engine_version_id", "compiler_version_id", "config_version_id", "input_hash", "result_hash",
+          "redaction_class", "verified_at", "created_at"];
         db.manifests.set(args[0], Object.fromEntries(names.map((name, index) => [name, args[index]])));
         return { meta: { changes: 1 } };
       },
@@ -77,6 +79,24 @@ test("validates artifact kinds and the caller's expected SHA-256 before writing"
   await assert.rejects(store.put({ workspaceId: "w", kind: "report", content: "x", expectedHash: "0".repeat(64) }), /SHA-256 mismatch/);
   await assert.rejects(store.put({ workspaceId: "w", kind: "dataset.holdout.raw", content: "x", visibility: "private" }), /sealed_holdout/);
   assert.equal(db.manifests.size, 0); assert.equal(r2.objects.size, 0);
+});
+
+test("stores typed provenance in manifest columns and redacts secret metadata", async () => {
+  const { db, store } = makeStore();
+  const inputHash = "a".repeat(64), resultHash = "b".repeat(64);
+  const manifest = await store.put({ workspaceId: "w", kind: "backtest.result", content: { pnl: 12 },
+    metadata: { phase: "development", api_key: "never-store", nested: { access_token: "never-store" } },
+    provenance: { strategyId: "strategy-1", dnaId: "dna-1", datasetSliceId: "slice-1",
+      policyVersionId: "policy-1", engineVersionId: "engine-1", compilerVersionId: "compiler-1",
+      configVersionId: "config-1", inputHash, resultHash } });
+  const row = db.manifests.get(manifest.artifact_id);
+  assert.equal(row.strategy_id, "strategy-1"); assert.equal(row.input_hash, inputHash);
+  assert.equal(row.result_hash, resultHash); assert.equal(row.schema_version, 2);
+  assert.deepEqual(JSON.parse(row.metadata_json), { phase: "development", nested: {} });
+  assert.deepEqual((await store.get({ workspaceId: "w", artifactId: manifest.artifact_id })).manifest.provenance,
+    manifest.provenance);
+  await assert.rejects(store.put({ workspaceId: "w", kind: "report", content: "x",
+    provenance: { inputHash: "NOT-A-HASH" } }), /SHA-256/);
 });
 
 test("reads reject corrupt bytes, corrupt object metadata and tampered D1 manifests", async () => {

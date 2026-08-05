@@ -13,6 +13,8 @@ export const DEFAULT_CLOSE_PHASES = Object.freeze({
   verify_flat: -1,
   reconcile_session: -10,
   close_valid_day_ledger: -15,
+  pipeline_incubation: -16,
+  pipeline_release: -17,
   generate_daily_report: -20,
   schedule_bounded_research: -25,
   run_daily_cohort: -30,
@@ -140,6 +142,8 @@ export function planOrchestrationTick({ calendar, now, completed_intent_ids, del
   addWhenDue("verify_flat", phases.verify_flat);
   addWhenDue("reconcile_session", phases.reconcile_session);
   addWhenDue("close_valid_day_ledger", phases.close_valid_day_ledger);
+  addWhenDue("pipeline_incubation", phases.pipeline_incubation);
+  addWhenDue("pipeline_release", phases.pipeline_release);
   addWhenDue("generate_daily_report", phases.generate_daily_report);
   addWhenDue("schedule_bounded_research", phases.schedule_bounded_research,
     { preconditions: ["valid_day_ledger_closed", "data_health_permits", "research_not_paused"] });
@@ -157,3 +161,16 @@ export function planOrchestrationTick({ calendar, now, completed_intent_ids, del
 // separate coordinator entry points.
 export const coordinateMarketEvent = planMarketEvent;
 export const coordinateScheduleTick = planOrchestrationTick;
+
+/** Combine event-driven and clock-driven work while keeping ingestion pauses
+ * scoped. Safety/watchdog/close work must continue while source polling and
+ * canonical event consumption are paused. */
+export function planOrchestrationWork({ events = [], calendar = null, now,
+  completed_intent_ids = [], ingestion_paused = false } = {}) {
+  const intents = [];
+  if (!ingestion_paused) {
+    for (const event of events) intents.push(...planMarketEvent(event, { completed_intent_ids }));
+  }
+  if (calendar) intents.push(...planOrchestrationTick({ calendar, now, completed_intent_ids }).intents);
+  return intents;
+}

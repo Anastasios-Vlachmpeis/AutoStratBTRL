@@ -1,7 +1,8 @@
 import { sha256 } from "./backtest.js";
 import { ArtifactStore } from "./artifact-store.js";
 import { NormalizedStore } from "./normalized-store.js";
-import { compareMigrationParity, exportLegacyState, normalizeLegacyExport, rebuildNormalizedReadModel } from "./state-migration.js";
+import { compareMigrationParity, createMigrationPlan, exportLegacyState,
+  normalizedPersistenceExport, normalizeLegacyExport, rebuildNormalizedReadModel } from "./state-migration.js";
 
 export const CONTROL_PLANE_WORKSPACE = "axiom-global-supervisor";
 export const CONTROL_PLANE_MODES = Object.freeze(["legacy", "dual_write"]);
@@ -115,12 +116,12 @@ export class PrivateArtifactRepository {
     return this.lastMirror;
   }
 
-  async putArtifact(id, value, metadata = {}) {
+  async putArtifact(id, value, metadata = {}, provenance = {}) {
     const safe = redactPrivateBars(value);
     if (this.contentStore) {
       await this.ensureWorkspace();
       const manifest = await this.contentStore.put({ workspaceId: this.workspace, kind: "backtest.result",
-        content: safe, visibility: "private", mediaType: "application/json", metadata: { legacy_id: id, ...metadata } });
+        content: safe, visibility: "private", mediaType: "application/json", metadata: { legacy_id: id, ...metadata }, provenance });
       return { value: safe, mirror: { status: "ok", object_key: manifest.object_key,
         content_hash: manifest.content_hash, artifact_id: manifest.artifact_id } };
     }
@@ -138,13 +139,14 @@ export class PrivateArtifactRepository {
     return found ? JSON.parse(new TextDecoder().decode(found.bytes)) : undefined;
   }
 
-  async putDatasetSlice(datasetId, phase, bars, metadata = {}) {
+  async putDatasetSlice(datasetId, phase, bars, metadata = {}, provenance = {}) {
     if (this.contentStore) {
       await this.ensureWorkspace();
       const kind = phase === "holdout" ? "dataset.holdout.raw" : "dataset.development.raw";
       const manifest = await this.contentStore.put({ workspaceId: this.workspace, kind, content: bars,
         visibility: phase === "holdout" ? "sealed_holdout" : "private", mediaType: "application/json",
-        metadata: { dataset_id: datasetId, phase, ...metadata } });
+        metadata: { dataset_id: datasetId, phase, ...metadata }, provenance: phase === "holdout"
+          ? { ...provenance, redactionClass: "sealed_holdout" } : provenance });
       return { status: "ok", object_key: manifest.object_key, content_hash: manifest.content_hash,
         artifact_id: manifest.artifact_id };
     }
@@ -163,13 +165,13 @@ export class PrivateArtifactRepository {
     return JSON.parse(new TextDecoder().decode(found.bytes));
   }
 
-  async putResearchTrial(cohortId, trialId, value, metadata = {}) {
+  async putResearchTrial(cohortId, trialId, value, metadata = {}, provenance = {}) {
     const safe = redactPrivateBars(value);
     if (this.contentStore) {
       await this.ensureWorkspace();
       const manifest = await this.contentStore.put({ workspaceId: this.workspace, kind: "research.result",
         content: safe, visibility: "private", mediaType: "application/json",
-        metadata: { cohort_id: cohortId, trial_id: trialId, ...metadata } });
+        metadata: { cohort_id: cohortId, trial_id: trialId, ...metadata }, provenance });
       return { value: safe, mirror: { status: "ok", object_key: manifest.object_key,
         content_hash: manifest.content_hash, artifact_id: manifest.artifact_id } };
     }
@@ -256,19 +258,59 @@ export class ControlPlaneRuntime {
   }
 
   async mirrorNormalizedState(state) {
+    let manifestInput = null;
     try {
-      const exported = exportLegacyState(state, { workspace_id: this.workspace, exported_at: new Date().toISOString() });
+      // A constant timestamp is intentional: the checkpoint content already
+      // changes the export hash, while retries over identical state must reuse
+      // the exact migration identity.
+      const exported = exportLegacyState(state, { workspace_id: this.workspace,
+        exported_at: state.migration_exported_at ?? "1970-01-01T00:00:00.000Z" });
       const normalized = normalizeLegacyExport(exported);
       const readModel = rebuildNormalizedReadModel(normalized);
       const parity = compareMigrationParity(exported, normalized, readModel);
-      await this.normalized.persistSnapshotProjection({ workspaceId: this.workspace,
-        stateHash: exported.export_hash, schemaVersion: state.schemaVersion ?? 1,
-        strategies: state.strategies ?? [], readModel,
-        comparisonStatus: parity.cutover_ready ? "matched" : "mismatched",
-        environment: String(this.env.ENVIRONMENT ?? "development") });
+      const plan = createMigrationPlan(exported);
+      const persistence = normalizedPersistenceExport(exported, normalized, readModel, parity);
+      persistence.workspace.environment = String(this.env.ENVIRONMENT ?? "development");
+      manifestInput = { workspaceId: this.workspace, migrationManifestId: plan.migration_id,
+        sourceSchemaVersion: exported.source_schema_version, targetSchemaVersion: normalized.schema_version,
+        sourceExportObjectKey: `durable-object://${this.workspace}/state/${exported.export_id}`,
+        sourceExportHash: exported.export_hash, manifestObjectKey: `normalized://${this.workspace}/${plan.migration_id}`,
+        manifestHash: plan.plan_hash, counts: { strategies: normalized.strategies.length,
+          dna: normalized.strategy_dna.length, lineages: normalized.lineages.length, cohorts: normalized.cohorts.length,
+          trials: normalized.trials.length, datasets: normalized.datasets.length }, status: "importing" };
+      const manifest = await this.normalized.recordMigrationManifest(manifestInput);
+      const recordStep = (stepKind, resultHash, status = "complete", details = {}) => this.normalized.recordMigrationStep({
+        workspaceId: this.workspace, migrationManifestId: manifest.migrationManifestId, stepKind,
+        inputHash: exported.export_hash, resultHash, status,
+        details: { normalized_id: normalized.normalized_id, ...details },
+      });
+      await recordStep("verify_export", exported.export_hash);
+      await recordStep("normalize_records", normalized.normalized_hash);
+      if (!parity.integrity.valid) {
+        await recordStep("verify_references", await sha256(parity.integrity), "failed",
+          { issues: parity.integrity.issues.length });
+        throw new Error(`Normalized migration references are invalid (${parity.integrity.issues.length} issues)`);
+      }
+      await recordStep("verify_references", parity.parity_hash);
+      await this.normalized.persistExport(persistence);
+      const readModelHash = await sha256(readModel);
+      await recordStep("rebuild_read_model", readModelHash);
+      if (!parity.cutover_ready) {
+        await recordStep("compare_parity", parity.parity_hash, "failed", { mismatches: parity.mismatches.length });
+        throw new Error(`Normalized migration parity blocked (${parity.mismatches.length} mismatches)`);
+      }
+      await recordStep("compare_parity", parity.parity_hash);
+      await recordStep("ready_for_cutover", parity.parity_hash, "complete", { read_model_hash: readModelHash });
+      await this.normalized.recordMigrationManifest({ ...manifestInput, status: "complete",
+        completedAt: new Date().toISOString() });
       this.lastNormalized = { status: parity.cutover_ready ? "matched" : "blocked",
-        source_checkpoint_hash: exported.export_hash, issues: parity.integrity.issues.length };
+        source_checkpoint_hash: exported.export_hash, migration_manifest_id: manifest.migrationManifestId,
+        issues: parity.integrity.issues.length };
     } catch (error) {
+      if (manifestInput) {
+        try { await this.normalized.recordMigrationManifest({ ...manifestInput, status: "failed" }); }
+        catch (recordError) { console.warn("Could not record normalized migration failure", messageOf(recordError)); }
+      }
       this.lastNormalized = { status: "degraded", error: messageOf(error) };
       console.warn("Normalized state mirror failed", this.lastNormalized);
     }

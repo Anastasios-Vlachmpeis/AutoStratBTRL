@@ -9,6 +9,20 @@ export const LIVE_OVERLAP_MINUTES = 12;
 export const LIVE_WATERMARK_SECONDS = 75;
 export const VALID_DAY_MINIMUM_COVERAGE = 0.90;
 
+export async function recordNormalizedHoldoutAccess(db, { workspaceId, datasetSliceId, strategyId = null,
+  actor = "system", purpose = "sealed_validation", decisionId = null, accessedAt = new Date().toISOString() }) {
+  if (!db) throw new Error("AXIOM_DB is required for normalized holdout access logging");
+  if (!workspaceId || !datasetSliceId) throw new Error("workspaceId and datasetSliceId are required");
+  const requestHash = await sha256({ workspace_id: workspaceId, dataset_slice_id: datasetSliceId,
+    actor, purpose, decision_id: decisionId });
+  await db.prepare(`INSERT INTO holdout_access_ledger
+    (workspace_id,access_id,dataset_slice_id,artifact_id,strategy_id,purpose,actor,request_hash,decision_id,accessed_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,request_hash,actor,purpose) DO NOTHING`).bind(
+    workspaceId, `holdout-access-${requestHash.slice(0, 32)}`, datasetSliceId, null,
+    strategyId, purpose, actor, requestHash, decisionId, accessedAt).run();
+  return { requestHash, datasetSliceId };
+}
+
 const ET_FORMATTER = new Intl.DateTimeFormat("en-US", {
   timeZone: "America/New_York", year: "numeric", month: "2-digit", day: "2-digit",
   hour: "2-digit", minute: "2-digit", second: "2-digit", weekday: "short", hourCycle: "h23",
@@ -749,14 +763,9 @@ export class MarketDataRepository {
     const datasetSliceId = await this.mirrorNormalizedDataset(manifest, expected, byId, scope, datasetHash, output);
     if (scope === "holdout_only" && this.env.AXIOM_DB
         && String(this.env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true") {
-      const actor = access?.actor ?? "system", purpose = access?.purpose ?? "sealed_validation";
-      const requestHash = await sha256({ workspace_id: this.workspace, dataset_slice_id: datasetSliceId,
-        actor, purpose, decision_id: access?.decisionId ?? null });
-      await this.env.AXIOM_DB.prepare(`INSERT INTO holdout_access_ledger
-        (workspace_id,access_id,dataset_slice_id,artifact_id,strategy_id,purpose,actor,request_hash,decision_id,accessed_at)
-        VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,request_hash,actor,purpose) DO NOTHING`).bind(
-        this.workspace, `holdout-access-${requestHash.slice(0, 32)}`, datasetSliceId, null,
-        access?.strategyId ?? null, purpose, actor, requestHash, access?.decisionId ?? null, new Date().toISOString()).run();
+      await recordNormalizedHoldoutAccess(this.env.AXIOM_DB, { workspaceId: this.workspace, datasetSliceId,
+        strategyId: access?.strategyId ?? null, actor: access?.actor ?? "system",
+        purpose: access?.purpose ?? "sealed_validation", decisionId: access?.decisionId ?? null });
     }
     return { schema_version: 1, dataset_id: manifest.id, dataset_root_hash: manifest.sha256,
       dataset_hash: datasetHash, dataset_scope: scope, dataset_slice_id: datasetSliceId,

@@ -1,7 +1,10 @@
 import { hashCanonical } from "./dsl.js";
 
 export const ORCHESTRATION_SCHEMA_VERSION = 1;
-export const ORCHESTRATION_MODES = Object.freeze(["observe", "autonomous"]);
+// `observe` is deliberately passive: system commands are planned for
+// visibility, but are never applied. `legacy` is an explicit opt-in for the
+// pre-orchestrator hourly scheduler. It must never be inferred from observe.
+export const ORCHESTRATION_MODES = Object.freeze(["observe", "legacy", "autonomous"]);
 
 export const ROUTINE_COMMANDS = Object.freeze([
   "session_watchdog", "compute_incubation_targets", "compute_released_targets", "record_monitoring_observations",
@@ -186,6 +189,39 @@ export function applyOrchestrationCommand(rawState, rawCommand) {
 export function executionAllowed(state) {
   const controls = state?.orchestration?.controls ?? state?.controls ?? {};
   return !controls.global_paused && !controls.kill_switch && !controls.execution_paused;
+}
+
+/**
+ * Execute an action batch through the runtime-owned dispatcher.  Keeping this
+ * seam here makes the actual dispatch contract testable without importing the
+ * Cloudflare Durable Object module into Node.  A missing handler is always an
+ * operational failure; callers must not checkpoint the command as executed.
+ */
+export async function executeOrchestrationActionBatch(actions, dispatch) {
+  if (typeof dispatch !== "function") throw new TypeError("Orchestration action dispatcher is required");
+  const completed = [];
+  for (const action of actions ?? []) {
+    if (!action?.kind) throw new TypeError("Orchestration action kind is required");
+    await dispatch(action);
+    completed.push(action.kind);
+  }
+  return completed;
+}
+
+export function orchestrationCommandDisposition(mode, actor) {
+  return mode === "observe" && actor === "system" ? "observe" : "execute";
+}
+
+/** Return only the next durable pipeline stage after persisted evidence exists. */
+export function pipelineFollowups(actionKind, outcome = {}) {
+  if (actionKind === "research.run_cohort" && !outcome.paused) {
+    if (!outcome.cohortId) throw new TypeError("Research followup requires a cohort ID");
+    return [{ kind: "pipeline_review", suffix: `development:${outcome.cohortId}` }];
+  }
+  if (actionKind === "pipeline.review" && outcome.hasValidation) {
+    return [{ kind: "pipeline_validate", suffix: "sealed-validation" }];
+  }
+  return [];
 }
 
 export function publicOrchestrationState(value) {

@@ -12,6 +12,10 @@ The current `backtest-request-v2` contract evaluates each DSL strategy as an iso
 - `X-Axiom-Job-Id`: body `job_id`
 - `X-Axiom-Signature`: lowercase hex HMAC-SHA256 of `timestamp + "." + job_id + "." + raw request body`, using `AXIOM_BACKTEST_SECRET`
 
+`job_id` is the lowercase SHA-256 of the canonical complete request object with
+only `job_id` removed. This makes conflicting reuse impossible across separate
+Cloud Run instances; the in-memory replay window is only an optimization.
+
 For V2, `dataset.sha256` hashes the sorted `bars_by_symbol` object and every symbol also has its own count, bounds and SHA-256. The immutable manifest binds the universe, calendar, feed, adjustment and regular-session contract. The service rejects mismatched, unsorted or out-of-scope data before execution.
 
 V2 `windows` use timezone-qualified ISO timestamps with an end-exclusive bound; legacy V1 windows retain zero-based indexes. Cloudflare must submit only development bars for development runs and only the sealed holdout bars for holdout runs. The API does not accept hidden bar references or fetch market data itself.
@@ -45,6 +49,11 @@ $projectNumber = gcloud projects describe YOUR_PROJECT_ID --format="value(projec
 gcloud secrets add-iam-policy-binding axiom-backtest-secret --member="serviceAccount:$projectNumber-compute@developer.gserviceaccount.com" --role="roles/secretmanager.secretAccessor"
 .\deploy-cloud-run.ps1 -ProjectId YOUR_PROJECT_ID
 ```
+
+The deployment script resolves the built image's immutable `sha256:` digest,
+deploys that exact image and exposes the same digest as
+`BACKTEST_IMAGE_DIGEST` for artifact provenance. A Cloud Run revision name is
+never reported as an image digest.
 
 The deployment is deliberately public at the HTTP layer because this integration uses signed requests rather than Google IAM identity tokens; HMAC authentication protects the only non-health endpoint. It allows zero minimum instances, so the container can scale down while idle and wake on demand. Set Cloudflare `BACKTEST_SERVICE_URL` to the resulting service URL and its matching `BACKTEST_SERVICE_SECRET` to the same secret value.
 

@@ -77,3 +77,30 @@ test("queue consumer delegates market-data partitions to the singleton Durable O
   assert.equal(message.acked, true);
   assert.deepEqual(requestBody, body);
 });
+
+test("queue consumer delegates bounded research stages to the singleton", async () => {
+  const paths = [];
+  const namespace = { idFromName() { return "singleton-id"; }, get() { return { async fetch(request) {
+    paths.push(new URL(request.url).pathname); return Response.json({ ok: true });
+  } }; } };
+  const screen = queueMessage({ kind: "research.screen-trial.v1", workspace_id: "axiom-global-supervisor",
+    job_id: "RSJ-test", cohort_id: "cohort" });
+  const finalize = queueMessage({ kind: "research.finalize-cohort.v1", workspace_id: "axiom-global-supervisor",
+    job_id: "RFJ-test", cohort_id: "cohort" });
+  await consumeArchitectureQueue({ messages: [screen, finalize] }, { AXIOM_LAB: namespace });
+  assert.deepEqual(paths, ["/internal/research/screen-trial", "/internal/research/finalize-cohort"]);
+  assert.equal(screen.acked, true); assert.equal(finalize.acked, true);
+});
+
+test("queue consumer delegates Backtrader shards and deterministic finalizers", async () => {
+  const paths = [];
+  const namespace = { idFromName() { return "singleton-id"; }, get() { return { async fetch(request) {
+    paths.push(new URL(request.url).pathname); return Response.json({ ok: true });
+  } }; } };
+  const shard = queueMessage({ kind: "backtest.run-shard.v1", workspace_id: "axiom-global-supervisor",
+    run_id: "run", shard_id: "shard" });
+  const finalize = queueMessage({ kind: "backtest.finalize-run.v1", workspace_id: "axiom-global-supervisor", run_id: "run" });
+  await consumeArchitectureQueue({ messages: [shard, finalize] }, { AXIOM_LAB: namespace });
+  assert.deepEqual(paths, ["/internal/backtest/run-shard", "/internal/backtest/finalize-run"]);
+  assert.equal(shard.acked, true); assert.equal(finalize.acked, true);
+});

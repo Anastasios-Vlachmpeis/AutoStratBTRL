@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { coordinateMarketEvent, planOrchestrationTick } from "./orchestration-schedule.js";
+import { coordinateMarketEvent, planOrchestrationTick, planOrchestrationWork } from "./orchestration-schedule.js";
 
 const calendar = { sessions: [
   { date: "2026-03-06", open: "09:30", close: "16:00" },
@@ -39,9 +39,17 @@ test("near-close phases use an exact early-close session boundary", () => {
 
 test("late ticks repair close work while known IDs suppress duplicate delivery", () => {
   const late = planOrchestrationTick({ calendar, now: "2026-11-27T18:35:00Z" });
-  for (const kind of ["reconcile_session", "close_valid_day_ledger", "generate_daily_report", "schedule_bounded_research", "run_daily_cohort", "weekly_operational_diversity_review"]) {
+  for (const kind of ["reconcile_session", "close_valid_day_ledger", "pipeline_incubation", "pipeline_release", "generate_daily_report", "schedule_bounded_research", "run_daily_cohort", "weekly_operational_diversity_review"]) {
     assert.ok(kinds(late).includes(kind), kind);
   }
   const replay = planOrchestrationTick({ calendar, now: "2026-11-27T18:35:00Z", completed_intent_ids: late.intents.map((item) => item.id) });
   assert.deepEqual(replay.intents, []);
+});
+
+test("ingestion pause suppresses market events but retains watchdog and safety work", () => {
+  const intents = planOrchestrationWork({ calendar, now: "2026-03-09T19:50:00Z",
+    ingestion_paused: true, events: [{ id: "five-minute-paused", bucket_close: "2026-03-09T19:50:00Z", actionable: true }] });
+  assert.equal(intents.some((item) => item.kind === "compute_released_targets"), false);
+  assert.equal(intents.some((item) => item.kind === "session_watchdog"), true);
+  assert.equal(intents.some((item) => item.kind === "stop_entries"), true);
 });

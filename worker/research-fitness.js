@@ -134,6 +134,7 @@ function complexity(dna) {
 export function evaluateResearchTrial(trial, barsBySymbol, options = {}) {
   const dna = trial?.dna ?? trial;
   const recordBase = { trial_id: String(trial?.trial_id ?? dna?.lineage?.trial_id ?? "unknown"), dna_hash: dna?.dna_hash ?? null,
+    ordinal: Number.isInteger(Number(trial?.ordinal)) ? Number(trial.ordinal) : null,
     generation: dna?.lineage?.generation ?? null, operator: trial?.operator ?? "sample", status: "screened" };
   try { validateStrategyDNA(dna); } catch (error) {
     return { ...recordBase, status: "invalid", skip_expensive: true, constraint_failures: ["invalid_dna"], error: String(error.message ?? error), fitness: null };
@@ -244,7 +245,19 @@ function annotateDuplicates(records, archive = [], threshold = .995) {
 /** Screen, rank, de-duplicate, and select at most twelve diverse finalists. */
 export function screenResearchTrials(trials, barsBySymbol, options = {}) {
   const evaluated = (trials ?? []).map((trial) => evaluateResearchTrial(trial, barsBySymbol, { ...options, trial_count: trials?.length ?? 1 }));
-  const deduplicated = annotateDuplicates(evaluated, options.novelty_archive ?? [], options.near_duplicate_correlation ?? .995);
+  return finalizeResearchScreen(evaluated, options);
+}
+
+/**
+ * Apply every cohort-wide decision to independently evaluated trial records.
+ * Input order is intentionally discarded so Queue delivery order cannot alter
+ * duplicate attribution, Pareto fronts, novelty, clusters, or finalists.
+ */
+export function finalizeResearchScreen(evaluated = [], options = {}) {
+  const canonical = [...evaluated].sort((left, right) => Number(left?.ordinal ?? Number.MAX_SAFE_INTEGER)
+    - Number(right?.ordinal ?? Number.MAX_SAFE_INTEGER)
+    || String(left?.trial_id ?? "").localeCompare(String(right?.trial_id ?? "")));
+  const deduplicated = annotateDuplicates(canonical, options.novelty_archive ?? [], options.near_duplicate_correlation ?? .995);
   const withNovelty = deduplicated.map((record) => {
     if (!record.fitness) return record;
     const archive = options.novelty_archive ?? [];
@@ -267,7 +280,7 @@ export function screenResearchTrials(trials, barsBySymbol, options = {}) {
   }
   const selectedByHash = new Map(chosen.map((item) => [recordKey(item), item]));
   const records = ranked.map((record) => selectedByHash.get(recordKey(record)) ?? { ...record, selected_for_expensive: false, selection_rank: null });
-  return { records, finalists: chosen, summary: { attempted: trials?.length ?? 0, eligible: records.filter((record) => record.status === "eligible").length,
+  return { records, finalists: chosen, summary: { attempted: canonical.length, eligible: records.filter((record) => record.status === "eligible").length,
     duplicates: records.filter((record) => record.status === "duplicate").length, finalists: chosen.length,
     contract_hash: hashCanonical(records.map((record) => ({ dna_hash: record.dna_hash, status: record.status, pareto_rank: record.pareto_rank, selected: record.selected_for_expensive }))) } };
 }

@@ -14,7 +14,7 @@ const direct = {
   proposed: ["compiled", "structural_reject"], compiled: ["screened", "structural_reject"],
   screened: ["development", "structural_reject"], development: ["supervisor_approved", "development_reject"],
   supervisor_approved: ["sealed_validation", "capacity_wait"], capacity_wait: ["sealed_validation"],
-  sealed_validation: ["incubation", "holdout_reject", "inconclusive"], incubation: ["released_paper", "release_blocked_short", "development_reject"],
+  sealed_validation: ["incubation", "holdout_reject", "inconclusive"], incubation: ["released_paper", "release_blocked_short", "development", "development_reject"],
   release_blocked_short: ["released_paper", "development_reject"], released_paper: ["watch"],
   watch: ["quarantined", "retired"], quarantined: ["retired"], operator_paused: [],
 };

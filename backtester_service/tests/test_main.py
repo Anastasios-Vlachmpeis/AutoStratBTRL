@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import hashlib
 import json
 import math
 import os
@@ -43,7 +44,14 @@ def payload():
     }
 
 
-def signed(body, timestamp=None):
+def bind_job_id(body):
+    body["job_id"] = digest({key: value for key, value in body.items() if key != "job_id"})
+    return body
+
+
+def signed(body, timestamp=None, *, rebind=True):
+    if rebind:
+        bind_job_id(body)
     raw = json.dumps(body, separators=(",", ":")).encode()
     timestamp = str(int(time.time()) if timestamp is None else timestamp)
     signature = hmac.new(b"test-secret", timestamp.encode() + b"." + body["job_id"].encode() + b"." + raw, hashlib.sha256).hexdigest()
@@ -166,8 +174,20 @@ def test_rejects_duplicate_job_with_different_payload():
     second["strategies"][0]["params"]["threshold"] = .0002
     dna = {key: second["strategies"][0][key] for key in ("id", "asset", "archetype", "params")}
     second["strategies"][0]["dna_hash"] = digest(dna)
-    raw, headers = signed(second)
+    second["job_id"] = first["job_id"]
+    raw, headers = signed(second, rebind=False)
     assert client.post("/v1/backtests/batch", content=raw, headers=headers).status_code == 409
+
+
+def test_job_identity_is_statelessly_bound_to_the_complete_payload():
+    body = payload()
+    bind_job_id(body)
+    original = body["job_id"]
+    body["windows"][0]["end"] -= 1
+    raw, headers = signed(body, rebind=False)
+    response = client.post("/v1/backtests/batch", content=raw, headers=headers)
+    assert response.status_code == 409
+    assert body["job_id"] == original
 
 
 def test_twelve_strategy_batch_completes_within_normal_target():
@@ -255,6 +275,16 @@ def test_v2_partial_fill_and_no_trade_metrics_are_finite():
     assert run["rejected_fills"]
 
 
+def test_v2_rejects_extended_hours_bars():
+    body = v2_payload(("SPY",))
+    body["bars_by_symbol"]["SPY"][0]["t"] = "2026-08-03T12:00:00Z"
+    body["dataset"]["symbols"][0]["start"] = body["bars_by_symbol"]["SPY"][0]["t"]
+    body["dataset"]["symbols"][0]["sha256"] = digest_v2(body["bars_by_symbol"]["SPY"])
+    body["dataset"]["sha256"] = digest_v2({"SPY": body["bars_by_symbol"]["SPY"]})
+    with pytest.raises(Exception, match="regular-session"):
+        BacktestRequestV2.model_validate(body)
+
+
 def test_v2_next_open_reversal_and_forced_eod_flatten_are_explicit():
     body = v2_payload(("SPY",))
     market = body["bars_by_symbol"]["SPY"]
@@ -271,6 +301,30 @@ def test_v2_next_open_reversal_and_forced_eod_flatten_are_explicit():
     first_fill = run["fills"][0]["t"]
     assert first_fill > first_signal
     assert run["session_flatten_events"]
+    assert run["execution_adapter"] == "backtrader-broker-authoritative-v2"
+    assert all(order["order_id"].startswith("bt-order-") for order in run["orders"])
+    assert all(order["status"] != "submitted" for order in run["orders"])
+    assert all(fill["order_id"].startswith("bt-order-") for fill in run["fills"])
+    fill_times = {fill["t"] for fill in run["fills"]}
+    assert all(event["t"] in fill_times for event in run["session_flatten_events"])
+    forced_targets = [item for item in run["targets"] if item["reason"] == "sealed_session_forced_close"]
+    assert forced_targets
+    assert all(item["execute_at"] == "next_eligible_bar_open" for item in forced_targets)
+    assert all(event["t"] > forced_targets[0]["t"] for event in run["session_flatten_events"])
+    assert all(abs(size) < 1e-10 for size in run["broker"]["positions"].values())
+    assert run["broker"]["value"] == run["portfolio_curve"][-1]["value"]
+
+
+def test_v2_never_calls_the_deprecated_post_cerebro_simulator(monkeypatch):
+    import app.v2 as module
+    body = v2_payload(("SPY",))
+    request = BacktestRequestV2.model_validate(body)
+    monkeypatch.setattr(module, "_simulate_v2_ledger", lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("post-Cerebro simulator was invoked")))
+    run = simulate_v2(request.strategies[0].dna,
+        {"SPY": [row.model_dump(exclude_none=True) for row in request.bars_by_symbol["SPY"]]},
+        request.windows[0], request.execution)
+    assert run["execution_adapter"] == "backtrader-broker-authoritative-v2"
 
 
 def test_v2_flat_strategy_has_finite_no_trade_artifact():

@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyOrchestrationCommand, createOrchestrationCommand, emptyOrchestrationState, ensureOrchestrationState, executionAllowed, publicOrchestrationState } from "./orchestration.js";
+import { applyOrchestrationCommand, createOrchestrationCommand, emptyOrchestrationState, ensureOrchestrationState, executeOrchestrationActionBatch, executionAllowed, orchestrationCommandDisposition, orchestrationMode, pipelineFollowups, publicOrchestrationState } from "./orchestration.js";
 
 const at = "2026-08-05T12:00:00.000Z";
 const command = (kind, values = {}) => createOrchestrationCommand({ kind, timestamp: at,
@@ -53,6 +53,43 @@ test("blocked stable intents remain retryable after their scoped pause is lifted
 test("deployment mode changes are reflected in existing orchestration state", () => {
   const holder = { orchestration: emptyOrchestrationState("observe") };
   assert.equal(ensureOrchestrationState(holder, "autonomous").mode, "autonomous");
+});
+
+test("observe is passive for system commands while operator controls remain usable", () => {
+  assert.equal(orchestrationCommandDisposition("observe", "system"), "observe");
+  assert.equal(orchestrationCommandDisposition("observe", "operator:admin"), "execute");
+  assert.equal(orchestrationCommandDisposition("autonomous", "system"), "execute");
+  assert.equal(orchestrationMode({ ORCHESTRATION_MODE: "legacy" }), "legacy");
+});
+
+test("runtime action batches fail loudly at an unhandled action and remain incomplete", async () => {
+  const completed = [];
+  const dispatch = async (action) => {
+    if (action.kind === "pipeline.missing") throw new Error(`Unhandled orchestration action: ${action.kind}`);
+    completed.push(action.kind);
+  };
+  await assert.rejects(executeOrchestrationActionBatch([
+    { kind: "broker.stop_entries" }, { kind: "pipeline.missing" }, { kind: "report.generate_daily" },
+  ], dispatch), /Unhandled orchestration action/);
+  assert.deepEqual(completed, ["broker.stop_entries"]);
+});
+
+test("runtime action batches execute every registered action exactly once", async () => {
+  const completed = [];
+  const result = await executeOrchestrationActionBatch([
+    { kind: "pipeline.compute_targets" }, { kind: "pipeline.monitor" }, { kind: "report.generate_daily" },
+  ], async (action) => { completed.push(action.kind); });
+  assert.deepEqual(result, completed);
+});
+
+test("research, review, and validation are separate durable pipeline stages", () => {
+  assert.deepEqual(pipelineFollowups("research.run_cohort", { cohortId: "COH-1" }),
+    [{ kind: "pipeline_review", suffix: "development:COH-1" }]);
+  assert.deepEqual(pipelineFollowups("pipeline.review", { hasValidation: true }),
+    [{ kind: "pipeline_validate", suffix: "sealed-validation" }]);
+  assert.deepEqual(pipelineFollowups("pipeline.review", { hasValidation: false }), []);
+  assert.deepEqual(pipelineFollowups("research.run_cohort", { paused: true }), []);
+  assert.throws(() => pipelineFollowups("research.run_cohort"), /cohort ID/);
 });
 
 test("a new exchange session reopens entries unless a safety pause remains active", () => {
