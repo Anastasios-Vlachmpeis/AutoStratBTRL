@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import {
+  MarketDataRepository,
   VALID_DAY_MINIMUM_COVERAGE,
   applyLiveMinutePoll,
   auditFiveMinuteBars,
@@ -21,6 +22,7 @@ import {
   publicMarketDataState,
   recordMarketDataUsage,
 } from "./market-data.js";
+import { sha256 } from "./backtest.js";
 import { initialUniverseManifest } from "./universe.js";
 
 const sessions = normalizeCalendarSessions([
@@ -214,4 +216,56 @@ test("daily cost telemetry rolls over without exposing private bars", async () =
   recordMarketDataUsage(state, { alpaca_requests: 1 }, "2026-08-04T14:00:00Z");
   assert.equal(state.marketData.usage.alpaca_requests, 1);
   assert.equal(publicMarketDataState(state).usage.date, "2026-08-04");
+});
+
+class SealedDatasetD1 {
+  constructor(dataset, partitions) { this.dataset = dataset; this.partitions = partitions; }
+  prepare(sql) { let args = []; const self = this; return { bind(...values) { args = values; return this; },
+    async first() { return sql.includes("FROM market_dataset_manifests") && args[0] === self.dataset.dataset_id ? self.dataset : null; },
+    async all() { return sql.includes("FROM market_partitions") ? { results: self.partitions } : { results: [] }; } }; }
+}
+
+class SealedDatasetR2 {
+  constructor(objects) { this.objects = objects; }
+  async get(key) { const value = this.objects.get(key); if (value === undefined) return null;
+    const bytes = new TextEncoder().encode(JSON.stringify(value));
+    return { customMetadata: { encoding: "identity" }, async arrayBuffer() { return bytes.buffer; } }; }
+}
+
+test("verified partition loading physically separates development and holdout bars", async () => {
+  const values = Array.from({ length: 8 }, (_, index) => bar(new Date(Date.UTC(2026, 0, 5, 14, 30 + index * 5)).toISOString(), 100 + index));
+  const contentHash = await sha256(values);
+  const partBase = { id: "part-1", schema_version: 1, feed: "iex", adjustment: "all", timeframe: "5Min",
+    universe_id: "u", universe_hash: "a".repeat(64), calendar_id: "c", symbol: "SPY", month: "2026-01",
+    start: values[0].t, end: values.at(-1).t, row_count: values.length, expected_bars: values.length,
+    missing_bars: 0, coverage: 1, adjustment_discontinuities: 0, content_hash: contentHash };
+  const part = { ...partBase, sha256: await sha256(partBase) };
+  const manifest = await buildDatasetManifest({ universe: { id: "u", sha256: "a".repeat(64), feed: "iex", symbols: ["SPY"] },
+    calendar: { id: "c", sha256: "b".repeat(64) }, start: part.start, end: part.end, partitions: [part] });
+  const objects = new Map([["manifest", manifest], ["partition", values]]);
+  const row = { partition_id: part.id, universe_id: "u", calendar_id: "c", range_start: part.start,
+    range_end: part.end, content_hash: contentHash, manifest_hash: part.sha256, object_key: "partition" };
+  const repository = new MarketDataRepository({ get: async () => null }, { AXIOM_DB: new SealedDatasetD1({
+    dataset_id: manifest.id, sha256: manifest.sha256, object_key: "manifest",
+  }, [row]), AXIOM_ARTIFACTS: new SealedDatasetR2(objects) });
+  const development = await repository.loadSealedDataset(manifest.id, { scope: "development_only" });
+  const holdout = await repository.loadSealedDataset(manifest.id, { scope: "holdout_only" });
+  assert.equal(development.bars_by_symbol.SPY.length, 6);
+  assert.equal(holdout.bars_by_symbol.SPY.length, 2);
+  assert.equal(development.bars_by_symbol.SPY.at(-1).t < holdout.bars_by_symbol.SPY[0].t, true);
+  assert.notEqual(development.dataset_hash, holdout.dataset_hash);
+  objects.set("partition", [...values, bar("2026-01-06T14:30:00Z", 999)]);
+  await assert.rejects(repository.loadSealedDataset(manifest.id), /content verification/);
+});
+
+test("reset preparation inventories exact legacy D1 and R2 market targets", async () => {
+  const db = { prepare(sql) { return { async all() {
+    if (sql.includes("market_partitions")) return { results: [{ partition_id: "partition-1" }] };
+    if (sql.includes("market_dataset_manifests")) return { results: [{ dataset_id: "dataset-1" }] };
+    return { results: [] };
+  } }; } };
+  const r2 = { async list() { return { objects: [{ key: "market/a" }, { key: "market/b" }], truncated: false }; } };
+  const repository = new MarketDataRepository({ get: async () => null }, { AXIOM_DB: db, AXIOM_ARTIFACTS: r2 });
+  assert.deepEqual(await repository.resetInventory(), { object_keys: ["market/a", "market/b"],
+    d1_targets: ["market_dataset_manifests:dataset-1", "market_partitions:partition-1"] });
 });

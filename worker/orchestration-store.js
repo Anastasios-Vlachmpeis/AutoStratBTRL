@@ -200,4 +200,39 @@ export class OrchestrationStore {
       approved_by=excluded.approved_by,decision=excluded.decision,expires_at=excluded.expires_at,created_at=excluded.created_at`,
     approvalId, workspaceId, configKey, configHash, approvedBy, decision, expiresAt, this.now()).run();
   }
+
+  async resetInventory(workspaceId) {
+    const d1Targets = [];
+    const direct = [
+      ["orchestration_strategy_lifecycle", "strategy_id"], ["orchestration_commands", "command_id"],
+      ["orchestration_transitions", "transition_id"], ["orchestration_jobs", "job_id"],
+      ["orchestration_incidents", "incident_id"], ["orchestration_operator_approvals", "approval_id"],
+      ["orchestration_config_approvals", "approval_id"],
+    ];
+    for (const [table, key] of direct) {
+      const result = await this.statement(`SELECT ${key} FROM ${table} WHERE workspace_id=? ORDER BY ${key}`, workspaceId).all();
+      d1Targets.push(...(result.results ?? []).map((row) => `${table}:${row[key]}`));
+    }
+    const outbox = await this.statement(`SELECT o.outbox_id FROM orchestration_outbox o
+      JOIN orchestration_commands c ON c.command_id=o.command_id WHERE c.workspace_id=? ORDER BY o.outbox_id`, workspaceId).all();
+    d1Targets.push(...(outbox.results ?? []).map((row) => `orchestration_outbox:${row.outbox_id}`));
+    const manifests = await this.statement(`SELECT m.manifest_id,m.object_key FROM orchestration_result_manifests m
+      JOIN orchestration_jobs j ON j.job_id=m.job_id WHERE j.workspace_id=? ORDER BY m.manifest_id`, workspaceId).all();
+    d1Targets.push(...(manifests.results ?? []).map((row) => `orchestration_result_manifests:${row.manifest_id}`));
+    return { d1_targets: d1Targets.sort(), object_keys: (manifests.results ?? []).map((row) => row.object_key).filter(Boolean).sort() };
+  }
+
+  async clearWorkspace(workspaceId) {
+    const inventory = await this.resetInventory(workspaceId);
+    if (inventory.object_keys.length && this.artifacts) await this.artifacts.delete(inventory.object_keys);
+    await this.statement(`DELETE FROM orchestration_result_manifests WHERE job_id IN
+      (SELECT job_id FROM orchestration_jobs WHERE workspace_id=?)`, workspaceId).run();
+    await this.statement(`DELETE FROM orchestration_outbox WHERE command_id IN
+      (SELECT command_id FROM orchestration_commands WHERE workspace_id=?)`, workspaceId).run();
+    for (const table of ["orchestration_jobs", "orchestration_transitions", "orchestration_commands",
+      "orchestration_incidents", "orchestration_operator_approvals", "orchestration_config_approvals",
+      "orchestration_strategy_lifecycle"]) {
+      await this.statement(`DELETE FROM ${table} WHERE workspace_id=?`, workspaceId).run();
+    }
+  }
 }

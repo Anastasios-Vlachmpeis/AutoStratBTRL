@@ -697,6 +697,124 @@ export class MarketDataRepository {
     return key;
   }
 
+  async loadDatasetManifest(datasetId) {
+    if (!this.env.AXIOM_DB || !this.env.AXIOM_ARTIFACTS) return null;
+    const row = await this.env.AXIOM_DB.prepare(`SELECT dataset_id,sha256,object_key
+      FROM market_dataset_manifests WHERE dataset_id=?`).bind(datasetId).first();
+    if (!row) return null;
+    const manifest = await decodeObject(await this.env.AXIOM_ARTIFACTS.get(row.object_key));
+    if (!manifest || manifest.id !== row.dataset_id || manifest.sha256 !== row.sha256) {
+      throw new Error(`Dataset manifest ${datasetId} failed identity verification`);
+    }
+    const canonical = { ...manifest }; delete canonical.id; delete canonical.sha256;
+    if (await sha256(canonical) !== manifest.sha256) throw new Error(`Dataset manifest ${datasetId} failed hash verification`);
+    return manifest;
+  }
+
+  /**
+   * Load only immutable partitions named by the verified dataset manifest.
+   * `development_only` physically removes the final quarter before returning;
+   * no holdout bar is included in the returned object or its hash.
+   */
+  async loadSealedDataset(datasetId, { scope = "development_only", symbols = null, access = null } = {}) {
+    if (!["development_only", "holdout_only", "full_private"].includes(scope)) throw new Error("Unsupported sealed dataset scope");
+    const manifest = await this.loadDatasetManifest(datasetId);
+    if (!manifest) throw new Error(`Sealed dataset ${datasetId} is unavailable`);
+    const requested = symbols ? new Set(symbols.map(String)) : null;
+    const expected = manifest.partitions.filter((item) => !requested || requested.has(item.symbol));
+    if (!expected.length) throw new Error("Sealed dataset selection contains no partitions");
+    const rows = await this.env.AXIOM_DB.prepare(`SELECT * FROM market_partitions
+      WHERE universe_id=? AND calendar_id=? AND range_start>=? AND range_end<=?
+      ORDER BY symbol,partition_month`).bind(manifest.universe_id, manifest.calendar_id, manifest.start, manifest.end).all();
+    const byId = new Map((rows.results ?? []).map((row) => [row.partition_id, row]));
+    const barsBySymbol = {};
+    for (const part of expected) {
+      const row = byId.get(part.id);
+      if (!row || row.content_hash !== part.content_hash || row.manifest_hash !== part.sha256) {
+        throw new Error(`Dataset partition ${part.id} is missing or has mismatched provenance`);
+      }
+      const bars = await decodeObject(await this.env.AXIOM_ARTIFACTS.get(row.object_key));
+      if (!Array.isArray(bars) || bars.length !== Number(part.row_count)
+          || await sha256(bars) !== part.content_hash) {
+        throw new Error(`Dataset partition ${part.id} failed content verification`);
+      }
+      (barsBySymbol[part.symbol] ??= []).push(...bars);
+    }
+    for (const values of Object.values(barsBySymbol)) values.sort((left, right) => String(left.t).localeCompare(String(right.t)));
+    const output = scope === "full_private" ? barsBySymbol : Object.fromEntries(Object.entries(barsBySymbol).map(([symbol, values]) => {
+      const split = Math.floor(values.length * .75);
+      return [symbol, scope === "development_only" ? values.slice(0, split) : values.slice(split)];
+    }));
+    const datasetHash = await sha256(output);
+    const datasetSliceId = await this.mirrorNormalizedDataset(manifest, expected, byId, scope, datasetHash, output);
+    if (scope === "holdout_only" && this.env.AXIOM_DB
+        && String(this.env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true") {
+      const actor = access?.actor ?? "system", purpose = access?.purpose ?? "sealed_validation";
+      const requestHash = await sha256({ workspace_id: this.workspace, dataset_slice_id: datasetSliceId,
+        actor, purpose, decision_id: access?.decisionId ?? null });
+      await this.env.AXIOM_DB.prepare(`INSERT INTO holdout_access_ledger
+        (workspace_id,access_id,dataset_slice_id,artifact_id,strategy_id,purpose,actor,request_hash,decision_id,accessed_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,request_hash,actor,purpose) DO NOTHING`).bind(
+        this.workspace, `holdout-access-${requestHash.slice(0, 32)}`, datasetSliceId, null,
+        access?.strategyId ?? null, purpose, actor, requestHash, access?.decisionId ?? null, new Date().toISOString()).run();
+    }
+    return { schema_version: 1, dataset_id: manifest.id, dataset_root_hash: manifest.sha256,
+      dataset_hash: datasetHash, dataset_scope: scope, dataset_slice_id: datasetSliceId,
+      bars_by_symbol: output, partition_ids: expected.map((item) => item.id), manifest };
+  }
+
+  async mirrorNormalizedDataset(manifest, expected, byId, scope, sliceHash, barsBySymbol) {
+    if (!this.env.AXIOM_DB || String(this.env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() !== "true") {
+      return `slice-${scope}-${sliceHash.slice(0, 32)}`;
+    }
+    const now = new Date().toISOString();
+    const [universe, calendar, datasetRow] = await Promise.all([
+      this.env.AXIOM_DB.prepare("SELECT object_key FROM market_universe_versions WHERE universe_id=?").bind(manifest.universe_id).first(),
+      this.env.AXIOM_DB.prepare("SELECT object_key FROM market_calendar_manifests WHERE calendar_id=?").bind(manifest.calendar_id).first(),
+      this.env.AXIOM_DB.prepare("SELECT object_key FROM market_dataset_manifests WHERE dataset_id=?").bind(manifest.id).first(),
+    ]);
+    if (!universe?.object_key || !calendar?.object_key || !datasetRow?.object_key) throw new Error("Normalized dataset provenance dependencies are missing");
+    const statements = [
+      this.env.AXIOM_DB.prepare(`INSERT INTO workspaces (workspace_id,display_name,environment,status,created_at,updated_at)
+        VALUES (?,?,'development','active',?,?) ON CONFLICT(workspace_id) DO UPDATE SET updated_at=excluded.updated_at`).bind(this.workspace, this.workspace, now, now),
+      this.env.AXIOM_DB.prepare(`INSERT INTO universe_versions
+        (workspace_id,universe_version_id,feed,symbols_object_key,symbols_hash,symbol_count,effective_from,created_at)
+        VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,universe_version_id) DO NOTHING`).bind(this.workspace,
+        manifest.universe_id, manifest.feed, universe.object_key, manifest.universe_hash, manifest.symbol_count, manifest.start, now),
+      this.env.AXIOM_DB.prepare(`INSERT INTO calendar_versions
+        (workspace_id,calendar_version_id,market,first_session,last_session,session_count,object_key,content_hash,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,calendar_version_id) DO NOTHING`).bind(this.workspace,
+        manifest.calendar_id, "XNYS", manifest.start, manifest.end, 0, calendar.object_key, manifest.calendar_hash, now),
+      this.env.AXIOM_DB.prepare(`INSERT INTO datasets
+        (workspace_id,dataset_id,dataset_root_hash,universe_version_id,calendar_version_id,feed,timeframe,adjustment,range_start,range_end,manifest_object_key,manifest_hash,row_count,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,dataset_id) DO NOTHING`).bind(this.workspace,
+        manifest.id, manifest.sha256, manifest.universe_id, manifest.calendar_id, manifest.feed, manifest.timeframe,
+        manifest.adjustment, manifest.start, manifest.end, datasetRow.object_key, manifest.sha256, manifest.row_count, now),
+    ];
+    expected.forEach((part, ordinal) => {
+      const row = byId.get(part.id);
+      statements.push(this.env.AXIOM_DB.prepare(`INSERT INTO dataset_partitions
+        (workspace_id,partition_id,feed,timeframe,symbol,range_start,range_end,revision,object_key,content_hash,row_count,byte_length,coverage,created_at)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,partition_id) DO NOTHING`).bind(this.workspace,
+        part.id, part.feed, part.timeframe, part.symbol, part.start, part.end, 0, row.object_key,
+        part.content_hash, part.row_count, Number(row.byte_length ?? 0), part.coverage, now));
+      statements.push(this.env.AXIOM_DB.prepare(`INSERT INTO dataset_members
+        (workspace_id,dataset_id,partition_id,ordinal) VALUES (?,?,?,?)
+        ON CONFLICT(workspace_id,dataset_id,partition_id) DO NOTHING`).bind(this.workspace, manifest.id, part.id, ordinal));
+    });
+    await runStatements(this.env.AXIOM_DB, statements);
+    const values = Object.values(barsBySymbol).flat();
+    const sliceKind = scope === "holdout_only" ? "holdout" : scope === "development_only" ? "development" : "screen";
+    const sliceId = `slice-${scope}-${sliceHash.slice(0, 32)}`;
+    await this.env.AXIOM_DB.prepare(`INSERT INTO dataset_slices
+      (workspace_id,dataset_slice_id,dataset_id,slice_kind,ordinal,range_start,range_end,sealed,slice_hash,manifest_object_key,created_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,dataset_slice_id) DO NOTHING`).bind(this.workspace,
+      sliceId, manifest.id, sliceKind, 0, values.map((item) => item.t).sort().at(0) ?? manifest.start,
+      values.map((item) => item.t).sort().at(-1) ?? manifest.end, scope === "holdout_only" ? 1 : 0,
+      sliceHash, datasetRow.object_key, now).run();
+    return sliceId;
+  }
+
   async loadLiveBook() {
     return (await this.storage.get("md:live-book")) ?? emptyLiveBook("iex");
   }
@@ -763,6 +881,33 @@ export class MarketDataRepository {
       reconciliation.summary.missing_live, reconciliation.summary.extra_live,
       reconciliation.sha256, key, new Date().toISOString()).run();
     return key;
+  }
+
+  async resetInventory() {
+    const objectKeys = [];
+    if (this.env.AXIOM_ARTIFACTS) {
+      let cursor;
+      do {
+        const page = await this.env.AXIOM_ARTIFACTS.list({ prefix: "market/", cursor });
+        objectKeys.push(...(page.objects ?? []).map((item) => item.key));
+        cursor = page.truncated ? page.cursor : undefined;
+      } while (cursor);
+    }
+    const d1Targets = [];
+    if (this.env.AXIOM_DB) {
+      const tables = [
+        ["market_session_reconciliations", "reconciliation_id"], ["market_data_health", "health_id"],
+        ["market_five_minute_events", "event_id"], ["market_live_bar_revisions", "revision_id"],
+        ["market_dataset_manifests", "dataset_id"], ["market_partitions", "partition_id"],
+        ["market_backfill_jobs", "job_id"], ["market_calendar_manifests", "calendar_id"],
+        ["market_universe_versions", "universe_id"],
+      ];
+      for (const [table, key] of tables) {
+        const result = await this.env.AXIOM_DB.prepare(`SELECT ${key} FROM ${table} ORDER BY ${key}`).all();
+        d1Targets.push(...(result.results ?? []).map((row) => `${table}:${row[key]}`));
+      }
+    }
+    return { object_keys: objectKeys.sort(), d1_targets: d1Targets.sort() };
   }
 
   async clear() {

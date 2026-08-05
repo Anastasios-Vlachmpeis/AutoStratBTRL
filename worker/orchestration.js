@@ -17,6 +17,7 @@ export const OPERATOR_COMMANDS = Object.freeze([
   "pause_execution", "resume_execution", "retry_operational", "quarantine_strategy", "retire_strategy",
   "pause_strategy", "resume_strategy",
   "reset_nonproduction_workspace",
+  "prepare_workspace_reset", "execute_workspace_reset",
   "approve_configuration", "approve_universe", "approve_policy",
 ]);
 
@@ -151,8 +152,14 @@ function operatorActions(current, command) {
       return result(command, "applied", [{ kind: "approval.persist", approval: current.approvals[`${command.kind}:${subject}`] }]);
     }
     case "reset_nonproduction_workspace":
-      if (payload.confirmation !== "RESET NONPRODUCTION WORKSPACE") throw new TypeError("Workspace reset requires the exact confirmation phrase");
-      return result(command, "applied", [{ kind: "workspace.reset_nonproduction", payload }]);
+      throw new TypeError("Direct workspace reset is disabled; prepare and execute the exact reset manifest");
+    case "prepare_workspace_reset":
+      return result(command, "applied", [{ kind: "workspace.prepare_reset", payload }]);
+    case "execute_workspace_reset":
+      if (payload.confirmation !== "RESET NONPRODUCTION WORKSPACE" || !payload.manifest_hash) {
+        throw new TypeError("Workspace reset execution requires its manifest hash and exact confirmation phrase");
+      }
+      return result(command, "applied", [{ kind: "workspace.execute_reset", payload }]);
     default: throw new TypeError(`Unhandled operator command: ${command.kind}`);
   }
 }
@@ -186,5 +193,7 @@ export function publicOrchestrationState(value) {
   return { schema_version: state.schema_version, mode: state.mode, version: state.version, controls: clone(state.controls),
     latest_command_id: state.latest_command_id, latest_watchdog_at: state.latest_watchdog_at,
     completed_intents: state.completed_intent_ids?.length ?? 0, open_incidents: (state.incidents ?? []).filter((item) => !item.resolved_at).length,
-    valid_day_ledgers: Object.values(state.valid_day_ledgers ?? {}).filter((item) => item.status === "closed").length };
+    valid_day_ledgers: Object.values(state.valid_day_ledgers ?? {}).filter((item) => item.status === "closed").length,
+    pending_reset: state.pending_reset ? { manifest_hash: state.pending_reset.manifest_hash,
+      prepared_at: state.pending_reset.prepared_at, requested_by: state.pending_reset.requested_by } : null };
 }

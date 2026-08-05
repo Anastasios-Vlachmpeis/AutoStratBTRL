@@ -109,3 +109,18 @@ test("poison jobs become dead letters and open an operator-visible incident", as
   assert.equal(db.jobs.get("poison").status, "dead_lettered");
   assert.equal(db.incidents.size, 1);
 });
+
+test("reset preparation inventories exact workspace orchestration rows and result objects", async () => {
+  const db = { prepare(sql) { let args = []; return { bind(...values) { args = values; return this; }, async all() {
+    assert.equal(args[0], "w");
+    if (sql.includes("FROM orchestration_commands") && !sql.includes("JOIN")) return { results: [{ command_id: "c1" }] };
+    if (sql.includes("FROM orchestration_outbox")) return { results: [{ outbox_id: "o1" }] };
+    if (sql.includes("FROM orchestration_result_manifests")) return { results: [{ manifest_id: "m1", object_key: "results/r1" }] };
+    return { results: [] };
+  } }; } };
+  const store = new OrchestrationStore(db);
+  const inventory = await store.resetInventory("w");
+  assert.deepEqual(inventory.object_keys, ["results/r1"]);
+  assert.deepEqual(inventory.d1_targets, ["orchestration_commands:c1", "orchestration_outbox:o1",
+    "orchestration_result_manifests:m1"]);
+});

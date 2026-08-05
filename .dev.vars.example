@@ -2,6 +2,8 @@
 # Generate a long random value; never commit the real token.
 ADMIN_TOKEN=replace-with-a-long-random-secret
 CONTROL_PLANE_MODE=legacy
+NORMALIZED_STORAGE_ENABLED=false
+NORMALIZED_READ_ENABLED=false
 MARKET_DATA_MODE=off
 ORCHESTRATION_MODE=observe
 ALPACA_API_KEY=replace-with-your-paper-key-id

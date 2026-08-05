@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { applyOrchestrationCommand, createOrchestrationCommand, emptyOrchestrationState, ensureOrchestrationState, executionAllowed } from "./orchestration.js";
+import { applyOrchestrationCommand, createOrchestrationCommand, emptyOrchestrationState, ensureOrchestrationState, executionAllowed, publicOrchestrationState } from "./orchestration.js";
 
 const at = "2026-08-05T12:00:00.000Z";
 const command = (kind, values = {}) => createOrchestrationCommand({ kind, timestamp: at,
@@ -69,4 +69,32 @@ test("a new exchange session reopens entries unless a safety pause remains activ
     payload: { session_date: "2026-08-07" },
   })).state;
   assert.equal(next.controls.entries_paused, true);
+});
+
+test("workspace reset requires an operator, a prepared manifest, and the exact confirmation", () => {
+  const prepared = applyOrchestrationCommand(emptyOrchestrationState(), command("prepare_workspace_reset", {
+    actor: "operator:admin", correlation_id: "reset:prepare",
+  }));
+  assert.equal(prepared.result.actions[0].kind, "workspace.prepare_reset");
+  assert.throws(() => applyOrchestrationCommand(prepared.state, command("execute_workspace_reset", {
+    actor: "operator:admin", correlation_id: "reset:bad",
+    payload: { manifest_hash: "a".repeat(64), confirmation: "reset" },
+  })), /exact confirmation phrase/);
+  const executed = applyOrchestrationCommand(prepared.state, command("execute_workspace_reset", {
+    actor: "operator:admin", correlation_id: "reset:execute",
+    payload: { manifest_hash: "a".repeat(64), confirmation: "RESET NONPRODUCTION WORKSPACE" },
+  }));
+  assert.equal(executed.result.actions[0].kind, "workspace.execute_reset");
+});
+
+test("public orchestration state reveals reset provenance but not private reset inventory", () => {
+  const state = emptyOrchestrationState();
+  state.pending_reset = { manifest_hash: "b".repeat(64), prepared_at: at, requested_by: "operator:admin",
+    artifact_manifest: { object_keys: ["private/workspace/holdout.json"], artifact_ids: ["A-SECRET"] },
+    identity: { d1_target_ids: ["strategies:private"] } };
+  const projection = publicOrchestrationState(state);
+  assert.deepEqual(projection.pending_reset, { manifest_hash: "b".repeat(64), prepared_at: at,
+    requested_by: "operator:admin" });
+  assert.equal(JSON.stringify(projection).includes("private/workspace"), false);
+  assert.equal(JSON.stringify(projection).includes("A-SECRET"), false);
 });

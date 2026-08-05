@@ -28,6 +28,8 @@
   "vars": {
     "ORCHESTRATION_MODE": "observe",
     "CONTROL_PLANE_MODE": "legacy",
+    "NORMALIZED_STORAGE_ENABLED": "false",
+    "NORMALIZED_READ_ENABLED": "false",
     "MARKET_DATA_MODE": "off",
     "ALPACA_DATA_FEED": "iex",
     "ALPACA_TRADING_ENABLED": "false",

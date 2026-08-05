@@ -1,4 +1,7 @@
 import { sha256 } from "./backtest.js";
+import { ArtifactStore } from "./artifact-store.js";
+import { NormalizedStore } from "./normalized-store.js";
+import { compareMigrationParity, exportLegacyState, normalizeLegacyExport, rebuildNormalizedReadModel } from "./state-migration.js";
 
 export const CONTROL_PLANE_WORKSPACE = "axiom-global-supervisor";
 export const CONTROL_PLANE_MODES = Object.freeze(["legacy", "dual_write"]);
@@ -59,6 +62,8 @@ export class PrivateArtifactRepository {
     this.env = env;
     this.workspace = workspace;
     this.mode = controlPlaneMode(env);
+    this.contentStore = String(env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true"
+      && env.AXIOM_DB && env.AXIOM_ARTIFACTS ? new ArtifactStore(env.AXIOM_DB, env.AXIOM_ARTIFACTS) : null;
     this.lastMirror = { status: this.mode === "legacy" ? "disabled" : "not_started" };
   }
 
@@ -112,26 +117,62 @@ export class PrivateArtifactRepository {
 
   async putArtifact(id, value, metadata = {}) {
     const safe = redactPrivateBars(value);
+    if (this.contentStore) {
+      await this.ensureWorkspace();
+      const manifest = await this.contentStore.put({ workspaceId: this.workspace, kind: "backtest.result",
+        content: safe, visibility: "private", mediaType: "application/json", metadata: { legacy_id: id, ...metadata } });
+      return { value: safe, mirror: { status: "ok", object_key: manifest.object_key,
+        content_hash: manifest.content_hash, artifact_id: manifest.artifact_id } };
+    }
     await this.storage.put(this.artifactStorageKey(id), safe);
     const mirror = await this.mirror("artifacts", id, safe, metadata);
     return { value: safe, mirror };
   }
 
   async getArtifact(id) {
-    return this.storage.get(this.artifactStorageKey(id));
+    const local = await this.storage.get(this.artifactStorageKey(id));
+    if (local || !this.contentStore) return local;
+    const found = id.startsWith("art-")
+      ? await this.contentStore.get({ workspaceId: this.workspace, artifactId: id })
+      : await this.contentStore.findLatest({ workspaceId: this.workspace, kind: "backtest.result", metadata: { legacy_id: id } });
+    return found ? JSON.parse(new TextDecoder().decode(found.bytes)) : undefined;
   }
 
   async putDatasetSlice(datasetId, phase, bars, metadata = {}) {
+    if (this.contentStore) {
+      await this.ensureWorkspace();
+      const kind = phase === "holdout" ? "dataset.holdout.raw" : "dataset.development.raw";
+      const manifest = await this.contentStore.put({ workspaceId: this.workspace, kind, content: bars,
+        visibility: phase === "holdout" ? "sealed_holdout" : "private", mediaType: "application/json",
+        metadata: { dataset_id: datasetId, phase, ...metadata } });
+      return { status: "ok", object_key: manifest.object_key, content_hash: manifest.content_hash,
+        artifact_id: manifest.artifact_id };
+    }
     await this.storage.put(this.datasetStorageKey(datasetId, phase), bars);
     return this.mirror("datasets", `${datasetId}-${phase}`, bars, { dataset_id: datasetId, phase, ...metadata });
   }
 
   async getDatasetSlice(datasetId, phase) {
-    return this.storage.get(this.datasetStorageKey(datasetId, phase));
+    const local = await this.storage.get(this.datasetStorageKey(datasetId, phase));
+    if (local || !this.contentStore) return local;
+    const kind = phase === "holdout" ? "dataset.holdout.raw" : "dataset.development.raw";
+    const found = await this.contentStore.findLatest({ workspaceId: this.workspace, kind,
+      metadata: { dataset_id: datasetId, phase } });
+    if (!found) return undefined;
+    if (phase === "holdout") await this.recordHoldoutAccess(found.manifest, "backtest_validation");
+    return JSON.parse(new TextDecoder().decode(found.bytes));
   }
 
   async putResearchTrial(cohortId, trialId, value, metadata = {}) {
     const safe = redactPrivateBars(value);
+    if (this.contentStore) {
+      await this.ensureWorkspace();
+      const manifest = await this.contentStore.put({ workspaceId: this.workspace, kind: "research.result",
+        content: safe, visibility: "private", mediaType: "application/json",
+        metadata: { cohort_id: cohortId, trial_id: trialId, ...metadata } });
+      return { value: safe, mirror: { status: "ok", object_key: manifest.object_key,
+        content_hash: manifest.content_hash, artifact_id: manifest.artifact_id } };
+    }
     await this.storage.put(this.researchTrialStorageKey(cohortId, trialId), safe);
     const mirror = await this.mirror("research-trials", `${cohortId}-${trialId}`, safe,
       { cohort_id: cohortId, trial_id: trialId, ...metadata });
@@ -139,7 +180,30 @@ export class PrivateArtifactRepository {
   }
 
   async getResearchTrial(cohortId, trialId) {
-    return this.storage.get(this.researchTrialStorageKey(cohortId, trialId));
+    const local = await this.storage.get(this.researchTrialStorageKey(cohortId, trialId));
+    if (local || !this.contentStore) return local;
+    const found = await this.contentStore.findLatest({ workspaceId: this.workspace, kind: "research.result",
+      metadata: { cohort_id: cohortId, trial_id: trialId } });
+    return found ? JSON.parse(new TextDecoder().decode(found.bytes)) : undefined;
+  }
+
+  async ensureWorkspace() {
+    if (!this.env.AXIOM_DB) return;
+    const now = new Date().toISOString();
+    await this.env.AXIOM_DB.prepare(`INSERT INTO workspaces
+      (workspace_id,display_name,environment,status,created_at,updated_at)
+      VALUES (?,?,?,'active',?,?) ON CONFLICT(workspace_id) DO UPDATE SET updated_at=excluded.updated_at`)
+      .bind(this.workspace, this.workspace, String(this.env.ENVIRONMENT ?? "development"), now, now).run();
+  }
+
+  async recordHoldoutAccess(manifest, purpose) {
+    if (!this.env.AXIOM_DB) return;
+    const requestHash = await sha256({ workspace_id: this.workspace, artifact_id: manifest.artifact_id, purpose });
+    await this.env.AXIOM_DB.prepare(`INSERT INTO holdout_access_ledger
+      (workspace_id,access_id,dataset_slice_id,artifact_id,strategy_id,purpose,actor,request_hash,decision_id,accessed_at)
+      VALUES (?,?,?,?,?,?,?,?,?,?) ON CONFLICT(workspace_id,request_hash,actor,purpose) DO NOTHING`).bind(this.workspace,
+      `holdout-access-${requestHash.slice(0, 32)}`, manifest.metadata?.dataset_slice_id ?? null,
+      manifest.artifact_id, null, purpose, "system", requestHash, null, new Date().toISOString()).run();
   }
 
   async clear() {
@@ -175,6 +239,8 @@ export class ControlPlaneRuntime {
     this.mode = controlPlaneMode(env);
     this.state = new DurableStateRepository(storage);
     this.artifacts = new PrivateArtifactRepository(storage, env, workspace);
+    this.normalized = String(env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true" && env.AXIOM_DB
+      ? new NormalizedStore(env.AXIOM_DB) : null;
     this.lastCheckpoint = { status: this.mode === "legacy" ? "disabled" : "not_started" };
   }
 
@@ -185,7 +251,53 @@ export class ControlPlaneRuntime {
   async saveState(state) {
     await this.state.save(state);
     this.lastCheckpoint = await this.mirrorCheckpoint(state);
+    if (this.normalized && !state.orchestration?.pending_reset) await this.mirrorNormalizedState(state);
     return this.lastCheckpoint;
+  }
+
+  async mirrorNormalizedState(state) {
+    try {
+      const exported = exportLegacyState(state, { workspace_id: this.workspace, exported_at: new Date().toISOString() });
+      const normalized = normalizeLegacyExport(exported);
+      const readModel = rebuildNormalizedReadModel(normalized);
+      const parity = compareMigrationParity(exported, normalized, readModel);
+      await this.normalized.persistSnapshotProjection({ workspaceId: this.workspace,
+        stateHash: exported.export_hash, schemaVersion: state.schemaVersion ?? 1,
+        strategies: state.strategies ?? [], readModel,
+        comparisonStatus: parity.cutover_ready ? "matched" : "mismatched",
+        environment: String(this.env.ENVIRONMENT ?? "development") });
+      this.lastNormalized = { status: parity.cutover_ready ? "matched" : "blocked",
+        source_checkpoint_hash: exported.export_hash, issues: parity.integrity.issues.length };
+    } catch (error) {
+      this.lastNormalized = { status: "degraded", error: messageOf(error) };
+      console.warn("Normalized state mirror failed", this.lastNormalized);
+    }
+    return this.lastNormalized;
+  }
+
+  async loadNormalizedReadModel() {
+    return this.normalized?.loadLatestReadModel(this.workspace) ?? null;
+  }
+
+  async clearCompatibilityMetadata() {
+    if (!this.env.AXIOM_DB) return;
+    for (const table of ["architecture_queue_receipts", "architecture_artifact_mirrors", "architecture_state_checkpoints"]) {
+      await this.env.AXIOM_DB.prepare(`DELETE FROM ${table} WHERE workspace_id=?`).bind(this.workspace).run();
+    }
+  }
+
+  async compatibilityResetInventory() {
+    if (!this.env.AXIOM_DB) return { d1_targets: [], object_keys: [] };
+    const targets = [];
+    for (const [table, key] of [["architecture_queue_receipts", "receipt_id"],
+      ["architecture_artifact_mirrors", "object_id"], ["architecture_state_checkpoints", "checkpoint_id"]]) {
+      const result = await this.env.AXIOM_DB.prepare(`SELECT ${key} FROM ${table} WHERE workspace_id=? ORDER BY ${key}`)
+        .bind(this.workspace).all();
+      targets.push(...(result.results ?? []).map((row) => `${table}:${row[key]}`));
+    }
+    const objects = await this.env.AXIOM_DB.prepare(`SELECT object_key FROM architecture_artifact_mirrors
+      WHERE workspace_id=? ORDER BY object_key`).bind(this.workspace).all();
+    return { d1_targets: targets.sort(), object_keys: (objects.results ?? []).map((row) => row.object_key).sort() };
   }
 
   async mirrorCheckpoint(state) {
@@ -230,6 +342,9 @@ export class ControlPlaneRuntime {
       }
     }
     const ready = this.mode === "legacy" || (bindings.d1 && bindings.r2 && bindings.queue && d1Probe === "ok");
+    const normalizedHealth = this.normalized
+      ? await this.normalized.checkCutoverHealth(this.workspace, { requireMigrationComplete: true })
+      : { ready: false, reasons: ["normalized_storage_disabled"] };
     return {
       mode: this.mode,
       authority: "durable_object",
@@ -238,7 +353,8 @@ export class ControlPlaneRuntime {
       probes: { d1: d1Probe },
       last_checkpoint: this.lastCheckpoint,
       last_artifact_mirror: this.artifacts.lastMirror,
-      normalized_cutover_available: false,
+      normalized_cutover_available: normalizedHealth.ready,
+      normalized: { status: this.lastNormalized?.status ?? "not_started", reasons: normalizedHealth.reasons },
     };
   }
 }

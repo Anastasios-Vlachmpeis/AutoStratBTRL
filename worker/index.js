@@ -14,7 +14,7 @@ import {
   validateCandidates,
   validateCandidatesWithBars,
 } from "./engine.js";
-import { isAuthorized } from "./auth.js";
+import { isAuthorized, isStrictlyAuthorized } from "./auth.js";
 import {
   aggregateMetrics, buildBacktestPayload, buildBacktestPayloadShardsV2, comparison, engineMode, EXECUTION_CONFIG_V2, frozenDna,
   makeDataset, makeMultiSymbolDataset, normalizeMetrics, remoteEnabled, sha256,
@@ -420,6 +420,141 @@ export class AxiomLab extends DurableObject {
     state.events = state.events.slice(0, 28);
   }
 
+  registerPartitionedDataset(state, loaded) {
+    const source = loaded.manifest;
+    state.datasets ??= {};
+    state.datasets[source.id] ??= {
+      id: source.id, schema_version: 2, storage_family: "partitioned-v1",
+      partition_dataset_id: source.id, timeframe: source.timeframe, sha256: source.sha256,
+      development_hash: loaded.dataset_hash, holdout_hash: null,
+      manifest: { schema_version: 2, timeframe: source.timeframe, feed: source.feed,
+        adjustment: source.adjustment, session: source.session,
+        universe: { id: source.universe_id, sha256: source.universe_hash },
+        calendar: { id: source.calendar_id, sha256: source.calendar_hash },
+        universe_id: source.universe_id, universe_sha256: source.universe_hash,
+        calendar_id: source.calendar_id, calendar_sha256: source.calendar_hash,
+        symbols: [...new Set(source.partitions.map((item) => item.symbol))].sort(),
+        source_dataset_hash: source.sha256 },
+      symbol_count: source.symbol_count, start: source.start, end: source.end,
+    };
+    return state.datasets[source.id];
+  }
+
+  async runSealedResearchCohort(state, command) {
+    const datasetId = state.marketData?.backfill?.dataset_id;
+    if (!datasetId) throw new Error("Three-year sealed market dataset is not complete");
+    const contentStore = this.controlPlane.artifacts.contentStore;
+    if (contentStore) {
+      const quota = await contentStore.quotaStatus({ workspaceId: SINGLETON_NAME,
+        quotaBytes: Math.max(1, Number(this.env.ARTIFACT_QUOTA_BYTES ?? 8_000_000_000)), researchPauseRatio: .9 });
+      if (quota.pause_optional_research) {
+        pauseResearch(state, "storage_quota_pressure");
+        ensureOrchestrationState(state, orchestrationMode(this.env)).incidents.push({ kind: "storage_quota_pressure",
+          action: "research.run_cohort", command_id: command.command_id, used_bytes: quota.used_bytes,
+          quota_bytes: quota.quota_bytes, opened_at: command.timestamp });
+        return { paused: true, reason: "storage_quota_pressure" };
+      }
+    }
+    const loaded = await this.marketDataRepository.loadSealedDataset(datasetId, { scope: "development_only" });
+    if (Object.keys(loaded.bars_by_symbol).length < 5) throw new Error("Sealed development dataset has fewer than five symbols");
+    const dataset = this.registerPartitionedDataset(state, loaded);
+    const sessionDate = command.payload?.session_date ?? newYorkClock(command.timestamp).date;
+    const finalists = boundedInt(this.env.RESEARCH_AUTORUN_FINALISTS, 6, 1, 12);
+    const prepared = prepareEvolutionaryResearch(state, {
+      seed: (Number(state.seed ?? 0) ^ Number(sessionDate.replaceAll("-", ""))) >>> 0,
+      session_date: sessionDate, dataset_id: dataset.id, dataset_hash: loaded.dataset_hash,
+      dataset_scope: "development_only", bars_by_symbol: loaded.bars_by_symbol,
+      telemetry: { status: String(this.env.RESEARCH_BUDGET_STATUS ?? "healthy"), at: command.timestamp },
+      config: { sampled_genomes: boundedInt(this.env.RESEARCH_AUTORUN_SAMPLED_GENOMES, Math.max(16, finalists * 4), 1, 128),
+        challengers: boundedInt(this.env.RESEARCH_AUTORUN_CHALLENGERS, Math.min(32, Math.max(4, finalists * 2)), 0, 32),
+        finalists, validation_slots: 3, minimum_symbols: 5, maximum_symbol_concentration: .35 },
+    });
+    if (prepared.duplicate) return { duplicate: true, cohort_id: prepared.cohort.cohort_id };
+    try {
+      const artifactIds = {};
+      for (const artifact of prepared.trial_artifacts) {
+        const stored = await this.controlPlane.artifacts.putResearchTrial(artifact.cohort_id, artifact.trial_id, artifact, {
+          dataset_id: artifact.dataset_id, contract_hash: artifact.contract_hash,
+        });
+        artifactIds[artifact.trial_id] = stored.mirror?.artifact_id ?? `${artifact.cohort_id}:${artifact.trial_id}`;
+      }
+      const committed = commitEvolutionaryResearch(state, prepared, { artifact_ids: artifactIds });
+      for (const strategy of committed.created) strategy.dataset_id = dataset.id;
+      this.record(state, "EVOLVE", `${committed.created.length} evolutionary finalists registered`,
+        `${prepared.screen.summary.attempted} attempts · ${prepared.screen.summary.eligible} eligible · sealed development partitions`);
+      return { duplicate: false, cohort_id: prepared.cohort.cohort_id, finalists: committed.created.length };
+    } catch (error) {
+      failEvolutionaryResearch(state, prepared, error);
+      throw error;
+    }
+  }
+
+  async buildWorkspaceResetSnapshot() {
+    const [artifactManifest, d1Targets, market, orchestration, compatibility, durableObjects] = await Promise.all([
+      this.controlPlane.artifacts.contentStore
+        ? this.controlPlane.artifacts.contentStore.buildResetManifest(SINGLETON_NAME) : null,
+      this.controlPlane.normalized
+        ? this.controlPlane.normalized.enumerateWorkspaceResetTargets(SINGLETON_NAME) : [],
+      this.marketDataRepository.resetInventory(),
+      this.orchestrationStore ? this.orchestrationStore.resetInventory(SINGLETON_NAME)
+        : { d1_targets: [], object_keys: [] },
+      this.controlPlane.compatibilityResetInventory(),
+      this.ctx.storage.list(),
+    ]);
+    const identity = {
+      workspace_id: SINGLETON_NAME,
+      artifact_inventory_hash: artifactManifest ? await sha256({ artifact_ids: artifactManifest.artifact_ids,
+        object_keys: artifactManifest.object_keys }) : null,
+      normalized_d1_targets: d1Targets.map((item) => item.targetId).sort(),
+      market_d1_targets: market.d1_targets,
+      market_object_keys: market.object_keys,
+      orchestration_d1_targets: orchestration.d1_targets,
+      orchestration_object_keys: orchestration.object_keys,
+      compatibility_d1_targets: compatibility.d1_targets,
+      compatibility_object_keys: compatibility.object_keys,
+      durable_object_keys: [...durableObjects.keys()].sort(),
+    };
+    return { manifest_hash: await sha256(identity), identity, artifact_manifest: artifactManifest,
+      counts: { d1: d1Targets.length + market.d1_targets.length + orchestration.d1_targets.length
+          + compatibility.d1_targets.length,
+        r2: (artifactManifest?.artifact_count ?? 0) + market.object_keys.length
+          + orchestration.object_keys.length + compatibility.object_keys.length,
+        durable_object: durableObjects.size } };
+  }
+
+  async persistWorkspaceResetManifest(prepared, command) {
+    if (!this.env.AXIOM_ARTIFACTS) throw new Error("AXIOM_ARTIFACTS is required to prepare a recoverable reset");
+    const workspaceHash = await sha256(SINGLETON_NAME);
+    const objectKey = `workspaces/${workspaceHash}/reset-manifests/${prepared.manifest_hash}.json`;
+    const record = { schema_version: 1, workspace_id: SINGLETON_NAME, manifest_hash: prepared.manifest_hash,
+      identity: prepared.identity, artifact_manifest: prepared.artifact_manifest, counts: prepared.counts,
+      requested_by: command.actor, prepared_at: command.timestamp };
+    const contentHash = await sha256(record);
+    await this.env.AXIOM_ARTIFACTS.put(objectKey, JSON.stringify(record), { customMetadata: {
+      kind: "workspace-reset-manifest", workspace_id: SINGLETON_NAME,
+      manifest_hash: prepared.manifest_hash, content_hash: contentHash,
+    } });
+    const stored = await this.env.AXIOM_ARTIFACTS.get(objectKey);
+    if (!stored) throw new Error("Prepared reset manifest could not be read back");
+    const decoded = JSON.parse(new TextDecoder().decode(await stored.arrayBuffer()));
+    if (await sha256(decoded) !== contentHash || await sha256(decoded.identity) !== prepared.manifest_hash) {
+      throw new Error("Prepared reset manifest failed read-after-write verification");
+    }
+    return { object_key: objectKey, content_hash: contentHash };
+  }
+
+  async verifyWorkspaceResetManifest(pending) {
+    const stored = await this.env.AXIOM_ARTIFACTS?.get(pending.manifest_object_key);
+    if (!stored) throw new Error("Prepared reset manifest is missing");
+    const decoded = JSON.parse(new TextDecoder().decode(await stored.arrayBuffer()));
+    if (await sha256(decoded) !== pending.manifest_content_hash
+        || decoded.manifest_hash !== pending.manifest_hash
+        || await sha256(decoded.identity) !== pending.manifest_hash) {
+      throw new Error("Prepared reset manifest is corrupt");
+    }
+    return decoded;
+  }
+
   async executeOrchestrationActions(state, command, result) {
     const orchestration = ensureOrchestrationState(state, orchestrationMode(this.env));
     orchestration.executed_command_ids ??= [];
@@ -486,11 +621,47 @@ export class AxiomLab extends DurableObject {
         await this.orchestrationStore.recordConfigApproval({ approvalId: command.command_id,
           workspaceId: SINGLETON_NAME, configKey: approval.kind, configHash: approval.subject_hash,
           approvedBy: approval.actor });
-      } else if (action.kind === "workspace.reset_nonproduction") {
+      } else if (action.kind === "workspace.prepare_reset") {
         if (String(this.env.ENVIRONMENT ?? "development").toLowerCase() === "production") {
           throw new Error("Workspace reset is disabled in production");
         }
-        await this.clearWorkspaceStorage();
+        const prepared = await this.buildWorkspaceResetSnapshot();
+        const persisted = await this.persistWorkspaceResetManifest(prepared, command);
+        orchestration.pending_reset = { schema_version: 1, manifest_hash: prepared.manifest_hash,
+          identity: prepared.identity, artifact_manifest: prepared.artifact_manifest,
+          manifest_object_key: persisted.object_key, manifest_content_hash: persisted.content_hash,
+          requested_by: command.actor, prepared_at: command.timestamp };
+        if (this.controlPlane.normalized) await this.controlPlane.normalized.prepareWorkspaceReset({
+          workspaceId: SINGLETON_NAME, requestedBy: command.actor,
+          environment: String(this.env.ENVIRONMENT ?? "development"),
+          manifestObjectKey: persisted.object_key, manifestHash: prepared.manifest_hash,
+        });
+        this.record(state, "WORKSPACE_RESET", "Workspace reset prepared",
+          `${prepared.counts.d1} D1, ${prepared.counts.r2} R2, and ${prepared.counts.durable_object} Durable Object targets enumerated`);
+      } else if (action.kind === "workspace.execute_reset") {
+        if (String(this.env.ENVIRONMENT ?? "development").toLowerCase() === "production") {
+          throw new Error("Workspace reset is disabled in production");
+        }
+        const pending = orchestration.pending_reset;
+        if (!pending || pending.manifest_hash !== action.payload.manifest_hash) throw new Error("Prepared reset manifest does not match");
+        await this.verifyWorkspaceResetManifest(pending);
+        const current = await this.buildWorkspaceResetSnapshot();
+        if (current.manifest_hash !== pending.manifest_hash) throw new Error("Workspace changed after reset preparation");
+        if (this.controlPlane.normalized) await this.controlPlane.normalized.clearWorkspaceData(SINGLETON_NAME);
+        if (this.controlPlane.artifacts.contentStore && pending.artifact_manifest) {
+          await this.controlPlane.artifacts.contentStore.executeReset({ workspaceId: SINGLETON_NAME,
+            manifest: pending.artifact_manifest });
+        }
+        await this.marketDataRepository.clear();
+        await this.controlPlane.artifacts.clear();
+        if (this.orchestrationStore) await this.orchestrationStore.clearWorkspace(SINGLETON_NAME);
+        if (pending.identity.compatibility_object_keys.length && this.env.AXIOM_ARTIFACTS) {
+          await this.env.AXIOM_ARTIFACTS.delete(pending.identity.compatibility_object_keys);
+        }
+        await this.controlPlane.clearCompatibilityMetadata();
+        for (let start = 0; start < pending.identity.durable_object_keys.length; start += 128) {
+          await this.ctx.storage.delete(pending.identity.durable_object_keys.slice(start, start + 128));
+        }
         const fresh = createDemoState();
         ensureOrchestrationState(fresh, orchestrationMode(this.env));
         for (const key of Object.keys(state)) delete state[key];
@@ -498,14 +669,19 @@ export class AxiomLab extends DurableObject {
         return { duplicate: false, reset: true };
       } else if (action.kind === "pipeline.validate") {
         await this.validateRemote(state, this.env, { advanceClock: false, silent: true });
+      } else if (action.kind === "pipeline.review") {
+        await this.reviewRemote(state, this.env, { dsl: {}, legacy: {} });
+      } else if (action.kind === "research.schedule") {
+        if (!state.marketData?.backfill?.dataset_id) throw new Error("Sealed market dataset is not ready for research");
+      } else if (action.kind === "research.run_cohort") {
+        const cohort = await this.runSealedResearchCohort(state, command);
+        if (!cohort.paused) {
+          await this.reviewRemote(state, this.env, { dsl: {}, legacy: {} });
+          await this.validateRemote(state, this.env, { advanceClock: false, silent: true });
+        }
       } else if (action.kind === "market.reconcile_session" && state.marketData?.calendar?.id) {
         const calendar = await this.marketDataRepository.loadCalendar(state.marketData.calendar.id);
         if (calendar) await this.reconcileLiveSession(state, new Date(command.timestamp), calendar);
-      } else if (["pipeline.review", "research.run_cohort", "research.schedule"].includes(action.kind)) {
-        // Plan 08 supplies the partition-streaming executor. Until then this is
-        // an operational data block, never a strategy-quality outcome.
-        orchestration.incidents.push({ kind: "data_blocked", action: action.kind, command_id: command.command_id,
-          reason: "sealed_partition_executor_pending", opened_at: command.timestamp });
       }
     }
     orchestration.executed_command_ids.push(command.command_id);
@@ -832,12 +1008,17 @@ export class AxiomLab extends DurableObject {
   }
 
   async persistArtifact(state, artifact, result) {
-    const artifactId = `artifact-${artifact.job_id}-${artifact.strategy_id}`;
-    await this.controlPlane.artifacts.putArtifact(artifactId, { ...artifact, result }, {
+    const legacyId = `artifact-${artifact.job_id}-${artifact.strategy_id}`;
+    const stored = await this.controlPlane.artifacts.putArtifact(legacyId, { ...artifact, result }, {
       phase: artifact.phase, strategy_id: artifact.strategy_id, dataset_id: artifact.dataset?.id,
     });
+    const artifactId = stored.mirror?.artifact_id ?? legacyId;
     state.backtestArtifacts ??= {};
-    state.backtestArtifacts[artifactId] = { id: artifactId, phase: artifact.phase, strategy_id: artifact.strategy_id, created_at: artifact.created_at, engine: artifact.engine, dataset: artifact.dataset };
+    state.backtestArtifacts[artifactId] = { id: artifactId, phase: artifact.phase,
+      strategy_id: artifact.strategy_id, dataset_id: artifact.dataset?.id,
+      timeframe: artifact.dataset?.timeframe ?? artifact.dataset?.manifest?.timeframe ?? null,
+      content_hash: stored.mirror?.content_hash ?? null, object_key: stored.mirror?.object_key ?? null,
+      created_at: artifact.created_at, engine: artifact.engine, dataset: artifact.dataset };
     return artifactId;
   }
 
@@ -927,7 +1108,19 @@ export class AxiomLab extends DurableObject {
   }
 
   async invokeBacktrader(state, phase, strategies, dataset, options = {}) {
-    const bars = await this.controlPlane.artifacts.getDatasetSlice(dataset.id, phase === "holdout" ? "holdout" : "development");
+    let bars;
+    if (dataset.storage_family === "partitioned-v1") {
+      const loaded = await this.marketDataRepository.loadSealedDataset(dataset.partition_dataset_id ?? dataset.id, {
+        scope: phase === "holdout" ? "holdout_only" : "development_only",
+        access: phase === "holdout" ? { purpose: "sealed_validation", actor: "system",
+          decisionId: await sha256(strategies.map((item) => item.holdout_authorization?.authorization_id ?? item.id).sort()) } : null,
+      });
+      bars = loaded.bars_by_symbol;
+      if (phase === "holdout") dataset.holdout_hash = loaded.dataset_hash;
+      else dataset.development_hash = loaded.dataset_hash;
+    } else {
+      bars = await this.controlPlane.artifacts.getDatasetSlice(dataset.id, phase === "holdout" ? "holdout" : "development");
+    }
     if (!(Array.isArray(bars) ? bars.length : Object.keys(bars ?? {}).length)) throw new Error(`Sealed ${phase} dataset is unavailable`);
     if (dataset.schema_version === 2) {
       const sealed = { ...dataset, [phase === "holdout" ? "holdout" : "development"]: bars };
@@ -1257,7 +1450,17 @@ export class AxiomLab extends DurableObject {
     const state = await this.load();
 
     try {
-      if (request.method === "GET" && url.pathname === "/api/state") return json(snapshot(state));
+      if (request.method === "GET" && url.pathname === "/api/state") {
+        if (String(this.env.NORMALIZED_READ_ENABLED ?? "false").toLowerCase() === "true") {
+          const cutover = this.controlPlane.normalized
+            ? await this.controlPlane.normalized.checkCutoverHealth(SINGLETON_NAME, { requireMigrationComplete: true }) : null;
+          if (!cutover?.ready) {
+            return json({ error: "Normalized read model is not cutover-ready", reasons: cutover?.reasons ?? ["normalized_storage_disabled"] }, 503);
+          }
+          return json(cutover.readModel.response);
+        }
+        return json(snapshot(state));
+      }
       if (request.method === "GET" && url.pathname === "/api/architecture") {
         return json(await this.controlPlane.health(true));
       }
@@ -1309,8 +1512,7 @@ export class AxiomLab extends DurableObject {
         return this.save(state);
       }
       if (request.method === "POST" && url.pathname === "/api/reset") {
-        await this.clearWorkspaceStorage();
-        return this.save(createDemoState());
+        return json({ error: "Use prepare_workspace_reset, then execute_workspace_reset with the returned manifest hash" }, 409);
       }
       if (request.method === "POST" && url.pathname === "/internal/market-data/backfill-partition") {
         const body = await request.json();
@@ -1472,12 +1674,27 @@ export class AxiomLab extends DurableObject {
       if (request.method === "GET" && url.pathname.startsWith("/api/backtest-artifacts/")) {
         const id = decodeURIComponent(url.pathname.slice("/api/backtest-artifacts/".length));
         const artifact = await this.controlPlane.artifacts.getArtifact(id);
+        if (artifact) {
+          this.record(state, "AUDIT", "Private backtest artifact read", `Authenticated read of ${id}`);
+          if (this.controlPlane.normalized) await this.controlPlane.normalized.recordAuditEvent({ workspaceId: SINGLETON_NAME,
+            actor: "admin", action: "artifact.read", subjectKind: "backtest_artifact", subjectId: id,
+            requestId: request.headers.get("cf-ray"), details: { route: "backtest-artifacts" } });
+          await this.controlPlane.saveState(state);
+        }
         return artifact ? json(artifact) : json({ error: "Artifact not found" }, 404);
       }
       if (request.method === "GET" && url.pathname.startsWith("/api/research-artifacts/")) {
         const parts = url.pathname.slice("/api/research-artifacts/".length).split("/").map(decodeURIComponent);
         if (parts.length !== 2 || !parts.every(Boolean)) return json({ error: "Cohort and trial IDs are required" }, 400);
         const artifact = await this.controlPlane.artifacts.getResearchTrial(parts[0], parts[1]);
+        if (artifact) {
+          const id = `${parts[0]}:${parts[1]}`;
+          this.record(state, "AUDIT", "Private research artifact read", `Authenticated read of ${id}`);
+          if (this.controlPlane.normalized) await this.controlPlane.normalized.recordAuditEvent({ workspaceId: SINGLETON_NAME,
+            actor: "admin", action: "artifact.read", subjectKind: "research_artifact", subjectId: id,
+            requestId: request.headers.get("cf-ray"), details: { route: "research-artifacts" } });
+          await this.controlPlane.saveState(state);
+        }
         return artifact ? json(artifact) : json({ error: "Research artifact not found" }, 404);
       }
       if (request.method === "POST" && url.pathname === "/internal/alpaca-cycle") {
@@ -1509,7 +1726,9 @@ export class AxiomLab extends DurableObject {
         const command = createOrchestrationCommand({ kind: body.kind, intent_id: body.intent_id ?? null,
           strategy_id: body.strategy_id ?? null, actor: "operator:admin", timestamp: new Date().toISOString(),
           correlation_id: body.correlation_id ?? `operator:${body.kind}:${Date.now()}`, payload: body.payload ?? {} });
-        const result = await this.submitOrchestrationCommand(state, command);
+        const result = await this.submitOrchestrationCommand(state, command, {
+          forceDirect: ["prepare_workspace_reset", "execute_workspace_reset"].includes(body.kind),
+        });
         return this.save(state).then(async (response) => json({ ...(await response.json()), command_result: result }));
       }
       if (request.method === "POST" && url.pathname === "/internal/scheduled") {
@@ -1532,6 +1751,10 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
+      if (["/api/backtest-artifacts/", "/api/research-artifacts/"].some((prefix) => url.pathname.startsWith(prefix))
+          && !isStrictlyAuthorized(request, env)) {
+        return json({ error: "Configured admin token required for private artifacts" }, 401);
+      }
       if (!isAuthorized(request, env)) {
         return json({ error: "Admin token required" }, 401);
       }
