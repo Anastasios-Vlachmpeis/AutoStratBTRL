@@ -2,6 +2,8 @@
 
 This is the isolated Backtrader execution service. Cloudflare remains responsible for strategy state, data sealing, release decisions, Alpaca orders and scheduling. This service receives one already-authorized bar slice, runs frozen strategy DNA and returns deterministic artifacts.
 
+The current `backtest-request-v2` contract evaluates each DSL strategy as an isolated USD 100,000 multi-symbol portfolio on canonical adjusted regular-session five-minute bars. The legacy single-symbol request remains replayable.
+
 ## Contract
 
 `GET /healthz` is public. `POST /v1/backtests/batch` requires:
@@ -10,11 +12,13 @@ This is the isolated Backtrader execution service. Cloudflare remains responsibl
 - `X-Axiom-Job-Id`: body `job_id`
 - `X-Axiom-Signature`: lowercase hex HMAC-SHA256 of `timestamp + "." + job_id + "." + raw request body`, using `AXIOM_BACKTEST_SECRET`
 
-The request's `dataset.sha256` is the SHA-256 of canonical JSON (`sort_keys`, compact separators) for the submitted `bars` array. Each strategy's `dna_hash` is the SHA-256 of canonical JSON for `{id,asset,archetype,params}`. The service validates both before executing.
+For V2, `dataset.sha256` hashes the sorted `bars_by_symbol` object and every symbol also has its own count, bounds and SHA-256. The immutable manifest binds the universe, calendar, feed, adjustment and regular-session contract. The service rejects mismatched, unsorted or out-of-scope data before execution.
 
-`windows` use zero-based, end-exclusive indexes within the submitted bar slice. Cloudflare must submit only development bars for development runs and only the sealed holdout bars for holdout runs. The API does not accept hidden bar references or fetch market data itself.
+V2 `windows` use timezone-qualified ISO timestamps with an end-exclusive bound; legacy V1 windows retain zero-based indexes. Cloudflare must submit only development bars for development runs and only the sealed holdout bars for holdout runs. The API does not accept hidden bar references or fetch market data itself.
 
-Execution is $100,000 cash, next-bar-open market orders, long/short targets, 5 bps slippage, no commission and a 52-bar warmup. Signal rules are intentionally a direct port of `worker/engine.js`, including the currently unused `exit_z` mean-reversion parameter.
+V2 execution uses close decisions and next-tradable-open fills, signed long/short targets, a 0.5% isolated-strategy gross cap, DSL-derived warmup, forced session flattening, flatten-first reversals and deterministic partial-fill participation limits. Adverse base/range/participation slippage and the stress scenario are versioned execution configuration—not strategy DNA.
+
+Each V2 window returns approved base-cost and stressed evidence, portfolio and per-symbol curves, signals, targets, orders, fills, closed round trips, rejected fills, session events, five-minute and end-of-day metrics, hashes and replay metadata. Lifecycle gates use the stressed window while retaining both artifacts.
 
 ## Local run
 

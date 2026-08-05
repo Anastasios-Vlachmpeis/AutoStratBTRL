@@ -306,6 +306,17 @@ test("schema 7 migration initializes private evolutionary state without changing
   assert.equal(snapshot(migrated).research.population_size, 0);
 });
 
+test("schema 8 migration preserves evolutionary state for multi-symbol execution", () => {
+  const state = createDemoState();
+  state.schemaVersion = 8;
+  state.research.total_trials = 17;
+  state.datasets = { sealed: { id: "sealed", schema_version: 2, symbol_count: 40 } };
+  const migrated = migrateState(state);
+  assert.equal(migrated.schemaVersion, CURRENT_SCHEMA_VERSION);
+  assert.equal(migrated.research.total_trials, 17);
+  assert.equal(migrated.datasets.sealed.symbol_count, 40);
+});
+
 test("only evolutionary finalists enter the lifecycle and private trials stay out of snapshots", () => {
   const fixture = createDemoState();
   generateBatch(fixture, 1);

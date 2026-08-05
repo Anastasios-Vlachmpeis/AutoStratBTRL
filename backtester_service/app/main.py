@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from .dsl import MANIFEST as DSL_COMPILER_MANIFEST, TargetStateMachine, canonical_json as dsl_canonical_json, validate_strategy_dna
+from .v2 import BacktestRequestV2, run_v2
 
 ENGINE_NAME = "backtrader"
 ENGINE_VERSION = "1.9.78.123"
@@ -515,6 +516,27 @@ def healthz() -> dict[str, str]:
 @app.post("/v1/backtests/batch")
 async def run_backtests(request: Request) -> dict[str, Any]:
     raw = await request.body()
+    # V1 and V2 deliberately share the authenticated endpoint.  The explicit
+    # request schema marker avoids interpreting a sealed multi-symbol payload
+    # as a legacy single-feed request.
+    try:
+        raw_object = json.loads(raw)
+    except Exception:
+        raw_object = None
+    if isinstance(raw_object, dict) and raw_object.get("schema_version") == "backtest-request-v2":
+        try:
+            payload_v2 = BacktestRequestV2.model_validate(raw_object)
+        except Exception as exc:
+            raise HTTPException(422, str(exc)) from exc
+        verify_auth(request, raw, payload_v2.job_id)
+        engine = {"name": ENGINE_NAME, "version": ENGINE_VERSION,
+                  "image_digest": os.environ.get("BACKTEST_IMAGE_DIGEST", os.environ.get("K_REVISION", "local")),
+                  # Hash the exact signed wire object. Pydantic intentionally
+                  # coerces 100000 to 100000.0, which must not break the
+                  # JavaScript/Python provenance comparison.
+                  "configuration_hash": digest(raw_object.get("execution", {})),
+                  "dsl_compiler": {"dsl_version": DSL_COMPILER_MANIFEST["dsl_version"], "semantic_version": DSL_COMPILER_MANIFEST["semantic_version"], "schema_sha256": DSL_COMPILER_MANIFEST["schema_sha256"], "semantic_sha256": DSL_COMPILER_MANIFEST["semantic_sha256"]}}
+        return run_v2(payload_v2, engine=engine, input_hash=digest(raw_object))
     try:
         payload = BacktestRequest.model_validate_json(raw)
     except Exception as exc:
@@ -549,3 +571,25 @@ async def run_backtests(request: Request) -> dict[str, Any]:
     }
     response["result_hash"] = digest(response)
     return response
+
+
+@app.post("/v2/backtests/batch")
+async def run_backtests_v2(request: Request) -> dict[str, Any]:
+    """Authoritative sealed multi-symbol five-minute backtest contract."""
+    raw = await request.body()
+    try:
+        raw_object = json.loads(raw)
+        payload = BacktestRequestV2.model_validate(raw_object)
+    except Exception as exc:
+        raise HTTPException(422, str(exc)) from exc
+    verify_auth(request, raw, payload.job_id)
+    engine = {
+        "name": ENGINE_NAME, "version": ENGINE_VERSION,
+        "image_digest": os.environ.get("BACKTEST_IMAGE_DIGEST", os.environ.get("K_REVISION", "local")),
+        "configuration_hash": digest(raw_object.get("execution", {})),
+        "dsl_compiler": {"dsl_version": DSL_COMPILER_MANIFEST["dsl_version"],
+                         "semantic_version": DSL_COMPILER_MANIFEST["semantic_version"],
+                         "schema_sha256": DSL_COMPILER_MANIFEST["schema_sha256"],
+                         "semantic_sha256": DSL_COMPILER_MANIFEST["semantic_sha256"]},
+    }
+    return run_v2(payload, engine=engine, input_hash=digest(raw_object))

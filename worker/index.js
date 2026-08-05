@@ -16,8 +16,8 @@ import {
 } from "./engine.js";
 import { isAuthorized } from "./auth.js";
 import {
-  aggregateMetrics, buildBacktestPayload, comparison, engineMode, frozenDna,
-  makeDataset, normalizeMetrics, remoteEnabled, reviewDecision, sha256, validationDecision,
+  aggregateMetrics, buildBacktestPayload, buildBacktestPayloadShardsV2, comparison, engineMode, frozenDna,
+  makeDataset, makeMultiSymbolDataset, normalizeMetrics, remoteEnabled, reviewDecision, sha256, validationDecision,
 } from "./backtest.js";
 import { CONTROL_PLANE_WORKSPACE, createControlPlaneRuntime } from "./control-plane.js";
 import { createRuntimeGateways } from "./gateways.js";
@@ -113,7 +113,8 @@ async function refreshAlpacaPortfolio(env, stub) {
 async function reviewWithAlpaca(env, stub) {
   const appState = await stateFrom(stub);
   const candidates = appState.strategies.filter((strategy) => ["generated", "rework"].includes(strategy.state));
-  const dslSymbols = [...new Set(candidates.filter((strategy) => strategy.strategy_format === "dsl-v1").map((strategy) => strategy.asset))];
+  const dslSymbols = [...new Set(candidates.filter((strategy) => strategy.strategy_format === "dsl-v1")
+    .flatMap((strategy) => strategy.strategy_dna?.scope?.symbols ?? [strategy.asset]))].sort();
   const legacySymbols = [...new Set(candidates.filter((strategy) => strategy.strategy_format !== "dsl-v1").map((strategy) => strategy.asset))];
   const gateway = createRuntimeGateways(env).marketData;
   const [dslBars, legacyBars] = await Promise.all([
@@ -554,6 +555,45 @@ export class AxiomLab extends DurableObject {
     return state.datasets[dataset.id];
   }
 
+  async sealMultiDataset(state, barsBySymbol, options = {}) {
+    const available = Object.fromEntries(Object.entries(barsBySymbol ?? {})
+      .filter(([, bars]) => Array.isArray(bars) && bars.length >= 400));
+    const universe = await initialUniverseManifest();
+    const calendar = state.marketData?.calendar ?? {};
+    const dataset = await makeMultiSymbolDataset(available, {
+      timeframe: "5Min",
+      max_bars: options.max_bars ?? 20_000,
+      development_ratio: .75,
+      metadata: {
+        universe: { id: universe.id, sha256: universe.sha256 },
+        calendar: { id: calendar.id ?? "nyse-regular-unversioned",
+          sha256: calendar.sha256 ?? "0".repeat(64), revision: calendar.last_session ?? "unversioned" },
+        feed: { name: String(this.env.ALPACA_DATA_FEED ?? "iex"), revision: "alpaca-adjusted-v1" },
+        adjustment: "all", session: "regular", data_revision: "canonical-five-minute-v1",
+      },
+    });
+    const insufficient = dataset.manifest.symbols.filter((item) => item.split_index < 300
+      || item.bar_count - item.split_index < 100).map((item) => item.symbol);
+    if (insufficient.length) throw new Error(`Insufficient sealed five-minute history: ${insufficient.join(", ")}`);
+    state.datasets ??= {};
+    if (!state.datasets[dataset.id]) {
+      await this.controlPlane.artifacts.putDatasetSlice(dataset.id, "development", dataset.development, {
+        schema_version: 2, timeframe: "5Min", symbols: dataset.manifest.symbols.length,
+      });
+      await this.controlPlane.artifacts.putDatasetSlice(dataset.id, "holdout", dataset.holdout, {
+        schema_version: 2, timeframe: "5Min", symbols: dataset.manifest.symbols.length,
+      });
+      state.datasets[dataset.id] = {
+        id: dataset.id, schema_version: 2, timeframe: "5Min", sha256: dataset.sha256,
+        manifest: dataset.manifest, development_hash: dataset.development_hash,
+        holdout_hash: dataset.holdout_hash, symbol_count: dataset.manifest.symbols.length,
+        start: dataset.manifest.symbols.map((item) => item.start).filter(Boolean).sort().at(0) ?? null,
+        end: dataset.manifest.symbols.map((item) => item.end).filter(Boolean).sort().at(-1) ?? null,
+      };
+    }
+    return state.datasets[dataset.id];
+  }
+
   async validateLegacyStrategies(state, fallbackBars = {}, fallbackDslBars = fallbackBars) {
     const candidates = state.strategies.filter((item) => item.state === "validation"
       && (item.engine_family ?? "legacy") === "legacy");
@@ -564,7 +604,9 @@ export class AxiomLab extends DurableObject {
           this.controlPlane.artifacts.getDatasetSlice(strategy.dataset_id, "development"),
           this.controlPlane.artifacts.getDatasetSlice(strategy.dataset_id, "holdout"),
         ]);
-        if (development?.length && holdout?.length) bars = [...development, ...holdout];
+        const developmentBars = Array.isArray(development) ? development : development?.[strategy.asset];
+        const holdoutBars = Array.isArray(holdout) ? holdout : holdout?.[strategy.asset];
+        if (developmentBars?.length && holdoutBars?.length) bars = [...developmentBars, ...holdoutBars];
         else this.record(state, "BACKTEST_ERROR", `${strategy.name} validation deferred`, "sealed legacy comparison dataset is missing");
       }
       validateCandidatesWithBars(state, { [strategy.asset]: bars }, {
@@ -576,7 +618,38 @@ export class AxiomLab extends DurableObject {
 
   async invokeBacktrader(state, phase, strategies, dataset) {
     const bars = await this.controlPlane.artifacts.getDatasetSlice(dataset.id, phase === "holdout" ? "holdout" : "development");
-    if (!bars?.length) throw new Error(`Sealed ${phase} dataset is unavailable`);
+    if (!(Array.isArray(bars) ? bars.length : Object.keys(bars ?? {}).length)) throw new Error(`Sealed ${phase} dataset is unavailable`);
+    if (dataset.schema_version === 2) {
+      const sealed = { ...dataset, [phase === "holdout" ? "holdout" : "development"]: bars };
+      const shards = await buildBacktestPayloadShardsV2(phase, strategies, sealed);
+      const responses = [];
+      for (const shard of shards) {
+        const response = await this.gateways.research.run(shard.payload);
+        if (response.job_id !== shard.job_id || response.phase !== phase) throw new Error("Backtest service provenance does not match the v2 request");
+        if (response.schema_version !== "backtest-artifact-v2" || response.dataset?.sha256 !== shard.slice_hash
+            || response.engine?.name !== "backtrader"
+            || (response.engine?.configuration_hash ?? response.engine?.config_hash) !== shard.config_hash) {
+          throw new Error("Backtest service returned an unexpected v2 dataset or execution configuration");
+        }
+        responses.push({ response, shard });
+      }
+      return {
+        response: {
+          schema_version: "backtest-artifact-v2", job_id: await sha256(responses.map((item) => item.shard.job_id)), phase,
+          engine: responses[0]?.response.engine, dataset: responses[0]?.response.dataset,
+          input_hash: await sha256(responses.map((item) => item.response.input_hash)),
+          result_hash: await sha256(responses.map((item) => item.response.result_hash)),
+          results: responses.flatMap((item) => item.response.results ?? []),
+          warnings: responses.flatMap((item) => item.response.warnings ?? []),
+          shards: responses.map((item) => ({ index: item.shard.shard_index, job_id: item.shard.job_id,
+            input_hash: item.response.input_hash, result_hash: item.response.result_hash })),
+        },
+        job_id: await sha256(responses.map((item) => item.shard.job_id)),
+        config_hash: responses[0]?.shard.config_hash,
+        dna: responses.flatMap((item) => item.shard.dna),
+        dataset,
+      };
+    }
     const built = await buildBacktestPayload(phase, strategies, dataset, bars);
     const { payload, config_hash, dna, slice_hash: sliceHash } = built;
     const job_id = payload.job_id;
@@ -623,17 +696,22 @@ export class AxiomLab extends DurableObject {
     const candidates = state.strategies.filter((item) => item.state === "generated" || (item.state === "rework" && item.rework?.source_stage === "data"));
     if (!candidates.length) return this.record(state, "REVIEW", "No candidates waiting", "Generate a new cohort or reproduce a released strategy first.");
     const byDataset = new Map();
+    let multiDataset;
     for (const strategy of candidates) {
       try {
         const isDsl = strategy.strategy_format === "dsl-v1";
         const barsBySymbol = isDsl ? barsByFormat.dsl : barsByFormat.legacy;
-        const dataset = await this.sealDataset(state, strategy.asset, barsBySymbol[strategy.asset] ?? [],
-          isDsl ? { timeframe: "5Min", max_bars: 20000 } : { timeframe: "1Day", max_bars: 600 });
+        const dataset = isDsl
+          ? (strategy.dataset_id ? state.datasets?.[strategy.dataset_id]
+            : (multiDataset ??= await this.sealMultiDataset(state, barsBySymbol, { max_bars: 20_000 })))
+          : await this.sealDataset(state, strategy.asset, barsBySymbol[strategy.asset] ?? [],
+            { timeframe: "1Day", max_bars: 600 });
+        if (!dataset) throw new Error("sealed strategy dataset is unavailable");
         strategy.dna_hash ??= await frozenDna(strategy);
         strategy.engine_family ??= "backtrader";
         strategy.dataset_id ??= dataset.id;
         if (strategy.dataset_id !== dataset.id) throw new Error("strategy dataset is immutable");
-        const groupKey = `${strategy.strategy_format ?? "legacy-archetype-v0"}:${dataset.id}`;
+        const groupKey = `${isDsl ? "dsl-v2" : strategy.strategy_format ?? "legacy-archetype-v0"}:${dataset.id}`;
         const group = byDataset.get(groupKey) ?? { dataset, strategies: [] };
         group.strategies.push(strategy); byDataset.set(groupKey, group);
       } catch (error) {
@@ -655,7 +733,8 @@ export class AxiomLab extends DurableObject {
                 || strategyResult?.compiler?.semantic_sha256 !== strategy.strategy_dna.compiler.semantic_sha256)) {
             throw new Error(`service returned mismatched DSL compiler for ${strategy.id}`);
           }
-          const results = strategyResult?.windows ?? (strategyResult ? [strategyResult] : []);
+          const windows = strategyResult?.windows ?? (strategyResult ? [strategyResult] : []);
+          const results = windows.map((window) => window.stress ?? window.ideal ?? window);
           if (!results.length) throw new Error(`service returned no result for ${strategy.id}`);
           const metrics = aggregateMetrics(results);
           const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "development", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,
@@ -703,7 +782,8 @@ export class AxiomLab extends DurableObject {
               || strategyResult?.compiler?.semantic_sha256 !== strategy.strategy_dna.compiler.semantic_sha256)) {
           throw new Error(`service returned mismatched DSL compiler for ${strategy.id}`);
         }
-        const result = strategyResult?.windows?.[0] ?? strategyResult;
+        const window = strategyResult?.windows?.[0] ?? strategyResult;
+        const result = window?.stress ?? window?.ideal ?? window;
         if (!result) throw new Error(`service returned no result for ${strategy.id}`);
         const validation = normalizeMetrics(result);
         const artifactId = await this.persistArtifact(state, { job_id: run.job_id, strategy_id: strategy.id, phase: "holdout", created_at: new Date().toISOString(), engine: run.response.engine ?? { name: "backtrader" }, dataset, strategy_format: strategy.strategy_format, strategy_dna: strategy.strategy_dna ?? strategy.legacy_dna, dna_hash: strategy.dna_hash, config_hash: run.config_hash,

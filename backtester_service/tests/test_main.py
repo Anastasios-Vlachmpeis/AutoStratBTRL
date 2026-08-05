@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import json
+import math
 import os
 import time
 from datetime import datetime, timedelta, timezone
@@ -10,6 +11,7 @@ from fastapi.testclient import TestClient
 os.environ["AXIOM_BACKTEST_SECRET"] = "test-secret"
 from app.dsl import legacy_strategy_to_dsl  # noqa: E402
 from app.main import DSLStrategyDNA, ExecutionConfig, StrategyDNA, app, digest, run_window, strategy_signal  # noqa: E402
+from app.v2 import BacktestRequestV2, V2Window, digest as digest_v2, simulate_v2  # noqa: E402
 
 client = TestClient(app)
 
@@ -183,3 +185,101 @@ def test_twelve_strategy_batch_completes_within_normal_target():
     assert response.status_code == 200, response.text
     assert time.monotonic() - started < 30
     assert len(response.json()["results"]) == 12
+
+
+def v2_market(symbol: str, count: int = 70, volume: float = 1000):
+    start = datetime(2026, 8, 3, 13, 30, tzinfo=timezone.utc)
+    result = []
+    for index in range(count):
+        price = 100 + index * .2
+        result.append({"t": (start + timedelta(minutes=index * 5)).isoformat().replace("+00:00", "Z"),
+                       "o": price, "h": price + 1, "l": price - 1, "c": price + .1, "v": volume,
+                       "interval_minutes": 5, "data_health": "healthy", "data_coverage": 1})
+    return result
+
+
+def v2_payload(symbols=("SPY", "QQQ")):
+    markets = {symbol: v2_market(symbol) for symbol in symbols}
+    frozen = legacy_strategy_to_dsl({"id": "v2", "asset": symbols[0], "archetype": "Momentum",
+                                     "params": {"fast": 2, "slow": 4, "threshold": .0001, "position_size": 1}}, symbols=list(symbols))
+    snapshot = {symbol: markets[symbol] for symbol in sorted(markets)}
+    manifests = [{"symbol": symbol, "start": rows[0]["t"], "end": rows[-1]["t"], "bar_count": len(rows), "sha256": digest_v2(rows)} for symbol, rows in sorted(markets.items())]
+    end = (datetime.fromisoformat(markets[symbols[0]][-1]["t"].replace("Z", "+00:00")) + timedelta(minutes=5)).isoformat().replace("+00:00", "Z")
+    return {"schema_version": "backtest-request-v2", "job_id": "v2-job", "phase": "holdout",
+            "strategies": [{"strategy_format": "dsl-v1", "id": "v2-dsl", "dna": frozen, "dna_hash": frozen["dna_hash"]}],
+            "dataset": {"schema_version": 2, "snapshot_id": "v2-snap", "timeframe": "5Min", "feed": "iex", "adjustment": "all", "session": "regular", "universe_id": frozen["scope"]["universe_id"], "universe_sha256": frozen["scope"]["universe_sha256"], "calendar_id": "nyse-v1", "calendar_sha256": "2" * 64, "symbols": manifests, "sha256": digest_v2(snapshot)},
+            "bars_by_symbol": snapshot, "windows": [{"id": "sealed", "start": markets[symbols[0]][0]["t"], "end": end}],
+            "execution": {"version": "execution-v2", "initial_cash": 100000, "strategy_gross_limit": .005,
+                          "fill": "next_tradable_bar_open", "allow_short": True, "no_overnight": True,
+                          "annualization": {"bar": 19656, "daily": 252, "risk_free_rate": 0},
+                          "warmup": {"mode": "dsl_derived", "safety_bars": 8},
+                          "costs": {"commission_bps": 0, "base_slippage_bps": 5, "range_slippage_bps": 2,
+                                    "participation_slippage_bps": 8},
+                          "participation": {"max_bar_volume_fraction": .10, "fill_policy": "partial_or_reject"},
+                          "stress": {"enabled": True, "slippage_multiplier": 2, "delayed_bars": 1,
+                                     "missed_fill_probability": .05, "force_session_flatten": True},
+                          "session": {"timezone": "America/New_York", "regular_hours_only": True,
+                                      "missing_data_blocks_entries": True}}}
+
+
+def test_v2_multi_symbol_is_deterministic_has_ideal_and_stress_artifacts():
+    body = v2_payload()
+    raw, headers = signed(body)
+    response = client.post("/v1/backtests/batch", content=raw, headers=headers)
+    assert response.status_code == 200, response.text
+    result = response.json()
+    window = result["results"][0]["windows"][0]
+    assert result["schema_version"] == "backtest-artifact-v2"
+    assert result["artifact_schema_version"] == "backtest-artifact-v2"
+    assert result["engine"]["configuration_hash"] == digest_v2(body["execution"])
+    assert result["input_hash"] == digest_v2(body)
+    assert result["replay"]["metrics_schema_version"] == "intraday-metrics-v2"
+    assert window["approved_artifact"] == "stress"
+    assert window["ideal"]["portfolio_curve"] and "stress" in window
+    assert "daily_sharpe" in window["metrics"]
+    assert window["metrics"]["observation_basis"]["bar_periods_per_year"] == 252 * 78
+    assert max(point["exposure"] for point in window["ideal"]["portfolio_curve"]) <= .0050001
+    raw, headers = signed(body)
+    assert client.post("/v1/backtests/batch", content=raw, headers=headers).json()["result_hash"] == result["result_hash"]
+
+
+def test_v2_partial_fill_and_no_trade_metrics_are_finite():
+    body = v2_payload(("SPY",))
+    body["bars_by_symbol"]["SPY"] = v2_market("SPY", volume=.001)
+    body["dataset"]["symbols"][0]["sha256"] = digest_v2(body["bars_by_symbol"]["SPY"])
+    body["dataset"]["sha256"] = digest_v2({"SPY": body["bars_by_symbol"]["SPY"]})
+    request = BacktestRequestV2.model_validate(body)
+    run = simulate_v2(request.strategies[0].dna, {"SPY": [x.model_dump(exclude_none=True) for x in request.bars_by_symbol["SPY"]]}, request.windows[0], request.execution)
+    assert all(math.isfinite(float(value)) for value in run["metrics"].values() if isinstance(value, (int, float)))
+    assert run["rejected_fills"]
+
+
+def test_v2_next_open_reversal_and_forced_eod_flatten_are_explicit():
+    body = v2_payload(("SPY",))
+    market = body["bars_by_symbol"]["SPY"]
+    for index, row in enumerate(market):
+        # A trend reversal forces a long-to-short target change after warmup.
+        price = 100 + index if index < 35 else 170 - index
+        row.update({"o": price, "h": price + 1, "l": price - 1, "c": price})
+    body["dataset"]["symbols"][0]["sha256"] = digest_v2(market)
+    body["dataset"]["sha256"] = digest_v2({"SPY": market})
+    request = BacktestRequestV2.model_validate(body)
+    run = simulate_v2(request.strategies[0].dna, {"SPY": [x.model_dump(exclude_none=True) for x in request.bars_by_symbol["SPY"]]}, request.windows[0], request.execution)
+    assert run["fills"]
+    first_signal = run["targets"][0]["t"]
+    first_fill = run["fills"][0]["t"]
+    assert first_fill > first_signal
+    assert run["session_flatten_events"]
+
+
+def test_v2_flat_strategy_has_finite_no_trade_artifact():
+    body = v2_payload(("SPY",))
+    dna = body["strategies"][0]["dna"]
+    # Re-freeze a migrated strategy with a threshold too high to trade.
+    frozen = legacy_strategy_to_dsl({"id": "flat", "asset": "SPY", "archetype": "Momentum",
+                                     "params": {"fast": 2, "slow": 4, "threshold": 10, "position_size": 1}}, symbols=["SPY"])
+    body["strategies"][0].update({"dna": frozen, "dna_hash": frozen["dna_hash"]})
+    request = BacktestRequestV2.model_validate(body)
+    run = simulate_v2(request.strategies[0].dna, {"SPY": [x.model_dump(exclude_none=True) for x in request.bars_by_symbol["SPY"]]}, request.windows[0], request.execution)
+    assert not run["closed_trades"]
+    assert all(math.isfinite(float(value)) for value in run["metrics"].values() if isinstance(value, (int, float)))

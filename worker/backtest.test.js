@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { aggregateMetrics, buildBacktestPayload, cleanBars, comparison, developmentWindows, frozenDna, makeDataset, normalizeMetrics,
-  remoteEnabled, sha256, signedBacktest, validationDecision } from "./backtest.js";
+  remoteEnabled, sha256, signedBacktest, validationDecision, makeMultiSymbolDataset, buildBacktestPayloadV2,
+  buildBacktestPayloadShardsV2, dynamicWarmup, normalizeBacktestResultV2, shardBacktestStrategies,
+  approvedExecutionConfig } from "./backtest.js";
 import { buildGeneratedStrategyDNA } from "./dsl-generation.js";
 
 test("sealed datasets split immutable development and holdout slices", async () => {
@@ -119,4 +121,121 @@ test("shadow comparison records exposure and trade-direction alignment", () => {
   assert.equal(result.signal_direction_alignment, 1);
   assert.equal(result.trade_direction_alignment, 1);
   assert.deepEqual(result.unexplained_differences, []);
+});
+
+function fiveMinuteBars(symbol, count = 120, start = Date.UTC(2026, 0, 2, 14, 30)) {
+  return Array.from({ length: count }, (_, index) => ({
+    t: new Date(start + index * 300_000).toISOString(), o: 100 + index, h: 101 + index, l: 99 + index,
+    c: 100.5 + index, v: 1000 + index, source: symbol,
+  }));
+}
+
+function v2Strategy(id, symbols = ["SPY", "QQQ"]) {
+  const built = buildGeneratedStrategyDNA({ family: "Dual average trend",
+    params: { fast: 5, slow: 20, threshold: .001, position_size: .25 }, seed: Number(id.replace(/\D/g, "")) || 1,
+    trialId: id, symbols });
+  return { id, strategy_format: "dsl-v1", strategy_dna: built.dna, dna_hash: built.dna.dna_hash };
+}
+
+async function v2Fixture() {
+  const strategy = v2Strategy("V2-1");
+  return { strategy, dataset: await makeMultiSymbolDataset({ QQQ: fiveMinuteBars("QQQ"), SPY: fiveMinuteBars("SPY") }, {
+    metadata: { universe: { id: strategy.strategy_dna.scope.universe_id, sha256: strategy.strategy_dna.scope.universe_sha256 },
+      calendar: { id: "nyse-v1", sha256: "calendar-hash", revision: "1" }, feed: { name: "iex", revision: "1" }, data_revision: "revision-1" },
+  }) };
+}
+
+test("v2 payload canonicalizes symbols and bars, with a stable immutable identity", async () => {
+  const { strategy, dataset } = await v2Fixture();
+  const first = await buildBacktestPayloadV2("development", [strategy], dataset);
+  const reordered = { ...dataset, development: { SPY: [...dataset.development.SPY].reverse(), QQQ: [...dataset.development.QQQ].reverse() } };
+  const second = await buildBacktestPayloadV2("development", [strategy], reordered);
+  assert.equal(first.payload.schema_version, "backtest-request-v2");
+  assert.equal(first.job_id, second.job_id);
+  assert.deepEqual(Object.keys(first.payload.bars_by_symbol), ["QQQ", "SPY"]);
+  assert.deepEqual(first.payload.dataset.symbols.map((item) => item.symbol), ["QQQ", "SPY"]);
+  assert.equal(first.payload.dataset.sha256, await sha256(first.payload.bars_by_symbol));
+  assert.equal("asset" in first.payload.strategies[0], false);
+  assert.equal(first.payload.windows.every((window) => window.start < window.end), true);
+});
+
+test("v2 development payload physically excludes holdout and holdout mutation leaves it unchanged", async () => {
+  const { strategy, dataset } = await v2Fixture();
+  const first = await buildBacktestPayloadV2("development", [strategy], dataset);
+  const changed = structuredClone(dataset);
+  changed.holdout.SPY[0].c += 9999;
+  const second = await buildBacktestPayloadV2("development", [strategy], changed);
+  const holdoutStamp = dataset.holdout.SPY[0].t;
+  assert.equal(first.job_id, second.job_id);
+  assert.equal(first.payload.bars_by_symbol.SPY.some((bar) => bar.t === holdoutStamp), false);
+  assert.equal(JSON.stringify(first.payload).includes("holdout"), false);
+  const rebuilt = await makeMultiSymbolDataset({
+    SPY: [...dataset.development.SPY, ...changed.holdout.SPY], QQQ: [...dataset.development.QQQ, ...changed.holdout.QQQ],
+  }, { metadata: { universe: dataset.manifest.universe, calendar: dataset.manifest.calendar, feed: dataset.manifest.feed,
+    adjustment: dataset.manifest.adjustment, session: dataset.manifest.session, data_revision: dataset.manifest.data_revision } });
+  const rebuiltPayload = await buildBacktestPayloadV2("development", [strategy], rebuilt);
+  assert.equal(first.job_id, rebuiltPayload.job_id);
+});
+
+test("v2 hashes change when a permitted bar mutates", async () => {
+  const { strategy, dataset } = await v2Fixture();
+  const first = await buildBacktestPayloadV2("development", [strategy], dataset);
+  const changed = structuredClone(dataset);
+  changed.development.SPY[20].c += 1;
+  const second = await buildBacktestPayloadV2("development", [strategy], changed);
+  assert.notEqual(first.payload.dataset.sha256, second.payload.dataset.sha256);
+  assert.notEqual(first.job_id, second.job_id);
+});
+
+test("v2 derives DSL warmup and has bounded deterministic 12 by 40 shards", async () => {
+  const { strategy, dataset } = await v2Fixture();
+  assert.equal(dynamicWarmup(strategy), strategy.strategy_dna.warmup_bars + 8);
+  const strategies = Array.from({ length: 13 }, (_, index) => v2Strategy(`V2-${index + 10}`));
+  const first = shardBacktestStrategies(strategies);
+  const second = shardBacktestStrategies([...strategies].reverse());
+  assert.deepEqual(first.map((group) => group.map((item) => item.id)), second.map((group) => group.map((item) => item.id)));
+  assert.deepEqual(first.map((group) => group.length), [12, 1]);
+  const shards = await buildBacktestPayloadShardsV2("development", strategies, dataset);
+  const replay = await buildBacktestPayloadShardsV2("development", [...strategies].reverse(), dataset);
+  assert.equal(shards.length, 2);
+  assert.notEqual(shards[0].job_id, shards[1].job_id);
+  assert.deepEqual(shards.map((item) => item.job_id), replay.map((item) => item.job_id));
+  assert.equal(shards[0].payload.execution.warmup.mode, "dsl_derived");
+});
+
+test("v2 deterministically isolates each 40-symbol finalist into bounded work shards", () => {
+  const symbols = Array.from({ length: 40 }, (_, index) => `S${String(index).padStart(2, "0")}`);
+  const strategies = Array.from({ length: 12 }, (_, index) => v2Strategy(`V2-WIDE-${index + 1}`, symbols));
+  const first = shardBacktestStrategies(strategies);
+  const replay = shardBacktestStrategies([...strategies].reverse());
+  assert.deepEqual(first.map((group) => group.length), Array(12).fill(1));
+  assert.deepEqual(first.map((group) => group[0].id), replay.map((group) => group[0].id));
+});
+
+test("v2 approved execution policy cannot disable stress, flattening, cash, or gross limits", () => {
+  assert.throws(() => approvedExecutionConfig({ initial_cash: 99_999 }), /fixed at 100000/);
+  assert.throws(() => approvedExecutionConfig({ strategy_gross_limit: .01 }), /fixed at 0.5%/);
+  assert.throws(() => approvedExecutionConfig({ stress: { enabled: false } }), /cannot be disabled/);
+  assert.throws(() => approvedExecutionConfig({ stress: { force_session_flatten: false } }), /cannot be disabled/);
+  const config = approvedExecutionConfig({ costs: { base_slippage_bps: 7 } });
+  assert.equal(config.initial_cash, 100_000);
+  assert.equal(config.strategy_gross_limit, .005);
+  assert.equal(config.stress.enabled, true);
+  assert.equal(config.stress.force_session_flatten, true);
+});
+
+test("v2 normalization preserves existing UI metrics and exposes portfolio artifacts", () => {
+  const result = normalizeBacktestResultV2({
+    metrics: { return: .08, sharpe: 1.1, daily_sharpe: .9, sortino: 1.4, calmar: .7, turnover: 2.1,
+      exposure: .3, hit_rate: .55, tail_loss: -.02, drawdown_duration_bars: 17, capacity_proxy: .8 },
+    equity_curve: [{ t: "a", value: 100000 }, { t: "b", value: 108000 }], drawdown_curve: [{ value: 0 }, { value: .03 }],
+    turnover_curve: [{ value: .1 }], per_symbol: { SPY: { return: .04, sharpe: .7, drawdown: .02, trades: 3 } },
+    fills: [{ id: "fill-1" }], warnings: ["stress warning"], result_hash: "r".repeat(64),
+  });
+  assert.equal(result.metrics.return, .08);
+  assert.equal(result.metrics.daily_sharpe, .9);
+  assert.equal(result.metrics.per_symbol.SPY.trades, 3);
+  assert.deepEqual(result.metrics.curve, [1, 1.08]);
+  assert.equal(result.portfolio.per_symbol.SPY.sharpe, .7);
+  assert.equal(result.ledger.fills.length, 1);
 });
