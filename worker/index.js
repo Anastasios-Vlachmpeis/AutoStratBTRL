@@ -75,6 +75,7 @@ import { planOrchestrationWork } from "./orchestration-schedule.js";
 import { applyLifecycleCommand, bindLifecycleProvenance, initialLifecycle, transitionId } from "./lifecycle.js";
 import { ADMIN_COMMAND_DTO_VERSION, buildOperationsReadModel, operatorArtifacts, operatorLogs,
   operatorOrders, operatorTrades, operatorTrials, paginateOperatorItems, strategyEvidenceDto } from "./operator-api.js";
+import { autonomyRequest, buildDashboardReadModel, buildStrategyDetail, buildStrategyList } from "./product-api.js";
 import { incrementOperationalMetric, operationalHealth, recordHeartbeat, recordOperationalEvent, structuredLogLine } from "./observability.js";
 import { advanceRolloutPhase, ensureRolloutState, recordDomainCutover, recordRolloutEvidence } from "./rollout.js";
 import { createRollbackBundle, rehearseRollback } from "./rollback.js";
@@ -2370,6 +2371,20 @@ export class AxiomLab extends DurableObject {
     const state = await this.load();
 
     try {
+      if (request.method === "GET" && url.pathname === "/api/v1/dashboard") {
+        let architecture = {};
+        try { architecture = await this.controlPlane.health(true); } catch (error) {
+          architecture = { ready: false, error: error instanceof Error ? error.message : String(error) };
+        }
+        const operations = buildOperationsReadModel(state, this.env, architecture);
+        return json(buildDashboardReadModel(state, this.env, operations));
+      }
+      if (request.method === "GET" && url.pathname === "/api/v1/strategies") {
+        try {
+          return json(buildStrategyList(state, { stage: url.searchParams.get("stage") ?? "active",
+            cursor: url.searchParams.get("cursor"), limit: url.searchParams.get("limit") ?? 50 }));
+        } catch (error) { return json({ error: error.message, code: "invalid_request" }, 400); }
+      }
       if (request.method === "GET" && url.pathname === "/api/v1/operations") {
         let architecture = {};
         try { architecture = await this.controlPlane.health(true); } catch (error) {
@@ -2395,6 +2410,11 @@ export class AxiomLab extends DurableObject {
         const id = decodeURIComponent(url.pathname.slice("/api/v1/strategies/".length, -"/evidence".length));
         const evidence = strategyEvidenceDto(state.strategies.find((item) => item.id === id));
         return evidence ? json(evidence) : json({ error: "Strategy not found", code: "artifact_not_found" }, 404);
+      }
+      if (request.method === "GET" && url.pathname.startsWith("/api/v1/strategies/")) {
+        const id = decodeURIComponent(url.pathname.slice("/api/v1/strategies/".length));
+        const detail = buildStrategyDetail(state, id);
+        return detail ? json(detail) : json({ error: "Strategy not found", code: "artifact_not_found" }, 404);
       }
       if (request.method === "GET" && url.pathname.startsWith("/api/v1/commands/")) {
         const id = decodeURIComponent(url.pathname.slice("/api/v1/commands/".length));
@@ -2443,6 +2463,34 @@ export class AxiomLab extends DurableObject {
           correlation_id: command.correlation_id, idempotency_key: idempotencyKey,
           status: result.queued ? "accepted" : result.status, terminal: !result.queued,
           outcome: result.queued ? null : result, ...(resetManifest ? { reset_manifest: resetManifest } : {}) }, result.queued ? 202 : 200);
+      }
+      if (request.method === "POST" && url.pathname === "/api/v1/admin/autonomy") {
+        if (orchestrationMode(this.env) !== "autonomous") {
+          return json({ error: "Autonomous scheduling is not enabled in this deployment", code: "setup_required" }, 409);
+        }
+        let desired;
+        try { desired = autonomyRequest(await request.json().catch(() => ({}))); }
+        catch (error) { return json({ error: error.message, code: "invalid_request" }, 400); }
+        const suppliedKey = request.headers.get("idempotency-key");
+        const idempotencyKey = String(suppliedKey ?? `autonomy:${desired.desired_state}:${Math.floor(Date.now() / 5000)}`);
+        if (!/^[A-Za-z0-9._:-]{8,160}$/.test(idempotencyKey)) {
+          return json({ error: "Invalid idempotency key", code: "invalid_request" }, 400);
+        }
+        const command = createOrchestrationCommand({ kind: desired.command_kind, actor: "operator:product",
+          timestamp: new Date().toISOString(), correlation_id: idempotencyKey,
+          payload: { desired_state: desired.desired_state } });
+        try { claimOperatorIdempotency(state, idempotencyKey, command.command_id); }
+        catch (error) { return json({ error: error.message, code: "idempotency_conflict" }, 409); }
+        const result = await this.submitOrchestrationCommand(state, command, { forceDirect: true });
+        this.record(state, "AUTONOMY", `Automation ${desired.desired_state}`,
+          desired.desired_state === "paused"
+            ? "New research, releases and increased exposure paused; monitoring and risk reduction continue."
+            : "Autonomous scheduling resumed without clearing other safety controls.",
+          { correlation_id: command.correlation_id, command_id: command.command_id });
+        await this.controlPlane.saveState(state);
+        return json({ dto_version: ADMIN_COMMAND_DTO_VERSION, desired_state: desired.desired_state,
+          command_id: command.command_id, status: result.status, terminal: true, outcome: result },
+        result.status === "blocked" ? 409 : 200);
       }
       if (request.method === "POST" && url.pathname === "/api/v1/admin/rollout/evidence") {
         const body = await request.json().catch(() => ({}));

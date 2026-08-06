@@ -3,254 +3,165 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <meta name="description" content="Axiom autonomous strategy foundry and paper-release terminal">
-  <title>Axiom / Strategy Foundry</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=DM+Mono:wght@300;400;500&family=Manrope:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <meta name="description" content="Axiom autonomous paper-strategy research and supervision">
+  <title>Axiom / Autonomous Paper Strategies</title>
   <link rel="stylesheet" href="/assets/styles.css">
 </head>
 <body>
-  <div class="app-shell">
-    <aside class="rail" aria-label="Primary navigation">
-      <a class="mark" href="#" aria-label="Axiom home"><span>AX</span></a>
-      <nav class="rail-nav">
-        <button class="rail-button active" data-view="portfolio" aria-label="Alpaca portfolio"><span class="rail-icon">$</span><span>Account</span></button>
-        <button class="rail-button" data-view="overview" aria-label="Foundry overview"><span class="rail-icon">⌘</span><span>Foundry</span></button>
-        <button class="rail-button" data-view="testing" aria-label="Backtest queue"><span class="rail-icon">⌁</span><span>Tests</span></button>
-        <button class="rail-button" data-view="released" aria-label="Released strategies"><span class="rail-icon">◇</span><span>Market</span></button>
-        <button class="rail-button" data-view="logs" aria-label="Supervisor decision logs"><span class="rail-icon">≡</span><span>Logs</span></button>
+  <section class="signin-screen" id="signin-screen" aria-labelledby="signin-title">
+    <div class="signin-glow"></div>
+    <form class="signin-card" id="signin-form">
+      <div class="axiom-mark" aria-hidden="true">AX</div>
+      <span class="eyebrow">PRIVATE AUTONOMOUS RESEARCH</span>
+      <h1 id="signin-title">Enter Axiom</h1>
+      <p>Use the admin token configured in Cloudflare. It stays in this browser tab and is discarded when the session ends.</p>
+      <label for="signin-token">Admin token</label>
+      <div class="signin-input"><input id="signin-token" type="password" autocomplete="current-password" required><button type="submit">Sign in</button></div>
+      <small id="signin-error" role="alert"></small>
+      <div class="paper-note"><i></i> Paper trading only</div>
+    </form>
+  </section>
+
+  <div class="app-shell" id="app-shell" hidden>
+    <aside class="sidebar" aria-label="Primary navigation">
+      <a class="brand" href="#/overview" aria-label="Axiom overview"><span>AX</span><strong>AXIOM</strong></a>
+      <nav>
+        <a class="nav-link" href="#/overview" data-route="overview"><span class="nav-symbol">◫</span><span>Overview</span></a>
+        <a class="nav-link" href="#/strategies" data-route="strategies"><span class="nav-symbol">⌁</span><span>Strategies</span></a>
       </nav>
-      <div class="rail-foot"><span class="pulse-dot"></span><span>SIM<br>ONLINE</span></div>
+      <div class="sidebar-bottom">
+        <a class="nav-link gear-link" href="#/advanced" data-route="advanced" aria-label="Advanced"><span class="nav-symbol">⚙</span><span>Advanced</span></a>
+        <button class="signout-button" id="signout-button">Sign out</button>
+      </div>
     </aside>
 
     <div class="workspace">
       <header class="topbar">
-        <div class="brand-copy">
-          <span class="eyebrow">AUTONOMOUS RESEARCH SYSTEM</span>
-          <h1>Strategy Foundry <span>/ AXIOM</span></h1>
-        </div>
-        <div class="top-status">
-          <div><span class="label">ENV</span><strong class="env-badge" id="environment-value">PAPER SIM</strong></div>
-          <div><span class="label">DATA</span><strong id="data-source-value">SYNTHETIC</strong></div>
-          <div><span class="label">CYCLE</span><strong id="cycle-value">—</strong></div>
-          <div><span class="label">CAPITAL</span><strong id="capital-value">—</strong></div>
-          <button class="icon-button" id="reset-button" title="Clear strategy workspace" aria-label="Clear strategy workspace">↻</button>
+        <div><span class="eyebrow">AUTONOMOUS STRATEGY SYSTEM</span><h1 id="page-title">Overview</h1></div>
+        <div class="top-actions">
+          <span class="paper-badge">PAPER MARKET</span><span class="feed-badge">IEX · 5 MIN</span>
+          <button class="button subdued" id="autonomy-button" disabled>Loading…</button>
+          <button class="button emergency" id="emergency-button">Emergency</button>
         </div>
       </header>
 
       <main>
-        <section class="command-strip" id="foundry-controls" hidden aria-label="Foundry controls">
-          <div>
-            <span class="section-kicker">SELF-SUPERVISING PIPELINE</span>
-          </div>
-          <div class="command-actions">
-            <label class="cohort-control"><span>COHORT</span><select id="cohort-size" aria-label="Cohort size"><option value="1">1</option><option value="3">3</option><option value="6" selected>6</option><option value="12">12</option></select></label>
-            <button class="button secondary" id="research-toggle-button"><span>||</span><span id="research-toggle-label">Pause research</span></button>
-            <button class="button secondary" id="generate-button"><span>＋</span>Generate new strats</button>
-            <button class="button secondary" id="review-button"><span>⌁</span> Run supervisor</button>
-            <button class="button secondary" id="validate-button"><span>◈</span> Validate holdout</button>
-            <button class="button secondary" id="advance-button"><span>▷</span> Advance simulation</button>
-            <button class="button primary" id="sync-button"><span>↯</span> Sync Alpaca</button>
-          </div>
-        </section>
-
-        <section class="pipeline" id="release-pipeline" hidden aria-label="Strategy release pipeline">
-          <article class="pipeline-step">
-            <div class="step-index">01</div><div><span>GENERATED</span><strong id="count-generated">0</strong></div>
-            <small>fresh DNA</small>
-          </article>
-          <div class="pipeline-link"><span></span></div>
-          <article class="pipeline-step">
-            <div class="step-index amber">02</div><div><span>UNDER REVIEW</span><strong id="count-testing">0</strong></div>
-            <small>3× regimes</small>
-          </article>
-          <div class="pipeline-link"><span></span></div>
-          <article class="pipeline-step">
-            <div class="step-index violet">03</div><div><span>VALIDATION</span><strong id="count-validation">0</strong></div>
-            <small>unseen 25%</small>
-          </article>
-          <div class="pipeline-link"><span></span></div>
-          <article class="pipeline-step">
-            <div class="step-index green">04</div><div><span>IN MARKET</span><strong id="count-released">0</strong></div>
-            <small>paper live</small>
-          </article>
-          <div class="pipeline-link"><span></span></div>
-          <article class="pipeline-step">
-            <div class="step-index muted">05</div><div><span>RETIRED</span><strong id="count-dropped">0</strong></div>
-            <small>evidence failed</small>
-          </article>
-        </section>
-
-        <section class="portfolio-dashboard" id="portfolio-dashboard" aria-label="Alpaca portfolio monitor">
-          <section class="operations-center" id="operations-center" aria-label="Operator control plane">
-            <div class="operations-head">
-              <div><span class="section-kicker">CONTROL PLANE / FIVE-MINUTE SYSTEM</span><h2>Operations now</h2></div>
-              <div class="mode-lockup"><span id="ops-mode" class="status-badge">LOADING</span><small id="ops-generated-at">Awaiting operator read model</small></div>
-            </div>
-            <div class="operations-grid" id="operations-grid" aria-live="polite"></div>
-            <div class="operations-attention" id="operations-attention"></div>
+        <section class="page" id="overview-page" data-page="overview">
+          <section class="system-banner" id="system-banner">
+            <div><span class="status-orb"></span><div><span class="eyebrow">SYSTEM STATE</span><h2 id="system-label">LOADING</h2><p id="system-detail">Reading the control plane…</p></div></div>
+            <div class="next-action"><span>NEXT EVENT</span><strong id="next-action">—</strong></div>
           </section>
-          <article class="panel portfolio-summary-panel">
-            <div class="panel-header">
-              <div><span class="section-kicker">ALPACA PAPER ACCOUNT</span><h2>Portfolio monitor</h2><div class="selected-meta" id="portfolio-updated"></div></div>
-              <div class="panel-actions"><span class="status-badge" id="portfolio-market-status">DISCONNECTED</span><button class="button compact" id="portfolio-refresh-button">Refresh account</button></div>
-            </div>
-            <div class="portfolio-alert" id="portfolio-alert"></div>
-            <div class="account-chart-grid">
-              <article class="account-chart-card">
-                <div class="account-chart-head"><div><span>ACCOUNT P/L</span><strong id="account-pnl-value">—</strong></div><small>3 MONTHS · DAILY</small></div>
-                <svg id="account-pnl-chart" viewBox="0 0 720 240" role="img" aria-label="Alpaca account profit and loss history"></svg>
-              </article>
-              <article class="account-chart-card">
-                <div class="account-chart-head"><div><span>ROLLING SHARPE</span><strong id="account-sharpe-value">—</strong></div><small>20-SESSION WINDOW</small></div>
-                <svg id="account-sharpe-chart" viewBox="0 0 720 240" role="img" aria-label="Alpaca account rolling Sharpe ratio"></svg>
-              </article>
-            </div>
-            <div class="account-metric-grid" id="account-metric-grid"></div>
-          </article>
 
-          <div class="portfolio-grid">
-            <article class="panel positions-panel">
-              <div class="panel-header simple"><div><span class="section-kicker">OPEN POSITIONS</span><h2>Current holdings</h2></div><span class="mono" id="position-count">0 POSITIONS</span></div>
-              <div class="table-scroll"><table class="portfolio-table"><thead><tr><th>Symbol</th><th>Attribution</th><th>Side / qty</th><th>Average entry</th><th>Current</th><th>Market value</th><th>Unrealized P/L</th></tr></thead><tbody id="position-table"></tbody></table></div>
-              <div class="empty-state" id="positions-empty">Connect Alpaca to load positions.</div>
+          <section class="alert-stack" id="alert-stack" aria-live="polite"></section>
+
+          <section class="account-hero panel">
+            <header class="panel-heading"><div><span class="eyebrow">ALPACA PAPER ACCOUNT</span><h2>Account performance</h2></div><span id="account-connection" class="quiet-badge">CONNECTING</span></header>
+            <div class="metric-grid account-metrics">
+              <article><span>P&amp;L</span><strong id="metric-pnl">—</strong><small id="metric-pnl-pct">—</small></article>
+              <article><span>ROLLING SHARPE</span><strong id="metric-sharpe">—</strong><small>20 observations</small></article>
+              <article><span>EQUITY</span><strong id="metric-equity">—</strong><small>paper account</small></article>
+              <article><span>MAX DRAWDOWN</span><strong id="metric-drawdown">—</strong><small>observed history</small></article>
+              <article><span>CASH</span><strong id="metric-cash">—</strong><small>available balance</small></article>
+              <article><span>GROSS EXPOSURE</span><strong id="metric-exposure">—</strong><small id="metric-net-exposure">— net</small></article>
+            </div>
+            <div class="chart-pair">
+              <article class="chart-card"><div class="chart-head"><span>ACCOUNT P&amp;L</span><strong id="account-delta">—</strong></div><svg id="account-pnl-chart" viewBox="0 0 920 310" role="img" aria-label="Paper account profit and loss"></svg></article>
+              <article class="chart-card narrow"><div class="chart-head"><span>ROLLING SHARPE</span><strong id="sharpe-now">—</strong></div><svg id="account-sharpe-chart" viewBox="0 0 520 310" role="img" aria-label="Paper account rolling Sharpe"></svg></article>
+            </div>
+          </section>
+
+          <section class="panel strategy-book">
+            <header class="panel-heading"><div><span class="eyebrow">ACTIVE PAPER BOOK</span><h2>Incubation + Paper Market</h2></div><button class="text-button" id="overview-legend-button" aria-expanded="false">Show legend</button></header>
+            <div class="chart-legend" id="overview-legend" hidden></div>
+            <svg class="large-chart" id="overview-strategy-chart" viewBox="0 0 1200 390" role="img" aria-label="Active strategy equity curves"></svg>
+            <p class="chart-hint">Select a curve or open a strategy to focus it.</p>
+          </section>
+
+          <section class="pipeline-panel panel">
+            <header class="panel-heading compact"><div><span class="eyebrow">AUTONOMOUS PIPELINE</span><h2>Where the work is</h2></div></header>
+            <div class="pipeline-strip" id="pipeline-strip"></div>
+          </section>
+
+          <section class="overview-lower">
+            <article class="panel current-work">
+              <header class="panel-heading"><div><span class="eyebrow">CURRENT WORK</span><h2 id="work-title">Waiting</h2><p id="work-detail">No work is running.</p></div><span class="live-pill"><i></i><span id="work-kind">IDLE</span></span></header>
+              <div class="work-visual" id="work-visual"><svg id="work-chart" viewBox="0 0 760 330" aria-label="Current autonomous work"></svg></div>
             </article>
-
-            <article class="panel orders-panel">
-              <div class="panel-header simple"><div><span class="section-kicker">OPEN ORDERS</span><h2>Working paper orders</h2></div><span class="mono" id="order-count">0 ORDERS</span></div>
-              <div class="table-scroll"><table class="portfolio-table"><thead><tr><th>Symbol</th><th>Source</th><th>Side / type</th><th>Quantity</th><th>Filled</th><th>Status</th><th>Submitted</th></tr></thead><tbody id="order-table"></tbody></table></div>
-              <div class="empty-state" id="orders-empty">Connect Alpaca to load open orders.</div>
+            <article class="panel decisions-card">
+              <header class="panel-heading compact"><div><span class="eyebrow">RECENT DECISIONS</span><h2>Supervisor tape</h2></div></header>
+              <div class="decision-list" id="decision-list"></div>
             </article>
-          </div>
-          <p class="portfolio-footnote">All execution shown here is Alpaca paper trading. IEX is a limited venue feed, not the consolidated SIP feed. Position attribution is conservative: Alpaca combines all shares of the same symbol, so a symbol touched by both you and Axiom is marked mixed.</p>
+          </section>
         </section>
 
-        <section class="desk-observer" id="desk-observer" hidden aria-label="Lifecycle evidence summary"></section>
+        <section class="page" id="strategies-page" data-page="strategies" hidden>
+          <section class="strategy-browser panel">
+            <header class="panel-heading"><div><span class="eyebrow">STRATEGY BOOK</span><h2>Research through Paper Market</h2><p>Retired strategies stay hidden until you ask for them.</p></div><span id="strategy-total" class="quiet-badge">0 STRATEGIES</span></header>
+            <div class="filter-row" id="strategy-filters" role="group" aria-label="Strategy stage filter"></div>
+            <div class="chart-toolbar"><span id="strategy-chart-label">ACTIVE CURVES</span><div><button class="text-button" id="strategy-show-all" hidden>Show all</button><button class="text-button" id="strategy-legend-button" aria-expanded="false">Show legend</button></div></div>
+            <div class="chart-legend" id="strategy-legend" hidden></div>
+            <svg class="large-chart" id="strategy-chart" viewBox="0 0 1200 400" role="img" aria-label="Filtered strategy equity curves"></svg>
+            <div class="table-wrap"><table><thead><tr><th>Strategy</th><th>Stage</th><th>Return</th><th>Sharpe</th><th>Drawdown</th><th>Score</th><th>Evidence</th></tr></thead><tbody id="strategy-table"></tbody></table></div>
+            <button class="button subdued load-more" id="strategy-load-more" hidden>Load more</button>
+            <div class="empty-state" id="strategy-empty" hidden>No strategies in this stage yet.</div>
+          </section>
 
-        <section class="main-grid" id="strategy-overview" hidden>
-          <article class="panel performance-panel">
-            <div class="panel-header">
-              <div>
-                <span class="section-kicker">SELECTED STRATEGY</span>
-                <h2 id="selected-name">Choose a strategy</h2>
-                <div class="selected-meta" id="selected-meta"></div>
+          <section class="strategy-detail" id="strategy-detail" hidden>
+            <article class="panel detail-hero">
+              <header class="panel-heading"><div><span class="eyebrow" id="detail-id">STRATEGY</span><h2 id="detail-name">—</h2><p id="detail-explanation">—</p></div><div class="detail-actions"><span id="detail-status" class="quiet-badge">—</span><button class="button subdued" id="pause-strategy-button">Pause strategy</button></div></header>
+              <div class="metric-grid detail-metrics" id="detail-metrics"></div>
+              <div class="incubation-progress" id="incubation-progress" hidden></div>
+              <div class="timeline" id="lifecycle-timeline"></div>
+            </article>
+            <details class="panel research-details">
+              <summary><span><span class="eyebrow">RESEARCH DETAILS</span><strong>DNA, provenance and generalization</strong></span><i>+</i></summary>
+              <div class="research-grid">
+                <article><header><span>POSITION SIZE</span><strong id="position-size-label">—</strong></header><div class="position-bar"><i id="position-size-bar"></i></div></article>
+                <article class="surface-card"><header><span>PARAMETER SURFACE</span><small>Drag to rotate</small></header><svg id="dna-surface" viewBox="0 0 620 390" aria-label="Rotatable three-dimensional parameter surface"></svg></article>
+                <article><header><span>GENERALIZATION</span><small>Regime balance</small></header><svg id="generalization-chart" viewBox="0 0 480 390" aria-label="Multidimensional generalization plot"></svg></article>
+                <article class="provenance-card"><header><span>PROVENANCE</span><small>Reproducible evidence</small></header><div id="provenance-content"></div></article>
               </div>
-              <div class="panel-actions">
-                <span class="status-badge" id="selected-status">—</span>
-                <button class="button compact" id="show-all-curves-button" hidden>Show all curves</button>
-                <button class="button compact" id="reproduce-button" disabled>Reproduce DNA</button>
-              </div>
-            </div>
-            <div class="strategy-filter-strip" id="strategy-filters" role="group" aria-label="Filter strategies" hidden></div>
-            <div class="metric-row" id="metric-row"></div>
-            <div class="chart-wrap">
-              <div class="chart-labels"><span id="chart-title">OUT-OF-SAMPLE EQUITY</span><div class="chart-label-actions"><button type="button" class="chart-legend-toggle" id="curve-legend-button" aria-controls="market-chart-legend" aria-expanded="false" hidden>Show legend</button><span id="chart-delta">—</span></div></div>
-              <div class="market-chart-legend" id="market-chart-legend" hidden></div>
-              <svg id="equity-chart" viewBox="0 0 900 255" role="img" aria-label="Strategy equity curve chart"></svg>
-            </div>
-          </article>
+            </details>
+          </section>
         </section>
 
-        <section class="logs-dashboard" id="logs-dashboard" hidden aria-label="Supervisor decision logs">
-          <article class="panel logs-panel">
-            <div class="panel-header">
-              <div><span class="section-kicker">SUPERVISOR TAPE</span><h2>System decision log</h2><div class="selected-meta"><span>GENERATION</span><span>REVIEW</span><span>VALIDATION</span><span>MARKET</span></div></div>
-              <div class="logs-header-meta"><strong id="log-count">0</strong><small>EVENTS LOADED</small><span class="live-marker"><i></i>PRIVATE</span></div>
-            </div>
-            <div class="log-controls"><label>TYPE <select id="log-category"><option value="">ALL</option><option value="lifecycle">LIFECYCLE</option><option value="incident">INCIDENT</option><option value="audit">AUDIT</option><option value="backtest_error">BACKTEST ERROR</option></select></label><button class="button compact" id="load-more-logs" hidden>Load more</button></div>
-            <div class="audit-feed" id="audit-feed" aria-live="polite"></div>
-          </article>
-        </section>
-
-        <section class="panel roster-panel" id="strategy-roster" hidden>
-          <div class="panel-header roster-heading">
-            <div>
-              <span class="section-kicker">STRATEGY ROSTER</span>
-              <h2 id="roster-title">All research units</h2>
-            </div>
-            <div class="roster-summary"><span id="average-score">—</span><small>AVG SCORE</small></div>
+        <section class="page advanced-page" id="advanced-page" data-page="advanced" hidden>
+          <section class="advanced-warning"><div><span>⚙</span><div><strong>Advanced operator controls</strong><p>Infrastructure, evidence and safety tools. Normal automation does not require anything here.</p></div></div><span class="quiet-badge">ADMIN ONLY</span></section>
+          <div class="advanced-tabs" id="advanced-tabs" role="tablist">
+            <button data-advanced="health" class="active">System</button><button data-advanced="logs">Logs</button><button data-advanced="execution">Orders &amp; trades</button><button data-advanced="evidence">Trials &amp; artifacts</button><button data-advanced="controls">Controls</button>
           </div>
-          <div class="table-scroll">
-            <table>
-              <thead><tr><th>Unit</th><th>Archetype / market</th><th>Stage</th><th>Evidence</th><th>Sharpe</th><th>Max DD</th><th>Score</th><th></th></tr></thead>
-              <tbody id="strategy-table"></tbody>
-            </table>
-          </div>
-          <div class="empty-state" id="empty-state" hidden>No strategies match this desk.</div>
-        </section>
-
-        <section class="detail-grid" id="strategy-detail" hidden>
-          <aside class="strategy-context-strip" id="strategy-context-strip" hidden></aside>
-          <article class="panel evidence-panel" id="strategy-evidence-panel">
-            <div class="panel-header simple"><div><span class="section-kicker">EVIDENCE CHAIN</span><h2>What this result actually means</h2></div><span class="mono" id="evidence-context">NO STRATEGY</span></div>
-            <div class="evidence-content" id="evidence-content"><div class="empty-state">Select a strategy to inspect its evidence and provenance.</div></div>
-          </article>
-          <article class="panel dna-panel">
-            <div class="panel-header simple"><div><span class="section-kicker">STRATEGY DNA</span><h2>Blueprint & lineage</h2></div><span class="mono" id="selected-id">—</span></div>
-            <div id="dna-content" class="dna-content"></div>
-          </article>
-          <article class="panel regime-panel">
-            <div class="panel-header simple"><div><span class="section-kicker">REGIME FITNESS</span><h2>Generalization map</h2></div><span class="mono">4 / 4 SCENARIOS</span></div>
-            <div id="regime-content" class="regime-content"></div>
-          </article>
+          <section class="advanced-section" data-advanced-section="health"><div class="advanced-grid" id="advanced-health"></div></section>
+          <section class="advanced-section" data-advanced-section="logs" hidden><div class="advanced-list" id="advanced-logs"></div></section>
+          <section class="advanced-section" data-advanced-section="execution" hidden><div class="split-lists"><article class="panel"><header><h2>Paper orders</h2></header><div id="advanced-orders"></div></article><article class="panel"><header><h2>Paper trades</h2></header><div id="advanced-trades"></div></article></div></section>
+          <section class="advanced-section" data-advanced-section="evidence" hidden><div class="split-lists"><article class="panel"><header><h2>Research trials</h2></header><div id="advanced-trials"></div></article><article class="panel"><header><h2>Artifacts</h2></header><div id="advanced-artifacts"></div></article></div></section>
+          <section class="advanced-section" data-advanced-section="controls" hidden>
+            <div class="control-grid">
+              <article class="panel"><header><span class="eyebrow">GRANULAR PAUSES</span><h2>Subsystem controls</h2></header><div class="control-buttons"><button data-control="research" class="button subdued">Pause research</button><button data-control="release" class="button subdued">Pause releases</button><button data-control="execution" class="button subdued">Pause execution</button></div></article>
+              <article class="panel"><header><span class="eyebrow">APPROVAL</span><h2>Approve an exact hash</h2></header><form id="approval-form" class="approval-form"><select id="approval-kind"><option value="configuration">Configuration</option><option value="universe">Universe</option><option value="policy">Policy</option></select><input id="approval-hash" placeholder="64-character SHA-256" minlength="64" maxlength="64" required><button class="button subdued">Approve</button></form></article>
+              <article class="panel"><header><span class="eyebrow">STRATEGY OPERATIONS</span><h2>Recovery and retirement</h2></header><form id="strategy-action-form" class="approval-form"><input id="advanced-strategy-id" placeholder="Strategy ID" required><div class="control-buttons"><button type="button" data-strategy-action="retry_operational" class="button subdued">Retry</button><button type="button" data-strategy-action="resume_strategy" class="button subdued">Resume</button><button type="button" data-strategy-action="quarantine_strategy" class="button subdued">Quarantine</button><button type="button" data-strategy-action="retire_strategy" class="button emergency">Retire</button></div></form></article>
+              <article class="panel danger-zone"><header><span class="eyebrow">WORKSPACE</span><h2>Nonproduction reset</h2></header><p>Prepare a server manifest, then confirm deletion of snapshots, artifacts and application state.</p><button class="button emergency" id="open-reset-button">Reset workspace…</button></article>
+            </div>
+          </section>
         </section>
       </main>
-      <footer><span>AXIOM v0.1 / DETERMINISTIC SEED <b id="seed-value">—</b></span><span>RESEARCH & PAPER SIMULATION ONLY — NOT INVESTMENT ADVICE</span></footer>
+
+      <footer><span>AXIOM · AUTONOMOUS PAPER RESEARCH</span><span>NOT INVESTMENT ADVICE · NO REAL-MONEY EXECUTION</span></footer>
     </div>
   </div>
-  <aside class="safety-dock" id="safety-dock" aria-label="Persistent safety controls">
-    <div><span>SAFETY CONTROLS</span><small id="command-receipt">No command pending</small></div>
-    <button class="dock-button" id="ops-research-toggle" data-command="pause_research">Pause research</button>
-    <button class="dock-button" id="ops-release-toggle" data-command="pause_release">Pause release</button>
-    <button class="dock-button" id="ops-execution-toggle" data-command="pause_execution">Pause execution</button>
-    <button class="dock-button" id="ops-approval-button">Approve hash</button>
-    <button class="dock-button warning" id="ops-cancel-button" data-command="cancel_open_orders">Cancel orders</button>
-    <button class="dock-button danger" id="ops-flatten-button" data-command="flatten_all">Flatten managed</button>
-    <button class="dock-button danger solid" id="ops-kill-button" data-command="kill_switch">Kill + flatten</button>
-  </aside>
-  <dialog class="reset-dialog" id="reset-dialog" aria-labelledby="reset-title">
-    <form method="dialog" id="reset-form">
-      <header><span class="section-kicker">DESTRUCTIVE / NONPRODUCTION ONLY</span><h2 id="reset-title">Reset the entire workspace</h2></header>
-      <p>This deletes application state, snapshots and artifacts identified by a server-generated manifest. Production is blocked by the server.</p>
-      <label>Re-enter admin token<input type="password" id="reset-admin-token" autocomplete="current-password" required></label>
-      <div class="reset-manifest" id="reset-manifest">Prepare a manifest before execution.</div>
-      <label>Type <strong>RESET NONPRODUCTION WORKSPACE</strong><input id="reset-confirmation" autocomplete="off" required></label>
-      <div class="dialog-actions"><button class="button" value="cancel">Cancel</button><button class="button" type="button" id="prepare-reset-button">Prepare manifest</button><button class="button danger" type="button" id="execute-reset-button" disabled>Execute reset</button></div>
+
+  <dialog id="emergency-dialog" class="modal emergency-modal">
+    <form method="dialog"><header><span class="eyebrow">EMERGENCY</span><h2>Protect the paper account</h2><p>These controls interrupt execution immediately and are logged.</p></header>
+      <div class="emergency-actions"><button type="button" data-emergency="cancel_open_orders"><strong>Cancel managed orders</strong><span>Leave positions unchanged</span></button><button type="button" data-emergency="flatten_all"><strong>Flatten managed positions</strong><span>Close Axiom-attributed exposure</span></button><button type="button" data-emergency="kill_switch" class="critical"><strong>Kill + flatten</strong><span>Stop execution and close managed exposure</span></button></div>
+      <button class="button subdued" value="cancel">Close</button></form>
+  </dialog>
+
+  <dialog id="reset-dialog" class="modal reset-modal">
+    <form method="dialog" id="reset-form"><header><span class="eyebrow">DESTRUCTIVE · NONPRODUCTION ONLY</span><h2>Reset this workspace</h2><p>The server will refuse this in production.</p></header>
+      <div class="reset-manifest" id="reset-manifest">Prepare a deletion manifest first.</div>
+      <label>Type <strong>RESET NONPRODUCTION WORKSPACE</strong><input id="reset-confirmation" autocomplete="off"></label>
+      <div class="modal-actions"><button class="button subdued" value="cancel">Cancel</button><button class="button subdued" type="button" id="prepare-reset-button">Prepare</button><button class="button emergency" type="button" id="execute-reset-button" disabled>Execute reset</button></div>
     </form>
   </dialog>
-  <div class="operation-overlay" id="operation-overlay" role="dialog" aria-modal="true" aria-labelledby="operation-title" tabindex="-1" hidden>
-    <section class="operation-terminal" id="operation-terminal">
-      <div class="operation-scanline" aria-hidden="true"></div>
-      <header class="operation-header">
-        <span id="operation-code">PROCESS / IDLE</span>
-        <span class="operation-status"><i></i><span id="operation-state">RUNNING</span></span>
-      </header>
-      <div class="operation-grid">
-        <div class="operation-visual" aria-hidden="true">
-          <i class="operation-ring ring-one"></i>
-          <i class="operation-ring ring-two"></i>
-          <i class="operation-ring ring-three"></i>
-          <span class="operation-particle particle-one"></span>
-          <span class="operation-particle particle-two"></span>
-          <span class="operation-particle particle-three"></span>
-          <strong class="operation-glyph" id="operation-glyph">DNA</strong>
-          <svg class="operation-equity-chart" id="operation-equity-chart" viewBox="0 0 360 220" preserveAspectRatio="xMidYMid meet"></svg>
-          <span class="operation-curve-caption" id="operation-curve-caption" hidden></span>
-        </div>
-        <div class="operation-copy">
-          <span class="section-kicker" id="operation-kicker">STRATEGY SYNTHESIS</span>
-          <h2 id="operation-title">Generating strategy DNA</h2>
-          <p id="operation-description">Constructing new research units from first principles.</p>
-          <div class="operation-steps" id="operation-steps"></div>
-        </div>
-      </div>
-      <footer class="operation-footer">
-        <div><span id="operation-current-step">INITIALIZING</span><strong id="operation-progress-label">0%</strong></div>
-        <span class="operation-progress"><i id="operation-progress"></i></span>
-      </footer>
-    </section>
-  </div>
   <div class="toast" id="toast" role="status" aria-live="polite"></div>
   <script src="/assets/app.js"></script>
 </body>

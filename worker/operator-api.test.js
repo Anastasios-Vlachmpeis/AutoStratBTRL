@@ -53,6 +53,14 @@ test("kill, stale data, and disabled switches enumerate exact independent risk b
   for (const code of ["kill_switch", "market_data_unhealthy", "paper_trading_disabled"]) assert.ok(result.mode.blocked_reasons.includes(code));
 });
 
+test("product autonomy pause is visible without pretending monitoring is stopped", () => {
+  const state = fixture(); state.orchestration.controls.autonomy_paused = true;
+  const result = buildOperationsReadModel(state, enabled);
+  assert.equal(result.mode.code, "paused");
+  assert.ok(result.mode.blocked_reasons.includes("autonomy_pause"));
+  assert.equal(result.controls.kill_switch, undefined);
+});
+
 test("opaque pagination is deterministic, bounded, and rejects stale cursors", () => {
   const items = Array.from({ length: 250 }, (_, index) => ({ id: `I-${index}` }));
   const first = paginateOperatorItems(items, { limit: 100, kind: "fixture" });

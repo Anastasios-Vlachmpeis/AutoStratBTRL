@@ -30,7 +30,7 @@ const iso = (value) => {
 function globalMode(state, env) {
   const controls = state.orchestration?.controls ?? {};
   if (controls.kill_switch || controls.flatten_requested) return "kill_flatten";
-  if (controls.global_paused || controls.execution_paused) return "paused";
+  if (controls.global_paused || controls.execution_paused || controls.autonomy_paused) return "paused";
   const broker = String(env.ALPACA_BROKER_MODE ?? "shadow").toLowerCase();
   if (broker === "canary" && bool(env.ALPACA_CANARY_TRADING_ENABLED)) return "paper_canary";
   if (state.orchestration?.mode === "autonomous" && bool(env.ALPACA_TRADING_ENABLED)) return "autonomous_paper";
@@ -44,6 +44,7 @@ function riskReasons(state, env) {
   if (controls.flatten_requested) reasons.push("flatten_in_progress");
   if (controls.global_paused) reasons.push("global_pause");
   if (controls.execution_paused) reasons.push("execution_pause");
+  if (controls.autonomy_paused) reasons.push("autonomy_pause");
   if (controls.entries_paused) reasons.push("entry_cutoff");
   if (state.alpaca?.risk_session?.halted) reasons.push("daily_loss_halt");
   if (!state.alpaca?.connected) reasons.push("alpaca_disconnected");

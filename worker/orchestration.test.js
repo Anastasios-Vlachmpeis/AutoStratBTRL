@@ -77,6 +77,44 @@ test("research and release pauses block only their own autonomous actions", () =
   assert.equal(applyOrchestrationCommand(state, command("record_monitoring_observations")).result.status, "applied");
 });
 
+test("autonomy pause blocks new work and risk while supervision and reductions continue", () => {
+  const paused = applyOrchestrationCommand(emptyOrchestrationState(), command("pause_autonomy", {
+    actor: "operator:product", correlation_id: "autonomy:paused:test",
+  }));
+  assert.equal(paused.state.controls.autonomy_paused, true);
+  assert.equal(applyOrchestrationCommand(paused.state, command("run_daily_cohort")).result.reason, "autonomy_paused");
+  for (const kind of ["pipeline_review", "pipeline_validate", "pipeline_incubation"]) {
+    assert.equal(applyOrchestrationCommand(paused.state, command(kind)).result.reason, "autonomy_paused", kind);
+  }
+  assert.equal(applyOrchestrationCommand(paused.state, command("pipeline_release")).result.reason, "autonomy_paused");
+  const targets = applyOrchestrationCommand(paused.state, command("compute_released_targets"));
+  assert.equal(targets.result.status, "applied");
+  assert.equal(targets.result.actions[0].block_new_risk, true);
+  for (const kind of ["record_monitoring_observations", "pipeline_monitor", "stop_entries",
+    "cancel_unsafe_orders", "flatten_positions", "verify_flat"]) {
+    assert.equal(applyOrchestrationCommand(paused.state, command(kind)).result.status, "applied", kind);
+  }
+});
+
+test("autonomy resume preserves every independent safety control", () => {
+  let state = applyOrchestrationCommand(emptyOrchestrationState(), command("pause_autonomy", {
+    actor: "operator:product", correlation_id: "autonomy:pause:guards",
+  })).state;
+  state.controls.research_paused = true; state.controls.release_paused = true; state.controls.entries_paused = true;
+  const resumed = applyOrchestrationCommand(state, command("resume_autonomy", {
+    actor: "operator:product", correlation_id: "autonomy:resume:guards",
+  }));
+  assert.equal(resumed.result.status, "applied"); assert.equal(resumed.state.controls.autonomy_paused, false);
+  assert.equal(resumed.state.controls.research_paused, true); assert.equal(resumed.state.controls.release_paused, true);
+  assert.equal(resumed.state.controls.entries_paused, true);
+  state = resumed.state; state.controls.autonomy_paused = true; state.controls.execution_paused = true;
+  const blocked = applyOrchestrationCommand(state, command("resume_autonomy", {
+    actor: "operator:product", correlation_id: "autonomy:resume:blocked",
+  }));
+  assert.equal(blocked.result.status, "blocked"); assert.equal(blocked.result.reason, "execution_paused");
+  assert.equal(blocked.state.controls.autonomy_paused, true);
+});
+
 test("blocked stable intents remain retryable after their scoped pause is lifted", () => {
   const daily = command("run_daily_cohort", { intent_id: "cohort:2026-08-05" });
   let state = applyOrchestrationCommand(emptyOrchestrationState(), command("pause_research", { actor: "operator:admin" })).state;

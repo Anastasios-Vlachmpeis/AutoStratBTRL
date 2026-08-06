@@ -16,6 +16,7 @@ export const ROUTINE_COMMANDS = Object.freeze([
 
 export const OPERATOR_COMMANDS = Object.freeze([
   "global_pause", "global_resume", "kill_switch", "clear_kill_switch", "flatten_all",
+  "pause_autonomy", "resume_autonomy",
   "pause_research", "resume_research", "pause_ingestion", "resume_ingestion", "pause_release", "resume_release",
   "pause_execution", "resume_execution", "cancel_open_orders", "retry_operational", "quarantine_strategy", "retire_strategy",
   "pause_strategy", "resume_strategy",
@@ -41,6 +42,7 @@ export function emptyOrchestrationState(mode = "observe") {
     version: 0,
     controls: {
       global_paused: false, kill_switch: false, flatten_requested: false, entries_paused: false,
+      autonomy_paused: false,
       research_paused: false, ingestion_paused: false, release_paused: false, execution_paused: false,
     },
     completed_intent_ids: [], command_results: {}, latest_command_id: null, latest_watchdog_at: null,
@@ -127,9 +129,13 @@ function routineActions(current, command) {
     case "close_valid_day_ledger": current.valid_day_ledgers[payload.session_date ?? command.timestamp.slice(0, 10)] = { status: "closed", command_id: command.command_id, closed_at: command.timestamp }; return result(command, "applied");
     case "generate_daily_report": return result(command, "applied", [{ kind: "report.generate_daily", payload }]);
     case "schedule_bounded_research":
-      return controls.research_paused ? result(command, "blocked", [], "research_paused") : result(command, "applied", [{ kind: "research.schedule", payload }]);
+      return controls.research_paused || controls.autonomy_paused
+        ? result(command, "blocked", [], controls.autonomy_paused ? "autonomy_paused" : "research_paused")
+        : result(command, "applied", [{ kind: "research.schedule", payload }]);
     case "run_daily_cohort":
-      return controls.research_paused ? result(command, "blocked", [], "research_paused") : result(command, "applied", [{ kind: "research.run_cohort", payload }]);
+      return controls.research_paused || controls.autonomy_paused
+        ? result(command, "blocked", [], controls.autonomy_paused ? "autonomy_paused" : "research_paused")
+        : result(command, "applied", [{ kind: "research.run_cohort", payload }]);
     case "weekly_operational_diversity_review": return result(command, "applied", [{ kind: "review.weekly", payload }]);
     case "compute_incubation_targets": case "compute_released_targets":
       if (controls.kill_switch || controls.execution_paused) {
@@ -140,12 +146,15 @@ function routineActions(current, command) {
       }
       return result(command, "applied", [{ kind: "pipeline.compute_targets",
         scope: command.kind === "compute_incubation_targets" ? "incubation" : "released",
-        block_new_risk: controls.entries_paused, payload }]);
+        block_new_risk: controls.entries_paused || controls.autonomy_paused, payload }]);
     case "record_monitoring_observations": return result(command, "applied", [{ kind: "pipeline.monitor", payload }]);
-    case "pipeline_review": return result(command, "applied", [{ kind: "pipeline.review", payload }]);
-    case "pipeline_validate": return result(command, "applied", [{ kind: "pipeline.validate", payload }]);
-    case "pipeline_incubation": return result(command, "applied", [{ kind: "pipeline.incubation", payload }]);
-    case "pipeline_release": return controls.release_paused ? result(command, "blocked", [], "release_paused") : result(command, "applied", [{ kind: "pipeline.release", payload }]);
+    case "pipeline_review": case "pipeline_validate": case "pipeline_incubation":
+      if (controls.autonomy_paused) return result(command, "blocked", [], "autonomy_paused");
+      return result(command, "applied", [{ kind: command.kind === "pipeline_review" ? "pipeline.review"
+        : command.kind === "pipeline_validate" ? "pipeline.validate" : "pipeline.incubation", payload }]);
+    case "pipeline_release": return controls.release_paused || controls.autonomy_paused
+      ? result(command, "blocked", [], controls.autonomy_paused ? "autonomy_paused" : "release_paused")
+      : result(command, "applied", [{ kind: "pipeline.release", payload }]);
     case "pipeline_monitor": return result(command, "applied", [{ kind: "pipeline.monitor", payload }]);
     default: throw new TypeError(`Unhandled routine command: ${command.kind}`);
   }
@@ -156,6 +165,13 @@ function operatorActions(current, command) {
   switch (command.kind) {
     case "global_pause": controls.global_paused = true; return result(command, "applied");
     case "global_resume": controls.global_paused = false; return result(command, "applied");
+    case "pause_autonomy": controls.autonomy_paused = true; return result(command, "applied");
+    case "resume_autonomy":
+      if (controls.kill_switch || controls.execution_paused) {
+        return result(command, "blocked", [], controls.kill_switch ? "kill_switch" : "execution_paused");
+      }
+      controls.autonomy_paused = false;
+      return result(command, "applied");
     case "kill_switch": controls.kill_switch = true; controls.execution_paused = true;
       controls.entries_paused = true; controls.flatten_requested = true;
       return result(command, "applied", [{ kind: "broker.cancel_unsafe_orders", payload }, { kind: "broker.flatten_all", payload }]);
