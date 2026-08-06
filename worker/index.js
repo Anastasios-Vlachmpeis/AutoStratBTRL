@@ -79,6 +79,7 @@ import { incrementOperationalMetric, operationalHealth, recordHeartbeat, recordO
 import { advanceRolloutPhase, ensureRolloutState, recordDomainCutover, recordRolloutEvidence } from "./rollout.js";
 import { createRollbackBundle, rehearseRollback } from "./rollback.js";
 import { RolloutStore } from "./rollout-store.js";
+import { assertImmediateDeploymentBoundary } from "./future-gates.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
@@ -415,6 +416,7 @@ async function submitOperatorPipelineCommand(stub, kind, payload = {}) {
 export class AxiomLab extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
+    assertImmediateDeploymentBoundary(env);
     this.ctx = ctx;
     this.env = env;
     this.controlPlane = createControlPlaneRuntime(ctx.storage, env, SINGLETON_NAME);
@@ -2837,6 +2839,8 @@ export default {
   async fetch(request, env) {
     const url = new URL(request.url);
     if (url.pathname.startsWith("/api/")) {
+      try { assertImmediateDeploymentBoundary(env); }
+      catch (error) { return json({ error: error.message, code: "deployment_boundary_violation" }, 503); }
       if (["/api/backtest-artifacts/", "/api/research-artifacts/", "/api/v1/artifacts/"].some((prefix) => url.pathname.startsWith(prefix))
           && !isStrictlyAuthorized(request, env)) {
         return json({ error: "Configured admin token required for private artifacts" }, 401);
@@ -2877,6 +2881,7 @@ export default {
   },
 
   async scheduled(controller, env, ctx) {
+    assertImmediateDeploymentBoundary(env);
     const stub = labStub(env);
     const work = [];
     const hasBrokerCredentials = Boolean(env.ALPACA_API_KEY && env.ALPACA_API_SECRET);
@@ -2923,6 +2928,7 @@ export default {
   },
 
   async queue(batch, env) {
+    assertImmediateDeploymentBoundary(env);
     await consumeArchitectureQueue(batch, env);
   },
 };

@@ -25,6 +25,9 @@
   "triggers": { "crons": ["* * * * *", "0 * * * *"] },
   "vars": {
     "ENVIRONMENT": "production-paper",
+    "TRADING_ENVIRONMENT": "paper",
+    "BROKER_ACCOUNT_CLASS": "paper",
+    "DATA_FEED_VERSION": "alpaca-iex-5min-adjusted-v1",
     "ORCHESTRATION_MODE": "observe",
     "CONTROL_PLANE_MODE": "dual_write",
     "NORMALIZED_STORAGE_ENABLED": "true",

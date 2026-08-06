@@ -111,6 +111,7 @@ class DatasetManifest(BaseModel):
     end: str
     bar_count: int = Field(ge=1)
     sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    feed: Literal["iex"] = "iex"
 
 
 class StrategyDNA(BaseModel):

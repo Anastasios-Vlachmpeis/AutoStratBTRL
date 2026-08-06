@@ -49,9 +49,19 @@ test("broker plan is journaled before submission with deterministic idempotency"
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO risk_actions")));
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO broker_intents")));
   assert.ok(db.calls.some((call) => call.sql.includes("INSERT INTO broker_intent_allocations")));
+  const registryIndex = db.calls.findIndex((call) => call.sql.includes("INSERT INTO paper_broker_accounts"));
+  const intentIndex = db.calls.findIndex((call) => call.sql.includes("INSERT INTO broker_intents"));
+  assert.ok(registryIndex >= 0 && registryIndex < intentIndex);
   const orderCalls = db.calls.filter((call) => call.sql.includes("INSERT INTO orders"));
   assert.equal(orderCalls.length, 2);
   assert.equal(orderCalls[0].args[1], orderCalls[1].args[1]);
+});
+
+test("broker journal rejects non-paper account namespaces", async () => {
+  const db = new MemoryD1(), store = new BrokerStore(db, { clock });
+  await assert.rejects(store.persistPlan({ workspaceId: "workspace-1", plan: plan(),
+    brokerAccountId: "alpaca-live-primary" }), /paper account/);
+  assert.equal(db.calls.length, 0);
 });
 
 test("known partial fills are append-only and attributed; manual fills are isolated", async () => {

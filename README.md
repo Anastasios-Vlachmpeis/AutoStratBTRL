@@ -114,6 +114,12 @@ Paper reconciliation is capped at 0.5% absolute exposure per strategy and 10% po
 
 No live-money endpoint, hard-to-borrow locate, options, crypto, or browser-controlled risk-limit changes are included.
 
+The deployable configuration is additionally pinned by `TRADING_ENVIRONMENT=paper`,
+`BROKER_ACCOUNT_CLASS=paper`, `ALPACA_DATA_FEED=iex`, and
+`DATA_FEED_VERSION=alpaca-iex-5min-adjusted-v1`. API, scheduler, queue, broker,
+and persistence paths fail closed if those boundaries are relabeled. There is
+no configurable Alpaca live endpoint in this build.
+
 ## Cost and operations
 
 The runtime records daily provider usage and projects the calendar month against a USD 50 limit. At 50% it informs; at 75% it halves new research and disables optional deep work; at 90% it pauses optional generation and backfills; at 100%, or when telemetry is stale/unavailable, optional cloud research stops. An already sealed validation may finish, while market-data safety and risk supervision remain active at every tier.
@@ -141,6 +147,31 @@ The Operations page shows the active phase and gate progress. Authenticated roll
 
 Rollback rehearsal writes a secret-free private replay bundle to R2, stores only hashes/metadata in D1, verifies the restore, and forces execution, entries, research, release, and global operation into paused state. Broker reconciliation and a fresh operator resume are mandatory after any real restore.
 
+## Future SIP and real-money gates
+
+SIP is represented as a separate versioned dataset and release lineage, never
+as a replacement string for IEX. A future SIP assessment requires a distinct
+three-year/40-symbol backfill, bar/volume/signal/target/fill/performance
+comparisons, rerun development plus sealed validation plus incubation, a
+precommitted bridge policy, preserved late-revision semantics, visible feed
+labels, and a revised cost projection. Even a passing assessment records only
+`ready_for_separate_sip_rollout`; it cannot switch the feed.
+
+Real-money readiness is likewise evidence-only. It requires sustained paper
+evidence across regimes; seven independent reviews; separate credentials,
+account, deployment, storage, queue, access and audit resources; materially
+tighter capital limits; manual releases; independent kill/flatten drills;
+fill/slippage calibration; formal model-change control; and an explicit user
+approval artifact. A passing result can only request a separate live design
+review. It never authorizes orders, and this repository contains no live-order
+adapter.
+
+Migration `0007_future_gates.sql` makes these boundaries durable: live release
+rows are rejected, broker rows require a registered `alpaca-paper-*` account,
+and future assessment tables are constrained to non-activating records. The
+Operations API exposes the current boundary and explicitly reports that no
+browser switch exists.
+
 ## Verification
 
 ```powershell
@@ -149,6 +180,8 @@ npm run test:incubation
 npm run test:plan13
 npm run test:plan14
 npm run test:plan14:coverage
+npm run test:plan15
+npm run test:plan15:coverage
 npm run scan:secrets
 python -m unittest discover -s tests -v
 ```
@@ -162,5 +195,10 @@ python -m pytest backtester_service/tests -q
 Before a reviewed remote deployment, run `.\scripts\plan13-smoke.ps1`. After deployment, pass `-BacktestServiceUrl` to include the public health endpoint. The script never deploys or submits an Alpaca order.
 
 The complete pre-rollout command is `.\scripts\plan14-verify.ps1`. Use `-SkipBacktester` only for local development when the pinned Python service dependencies are unavailable; it is forbidden for a staging or paper rollout decision.
+
+After Plan 14 passes, `.\scripts\plan15-verify.ps1` adds the paper/IEX boundary,
+SIP isolation, non-activating real-money assessment, database-trigger, and
+configuration tests. It accepts the same `-Python` and `-SkipBacktester`
+arguments; skipping Backtrader remains forbidden for any rollout decision.
 
 No repository push or cloud deployment is performed by the implementation or test commands above.

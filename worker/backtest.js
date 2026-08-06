@@ -1,6 +1,7 @@
 /** Cloudflare control-plane helpers for the remote Backtrader runner. */
 
 import { validateStrategyDNA } from "./dsl.js";
+import { IMMEDIATE_FEED } from "./future-gates.js";
 
 const encoder = new TextEncoder();
 const stable = (value) => {
@@ -323,6 +324,8 @@ function v2Windows(phase, barsBySymbol) {
  */
 export async function buildBacktestPayloadV2(phase, strategies, dataset, options = {}) {
   if (!["development", "holdout", "shadow"].includes(phase)) throw new Error("Unsupported v2 backtest phase");
+  const sourceFeed = String(dataset?.manifest?.feed?.name ?? dataset?.manifest?.feed ?? IMMEDIATE_FEED).toLowerCase();
+  if (sourceFeed !== IMMEDIATE_FEED) throw new Error("This Backtrader contract is pinned to the versioned IEX dataset");
   const actualPhase = phase === "shadow" ? "development" : phase;
   const bars_by_symbol = canonicalBarsBySymbol(phaseBars(dataset, actualPhase), { timeframe: dataset.manifest?.timeframe ?? "5Min" });
   const execution = approvedExecutionConfig(options.execution);

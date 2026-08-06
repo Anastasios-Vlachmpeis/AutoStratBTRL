@@ -39,6 +39,9 @@ test("operations DTO explains whether new paper risk is possible without exposin
   assert.equal(result.mode.new_risk_possible, true); assert.equal(result.market.feed, "IEX");
   assert.equal(result.market.consolidated_sip, false); assert.equal(result.data.expected_symbols, 40);
   assert.equal(result.rollout.phase, "A"); assert.equal(result.rollout.legacy_authoritative, true);
+  assert.equal(result.future_boundary.account_class, "paper");
+  assert.equal(result.future_boundary.live_money_supported, false);
+  assert.equal(result.future_boundary.browser_switch_available, false);
   assert.equal(JSON.stringify(result).includes("never-return"), false);
   assert.ok(result.attention.some((item) => item.code === "iex_not_consolidated"));
 });

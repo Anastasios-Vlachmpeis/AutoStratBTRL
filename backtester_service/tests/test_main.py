@@ -277,6 +277,13 @@ def test_v2_multi_symbol_is_deterministic_has_ideal_and_stress_artifacts():
     assert client.post("/v1/backtests/batch", content=raw, headers=headers).json()["result_hash"] == result["result_hash"]
 
 
+def test_v2_contract_rejects_sip_until_a_separate_service_is_reviewed():
+    body = v2_payload()
+    body["dataset"]["feed"] = "sip"
+    with pytest.raises(Exception, match="iex"):
+        BacktestRequestV2.model_validate(body)
+
+
 def test_v2_partial_fill_and_no_trade_metrics_are_finite():
     body = v2_payload(("SPY",))
     body["bars_by_symbol"]["SPY"] = v2_market("SPY", volume=.001)

@@ -18,6 +18,12 @@ for (const file of configurations) {
     assert.equal(config.vars.ALPACA_LONG_TRADING_ENABLED, "false");
     assert.equal(config.vars.ALPACA_SHORT_TRADING_ENABLED, "false");
     assert.equal(config.vars.ORCHESTRATION_MODE, "observe");
+    assert.equal(config.vars.TRADING_ENVIRONMENT, "paper");
+    assert.equal(config.vars.BROKER_ACCOUNT_CLASS, "paper");
+    assert.equal(config.vars.ALPACA_DATA_FEED, "iex");
+    assert.equal(config.vars.DATA_FEED_VERSION, "alpaca-iex-5min-adjusted-v1");
+    assert.equal(config.vars.ALPACA_LIVE_BASE_URL, undefined);
+    assert.equal(config.vars.LIVE_TRADING_ENABLED, undefined);
   });
 }
 

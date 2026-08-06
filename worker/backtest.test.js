@@ -183,6 +183,12 @@ test("v2 payload canonicalizes symbols and bars, with a stable immutable identit
     ["anchored-1", "anchored-2", "anchored-3", "rolling-1", "rolling-2", "rolling-3"]);
 });
 
+test("v2 Backtrader payload rejects SIP until a separate service contract exists", async () => {
+  const { strategy, dataset } = await v2Fixture();
+  const sip = structuredClone(dataset); sip.manifest.feed = { name: "sip", revision: "future" };
+  await assert.rejects(buildBacktestPayloadV2("development", [strategy], sip), /pinned.*IEX/);
+});
+
 test("v2 development payload physically excludes holdout and holdout mutation leaves it unchanged", async () => {
   const { strategy, dataset } = await v2Fixture();
   const first = await buildBacktestPayloadV2("development", [strategy], dataset);

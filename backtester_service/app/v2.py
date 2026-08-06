@@ -91,7 +91,9 @@ class DatasetManifestV2(BaseModel):
     schema_version: Literal[2] = 2
     snapshot_id: str = Field(min_length=1, max_length=200)
     timeframe: Literal["5Min"] = "5Min"
-    feed: str = Field(min_length=1, max_length=64)
+    # The deployable service is paired with the immediate IEX/paper control
+    # plane. SIP receives a separately reviewed service contract and dataset.
+    feed: Literal["iex"] = "iex"
     adjustment: Literal["all"] = "all"
     session: Literal["regular"] = "regular"
     universe_id: str = Field(min_length=1, max_length=200)

@@ -1,6 +1,7 @@
 import { hashCanonical } from "./dsl.js";
+import { assertPaperBrokerAccountId, PAPER_BROKER_ACCOUNT_ID } from "./future-gates.js";
 
-const BROKER_ACCOUNT_ID = "alpaca-paper-primary";
+const BROKER_ACCOUNT_ID = PAPER_BROKER_ACCOUNT_ID;
 const json = (value) => JSON.stringify(value ?? {});
 const signedQty = (position) => (position.side === "short" || Number(position.qty) < 0)
   ? -Math.abs(Number(position.qty)) : Math.abs(Number(position.qty));
@@ -21,11 +22,16 @@ export class BrokerStore {
 
   async persistPlan({ workspaceId, plan, brokerAccountId = BROKER_ACCOUNT_ID }) {
     if (!workspaceId || !plan?.scheduled_bucket) throw new Error("Workspace and scheduled broker bucket are required");
+    assertPaperBrokerAccountId(brokerAccountId);
     const observedAt = plan.fetched_at ?? plan.clock?.timestamp ?? this.now();
     const statements = [this.statement(`INSERT INTO workspaces
       (workspace_id,display_name,environment,status,created_at,updated_at) VALUES (?,?,?,?,?,?)
       ON CONFLICT(workspace_id) DO UPDATE SET updated_at=excluded.updated_at`,
-    workspaceId, workspaceId, "development", "active", observedAt, observedAt)];
+    workspaceId, workspaceId, "development", "active", observedAt, observedAt),
+    this.statement(`INSERT INTO paper_broker_accounts
+      (workspace_id,broker_account_id,provider,account_class,endpoint_class,record_schema,registered_at)
+      VALUES (?,?,?,?,?,?,?) ON CONFLICT(workspace_id,broker_account_id) DO NOTHING`,
+    workspaceId, brokerAccountId, "alpaca", "paper", "alpaca_paper_api", "axiom.paper-broker.v1", observedAt)];
 
     for (const contribution of plan.allocation?.contributions ?? []) {
       const identity = { bucket: plan.scheduled_bucket, strategy_id: contribution.strategy_id,
@@ -112,6 +118,7 @@ export class BrokerStore {
   }
 
   async persistExecution({ workspaceId, execution, brokerAccountId = BROKER_ACCOUNT_ID }) {
+    assertPaperBrokerAccountId(brokerAccountId);
     const receivedAt = this.now(); const statements = [];
     for (const order of execution.submitted_orders ?? []) {
       const terminal = ["filled", "canceled", "expired", "rejected"].includes(order.status)
@@ -171,6 +178,7 @@ export class BrokerStore {
   }
 
   async persistCancellations({ workspaceId, cancelled = [], brokerAccountId = BROKER_ACCOUNT_ID }) {
+    assertPaperBrokerAccountId(brokerAccountId);
     const at = this.now();
     await this.batch(cancelled.map((order) => this.statement(`UPDATE orders
       SET status='cancel_requested',terminal_at=COALESCE(terminal_at,?)

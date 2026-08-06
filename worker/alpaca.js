@@ -3,12 +3,15 @@ import { INITIAL_UNIVERSE_SYMBOLS } from "./universe.js";
 import { evaluateLatestTarget, hashCanonical } from "./dsl.js";
 import { allocatePortfolioRisk, dailyRiskState, riskPolicy, riskReducingTarget,
   sessionRiskPolicy } from "./risk-allocator.js";
+import { assertImmediateDeploymentBoundary, assertPaperOrderRequest,
+  PAPER_BROKER_ACCOUNT_ID } from "./future-gates.js";
 
 const PAPER_BASE = "https://paper-api.alpaca.markets";
 const DATA_BASE = "https://data.alpaca.markets";
 const SUPPORTED_SYMBOLS = [...INITIAL_UNIVERSE_SYMBOLS];
 
 function requireCredentials(env) {
+  assertImmediateDeploymentBoundary(env);
   if (!env.ALPACA_API_KEY || !env.ALPACA_API_SECRET) {
     throw new Error("Alpaca credentials are not configured");
   }
@@ -213,6 +216,7 @@ export async function getStockBars(env, symbols, {
   timeframe, start, end = new Date().toISOString(), limit = 10000,
   adjustment = "all", maxPages = 1000,
 }) {
+  const boundary = assertImmediateDeploymentBoundary(env);
   const allowed = [...new Set(symbols)].filter((symbol) => SUPPORTED_SYMBOLS.includes(symbol));
   if (!allowed.length) return {};
   const collected = Object.fromEntries(allowed.map((symbol) => [symbol, []]));
@@ -226,7 +230,7 @@ export async function getStockBars(env, symbols, {
       start,
       end,
       limit: String(limit),
-      feed: env.ALPACA_DATA_FEED || "iex",
+      feed: boundary.feed,
       adjustment,
       sort: "asc",
     });
@@ -354,6 +358,7 @@ function wholeSharesForNotional(notional, position) {
 }
 
 export function brokerActivation(env = {}, options = {}) {
+  assertImmediateDeploymentBoundary(env);
   const mode = ["off", "shadow", "canary", "paper"].includes(String(env.ALPACA_BROKER_MODE).toLowerCase())
     ? String(env.ALPACA_BROKER_MODE).toLowerCase() : "shadow";
   const global = env.ALPACA_TRADING_ENABLED === "true";
@@ -396,6 +401,10 @@ async function cancelOrder(env, order) {
 /** Execute a previously frozen broker plan. Runtime callers persist the plan
  * before invoking this function, so a crash can replay by client order ID. */
 export async function executePaperPlan(env, plan) {
+  assertImmediateDeploymentBoundary(env);
+  assertPaperOrderRequest({ account_class: plan.account_class ?? "paper",
+    trading_environment: plan.trading_environment ?? "paper",
+    broker_account_id: plan.broker_account_id ?? PAPER_BROKER_ACCOUNT_ID });
   const activation = plan.activation ?? brokerActivation(env, { canary: plan.canary });
   const safety = Boolean(plan.force_flatten || plan.daily_risk?.halted || plan.kill_switch);
   const cancelled = [];
