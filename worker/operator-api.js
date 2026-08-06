@@ -1,6 +1,7 @@
 import { hashCanonical } from "./dsl.js";
 import { costPublicSummary } from "./cost-controller.js";
 import { operationalHealth } from "./observability.js";
+import { publicRolloutState } from "./rollout.js";
 
 export const OPERATOR_READ_DTO_VERSION = "axiom.operator-read.v1";
 export const OPERATOR_PAGE_DTO_VERSION = "axiom.operator-page.v1";
@@ -110,6 +111,7 @@ export function buildOperationsReadModel(state, env = {}, architecture = {}, now
   const usage = state.marketData?.usage ?? {};
   const budgetSummary = costPublicSummary(state, env, now);
   const health = operationalHealth(state, now);
+  const rollout = publicRolloutState(state);
   const attention = [...incidents.map((item) => ({ code: item.kind, severity: item.severity,
     strategy_id: item.strategy_id, summary: item.summary }))];
   if (String(universe.feed ?? env.ALPACA_DATA_FEED ?? "iex").toLowerCase() === "iex") attention.push({
@@ -147,7 +149,7 @@ export function buildOperationsReadModel(state, env = {}, architecture = {}, now
     research: { paused: Boolean(state.research?.paused), pause_reason: state.research?.pause_reason ?? null,
       population: state.research?.population?.length ?? 0, trials: Object.keys(state.research?.trials ?? {}).length,
       cohorts: state.research?.cohorts?.length ?? 0, novelty_archive: state.research?.novelty_archive?.dna_hashes?.length ?? 0 },
-    incidents, attention: attention.slice(0, 100), observability: health,
+    incidents, attention: attention.slice(0, 100), observability: health, rollout,
     controls: { ...clone(state.orchestration?.controls ?? {}), release_paused: Boolean(state.orchestration?.controls?.release_paused) } });
 }
 

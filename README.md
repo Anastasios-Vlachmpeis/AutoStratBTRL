@@ -128,12 +128,27 @@ node scripts/estimate-monthly-cost.mjs .\protected-staging-usage.json
 
 Do not commit the usage file. Billing alerts should also be configured at the providers; they complement rather than replace the application controller.
 
+## Evidence-bound rollout
+
+Replacement of the prototype is controlled by phases A–I: foundations, data shadow, DSL/research shadow, Backtrader shadow, normalized-storage cutover, incubation shadow, paper canary, bounded autonomous paper, and legacy retirement. A phase advances only when every quantitative gate has immutable evidence and an authenticated operator submits the exact current phase with an idempotency key. Advancement records approval; it never changes Wrangler variables, enables Alpaca switches, deploys infrastructure, or submits an order.
+
+The Operations page shows the active phase and gate progress. Authenticated rollout endpoints are:
+
+- `POST /api/v1/admin/rollout/evidence`
+- `POST /api/v1/admin/rollout/advance`
+- `POST /api/v1/admin/rollout/domain-cutover`
+- `POST /api/v1/admin/rollback/rehearse`
+
+Rollback rehearsal writes a secret-free private replay bundle to R2, stores only hashes/metadata in D1, verifies the restore, and forces execution, entries, research, release, and global operation into paused state. Broker reconciliation and a fresh operator resume are mandatory after any real restore.
+
 ## Verification
 
 ```powershell
 npm run check
 npm run test:incubation
 npm run test:plan13
+npm run test:plan14
+npm run test:plan14:coverage
 npm run scan:secrets
 python -m unittest discover -s tests -v
 ```
@@ -145,5 +160,7 @@ python -m pytest backtester_service/tests -q
 ```
 
 Before a reviewed remote deployment, run `.\scripts\plan13-smoke.ps1`. After deployment, pass `-BacktestServiceUrl` to include the public health endpoint. The script never deploys or submits an Alpaca order.
+
+The complete pre-rollout command is `.\scripts\plan14-verify.ps1`. Use `-SkipBacktester` only for local development when the pinned Python service dependencies are unavailable; it is forbidden for a staging or paper rollout decision.
 
 No repository push or cloud deployment is performed by the implementation or test commands above.

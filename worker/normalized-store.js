@@ -9,6 +9,12 @@ const optional = (value) => value === undefined ? null : value;
 // This allowlist is deliberately static. Reset preparation must never accept a
 // browser-provided table name or predicate.
 export const NORMALIZED_WORKSPACE_TABLES = Object.freeze([
+  ["rollback_rehearsals", ["rehearsal_id"]],
+  ["rollback_backup_manifests", ["backup_id"]],
+  ["rollout_transitions", ["transition_id"]],
+  ["rollout_gate_evidence", ["evidence_id"]],
+  ["rollout_domain_cutovers", ["domain"]],
+  ["rollout_phase_state", ["workspace_id"]],
   ["normalized_read_models", ["read_model_id"]],
   ["workspace_reset_targets", ["reset_manifest_id", "target_id"]],
   ["workspace_reset_manifests", ["reset_manifest_id"]],

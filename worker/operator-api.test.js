@@ -38,6 +38,7 @@ test("operations DTO explains whether new paper risk is possible without exposin
     { mode: "dual_write", ready: true, bindings: { queue: true }, normalized_cutover_available: false });
   assert.equal(result.mode.new_risk_possible, true); assert.equal(result.market.feed, "IEX");
   assert.equal(result.market.consolidated_sip, false); assert.equal(result.data.expected_symbols, 40);
+  assert.equal(result.rollout.phase, "A"); assert.equal(result.rollout.legacy_authoritative, true);
   assert.equal(JSON.stringify(result).includes("never-return"), false);
   assert.ok(result.attention.some((item) => item.code === "iex_not_consolidated"));
 });

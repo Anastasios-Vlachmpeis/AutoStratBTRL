@@ -76,6 +76,9 @@ import { applyLifecycleCommand, bindLifecycleProvenance, initialLifecycle, trans
 import { ADMIN_COMMAND_DTO_VERSION, buildOperationsReadModel, operatorArtifacts, operatorLogs,
   operatorOrders, operatorTrades, operatorTrials, paginateOperatorItems, strategyEvidenceDto } from "./operator-api.js";
 import { incrementOperationalMetric, operationalHealth, recordHeartbeat, recordOperationalEvent, structuredLogLine } from "./observability.js";
+import { advanceRolloutPhase, ensureRolloutState, recordDomainCutover, recordRolloutEvidence } from "./rollout.js";
+import { createRollbackBundle, rehearseRollback } from "./rollback.js";
+import { RolloutStore } from "./rollout-store.js";
 
 const JSON_HEADERS = { "content-type": "application/json; charset=utf-8", "cache-control": "no-store" };
 const SINGLETON_NAME = CONTROL_PLANE_WORKSPACE;
@@ -421,6 +424,8 @@ export class AxiomLab extends DurableObject {
       ? new IncubationStore(env.AXIOM_DB) : null;
     this.healthStore = env.AXIOM_DB && String(env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true"
       ? new HealthStore(env.AXIOM_DB) : null;
+    this.rolloutStore = env.AXIOM_DB && String(env.NORMALIZED_STORAGE_ENABLED ?? "false").toLowerCase() === "true"
+      ? new RolloutStore(env.AXIOM_DB) : null;
     this.marketDataRepository = new MarketDataRepository(ctx.storage, env, SINGLETON_NAME);
     this.orchestrationStore = env.AXIOM_DB ? new OrchestrationStore(env.AXIOM_DB, {
       queue: env.AXIOM_JOBS, artifacts: env.AXIOM_ARTIFACTS,
@@ -430,6 +435,7 @@ export class AxiomLab extends DurableObject {
       if (!existing) {
         const initial = createDemoState();
         ensureOrchestrationState(initial, orchestrationMode(env));
+        ensureRolloutState(initial);
         initial.schemaVersion = CURRENT_SCHEMA_VERSION; initial.datasets = {}; initial.backtestArtifacts = {};
         const universe = await ensureMarketDataState(initial, env);
         await this.marketDataRepository.saveUniverse(universe);
@@ -444,6 +450,7 @@ export class AxiomLab extends DurableObject {
         }
         const universe = await ensureMarketDataState(migrated, env);
         ensureOrchestrationState(migrated, orchestrationMode(env));
+        ensureRolloutState(migrated);
         await this.marketDataRepository.saveUniverse(universe);
         await this.controlPlane.saveState(migrated);
       }
@@ -456,6 +463,7 @@ export class AxiomLab extends DurableObject {
   async load() {
     await this.ready;
     const state = await this.controlPlane.loadState();
+    if (state) ensureRolloutState(state);
     if (state && this.orchestrationStore) {
       const authoritative = await this.orchestrationStore.loadLifecycle(SINGLETON_NAME, "__workspace__");
       if (authoritative && authoritative.version > Number(state.orchestration?.version ?? -1)) {
@@ -472,6 +480,7 @@ export class AxiomLab extends DurableObject {
     state.datasets ??= {};
     state.backtestArtifacts ??= {};
     ensureOrchestrationState(state, orchestrationMode(this.env));
+    ensureRolloutState(state);
     await ensureMarketDataState(state, this.env);
     await this.controlPlane.saveState(state);
     return json(snapshot(state));
@@ -2432,6 +2441,66 @@ export class AxiomLab extends DurableObject {
           correlation_id: command.correlation_id, idempotency_key: idempotencyKey,
           status: result.queued ? "accepted" : result.status, terminal: !result.queued,
           outcome: result.queued ? null : result, ...(resetManifest ? { reset_manifest: resetManifest } : {}) }, result.queued ? 202 : 200);
+      }
+      if (request.method === "POST" && url.pathname === "/api/v1/admin/rollout/evidence") {
+        const body = await request.json().catch(() => ({}));
+        const result = recordRolloutEvidence(state, { phase: body.phase, gate: body.gate, status: body.status,
+          artifact_hash: body.artifact_hash, observed_at: body.observed_at ?? new Date(), details: body.details });
+        if (this.rolloutStore) await this.rolloutStore.persistRollout(SINGLETON_NAME, state);
+        this.record(state, "ROLLOUT", `Phase ${body.phase} ${body.gate} evidence recorded`,
+          `${body.status} · ${result.evidence.evidence_id}`, { correlation_id: body.correlation_id ?? result.evidence.evidence_id });
+        await this.controlPlane.saveState(state);
+        return json({ ok: true, duplicate: result.duplicate, evidence_id: result.evidence.evidence_id,
+          phase: result.evidence.phase, gate: result.evidence.gate, status: result.evidence.status });
+      }
+      if (request.method === "POST" && url.pathname === "/api/v1/admin/rollout/advance") {
+        const body = await request.json().catch(() => ({}));
+        const idempotencyKey = String(request.headers.get("idempotency-key") ?? body.idempotency_key ?? "");
+        const result = advanceRolloutPhase(state, { expected_phase: body.expected_phase, actor: "operator:admin",
+          idempotency_key: idempotencyKey, at: new Date() });
+        if (result.advanced && this.rolloutStore) await this.rolloutStore.persistRollout(SINGLETON_NAME, state);
+        this.record(state, "ROLLOUT", result.advanced ? `Rollout advanced from phase ${body.expected_phase}`
+          : `Rollout phase ${body.expected_phase} remains blocked`, result.advanced
+          ? `Next phase ${result.phase}${result.complete ? " · legacy authority retired" : ""}`
+          : result.evaluation.gates.filter((gate) => !gate.passed).map((gate) => gate.gate).join(", "),
+        { correlation_id: idempotencyKey, transition_id: result.transition?.transition_id });
+        await this.controlPlane.saveState(state);
+        return json(result, result.advanced ? 200 : 409);
+      }
+      if (request.method === "POST" && url.pathname === "/api/v1/admin/rollout/domain-cutover") {
+        const body = await request.json().catch(() => ({}));
+        const result = recordDomainCutover(state, { domain: body.domain, expected_write: body.expected_write,
+          expected_read: body.expected_read, target_write: body.target_write, target_read: body.target_read,
+          parity_hash: body.parity_hash, actor: "operator:admin", at: new Date(), rollback: body.rollback === true });
+        if (this.rolloutStore) await this.rolloutStore.persistRollout(SINGLETON_NAME, state);
+        this.record(state, "ROLLOUT", `${body.domain} authority updated`,
+          `${result.write_authority} writes · ${result.read_authority} reads${result.rollback ? " · rollback" : ""}`,
+        { correlation_id: result.cutover_id });
+        await this.controlPlane.saveState(state);
+        return json({ ok: true, cutover: result });
+      }
+      if (request.method === "POST" && url.pathname === "/api/v1/admin/rollback/rehearse") {
+        const contentStore = this.controlPlane.artifacts.contentStore;
+        if (!contentStore || !this.rolloutStore) return json({ error: "Rollback rehearsal requires normalized D1/R2 storage" }, 503);
+        const createdAt = new Date().toISOString();
+        const bundle = createRollbackBundle(state, { workspace_id: SINGLETON_NAME, created_at: createdAt });
+        const manifest = await contentStore.put({ workspaceId: SINGLETON_NAME, kind: "replay.bundle", content: bundle,
+          visibility: "private", mediaType: "application/json", metadata: { backup_id: bundle.backup_id, purpose: "rollback" },
+          provenance: { resultHash: bundle.state_hash, redactionClass: "private" } });
+        await this.rolloutStore.persistBackupManifest(SINGLETON_NAME, bundle, manifest.object_key);
+        const { report } = rehearseRollback(state, bundle, { rehearsed_at: new Date().toISOString() });
+        await this.rolloutStore.persistRehearsal(SINGLETON_NAME, report);
+        if (state.rollout.phase === "E") recordRolloutEvidence(state, { phase: "E", gate: "rollback_rehearsal",
+          status: report.passed ? "passed" : "failed", artifact_hash: report.report_hash,
+          observed_at: report.rehearsed_at, details: { backup_verified: report.backup_verified,
+            restore_verified: report.strategy_identity_verified, idempotency_preserved: report.idempotency_preserved,
+            execution_paused_after_restore: report.execution_paused_after_restore } });
+        await this.rolloutStore.persistRollout(SINGLETON_NAME, state);
+        this.record(state, "ROLLOUT", "Rollback rehearsal completed", `${bundle.backup_id} · ${report.passed ? "passed" : "failed"}`,
+          { correlation_id: report.report_hash });
+        await this.controlPlane.saveState(state);
+        return json({ ok: report.passed, backup_id: bundle.backup_id, state_hash: bundle.state_hash,
+          manifest_hash: bundle.manifest_hash, artifact_id: manifest.artifact_id, report });
       }
       if (request.method === "GET" && url.pathname === "/api/state") {
         if (String(this.env.NORMALIZED_READ_ENABLED ?? "false").toLowerCase() === "true") {
