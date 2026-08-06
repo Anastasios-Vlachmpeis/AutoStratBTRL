@@ -1,5 +1,7 @@
-# Axiom Strategy Foundry
+# Strategy foundry and supervised release-t0-market framework
 
+(Will continue working on it when budget allows to)
+ 
 A self-supervising research and Alpaca paper-trading system for regular-session US equities on canonical five-minute data. It generates typed strategy DNA, screens candidates, runs development and sealed holdout backtests, incubates approved strategies on forward data, and monitors released paper strategies.
 
 The checked-in configuration is deliberately safe: observation mode is enabled, market ingestion is off, the legacy control plane remains readable, Backtrader runs in shadow mode, and all Alpaca order submission is disabled.
