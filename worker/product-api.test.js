@@ -85,7 +85,7 @@ test("legacy and granular pauses cannot be misreported as fully running", () => 
   assert.equal(status.label, "PAUSED"); assert.equal(status.can_resume, false);
   state.orchestration.controls.global_paused = false; state.orchestration.controls.release_paused = true;
   status = buildDashboardReadModel(state, env, operations(state)).system;
-  assert.equal(status.label, "DEGRADED"); assert.match(status.detail, /Advanced subsystem pause/);
+  assert.equal(status.label, "DEGRADED"); assert.match(status.detail, /subsystem pause/);
 });
 
 test("strategy lists hide retired work by default and paginate stable stage filters", () => {
@@ -97,27 +97,28 @@ test("strategy lists hide retired work by default and paginate stable stage filt
   assert.equal(productStage(state.strategies[4]), "watch");
 });
 
-test("strategy detail is presentation-safe and never exposes sealed data or secrets", () => {
+test("strategy detail is intentionally small and never exposes research internals or secrets", () => {
   const state = fixture(); state.strategies[2].params.private_holdout_bars = [{ close: 123 }];
   state.strategies[2].params.api_secret = "never-return";
   const detail = buildStrategyDetail(state, "S-3"), serialized = JSON.stringify(detail);
   assert.equal(detail.incubation.required_days, 10); assert.equal(detail.incubation.required_trades, 67);
-  assert.equal(detail.evidence.provenance.validation.raw_bars_exposed, false);
   assert.equal(detail.lifecycle[0].reason_code, "gate_pass");
+  assert.equal("research" in detail, false); assert.equal("evidence" in detail, false);
   assert.equal(serialized.includes("private_holdout_bars"), false);
   assert.equal(serialized.includes("never-return"), false);
   assert.equal(serialized.includes("API_SECRET"), false);
   assert.equal(buildStrategyDetail(state, "missing"), null);
 });
 
-test("current work chart payload is capped at twelve strategies", () => {
+test("current work stays text-only instead of shipping decorative chart data", () => {
   const state = fixture(); state.strategies = Array.from({ length: 20 }, (_, index) => {
     const item = strategy(`Q-${index}`, "generated", index / 1000);
     item.lifecycle.operational.state = "running"; return item;
   });
   const dashboard = buildDashboardReadModel(state, env, operations(state));
   assert.equal(dashboard.current_work.kind, "backtesting");
-  assert.equal(dashboard.current_work.curves.length, 12);
+  assert.equal(dashboard.current_work.count, 20);
+  assert.equal("curves" in dashboard.current_work, false);
 });
 
 test("legacy strategies with missing presentation fields still produce a hashable dashboard", () => {

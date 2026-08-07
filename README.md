@@ -32,11 +32,11 @@ npm run dev:cloudflare
 
 Open the Wrangler URL, normally `http://127.0.0.1:8787`. Put only local secrets in `.dev.vars`; it is ignored by Git.
 
-The browser opens on **Overview**, which combines paper-account performance, active strategy curves, pipeline progress,
-actionable alerts, and current autonomous work. **Strategies** contains the full lifecycle book; infrastructure and
-operator tools live behind the **Advanced** gear. There are no manual generation or pipeline-advance controls in the
-normal product. The admin token is kept in `sessionStorage` only and is discarded on sign-out or when the browser
-session ends.
+The browser is intentionally one simple terminal. It shows what automation is doing, paper-account performance,
+pipeline counts, strategy curves and stages, and the latest automatic decisions. The only normal controls are
+pause/resume automation, strategy filtering, and a confirmed emergency stop. Infrastructure, rollout, artifact and
+recovery APIs remain available to operators but are not exposed as a browser console. The admin token is kept in
+`sessionStorage` only and is discarded on sign-out or when the browser session ends.
 
 ## Cloudflare preparation
 

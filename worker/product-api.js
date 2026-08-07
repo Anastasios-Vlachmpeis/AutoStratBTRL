@@ -1,5 +1,5 @@
 import { hashCanonical } from "./dsl.js";
-import { deterministicDownsample, operatorLogs, paginateOperatorItems, strategyEvidenceDto } from "./operator-api.js";
+import { deterministicDownsample, operatorLogs, paginateOperatorItems } from "./operator-api.js";
 
 export const DASHBOARD_DTO_VERSION = "axiom.dashboard.v1";
 export const STRATEGY_LIST_DTO_VERSION = "axiom.strategy-list.v1";
@@ -11,17 +11,6 @@ const RETIRED_STATES = new Set(["development_reject", "holdout_reject", "inconcl
 const finite = (value, fallback = 0) => Number.isFinite(Number(value)) ? Number(value) : fallback;
 const clone = (value) => value == null ? value : JSON.parse(JSON.stringify(value));
 const iso = (value) => { const date = new Date(value ?? 0); return Number.isNaN(date.getTime()) ? null : date.toISOString(); };
-
-function safeResearchValue(value, depth = 0) {
-  if (depth > 10 || value == null || typeof value === "boolean") return value ?? null;
-  if (typeof value === "number") return Number.isFinite(value) ? value : null;
-  if (typeof value === "string") return value.slice(0, 500);
-  if (Array.isArray(value)) return value.slice(0, 128).map((item) => safeResearchValue(item, depth + 1));
-  if (typeof value !== "object") return null;
-  return Object.fromEntries(Object.entries(value).filter(([key]) =>
-    !/(^|_)(raw|holdout|development|market)_?bars|secret|token|credential|api[_-]?key|object[_-]?key/i.test(key))
-    .map(([key, nested]) => [key, safeResearchValue(nested, depth + 1)]));
-}
 
 export function productStage(strategy = {}) {
   if (strategy.operational_status === "operational_blocked") return "watch";
@@ -101,14 +90,14 @@ function systemStatus(state, env, operations) {
   if (mode !== "autonomous") return { code: "setup_required", label: "SETUP REQUIRED",
     detail: "Autonomous scheduling is not enabled in this deployment.", can_pause: false, can_resume: false };
   if (controls.autonomy_paused || controls.global_paused) return { code: "paused", label: "PAUSED",
-    detail: controls.global_paused ? "A legacy global pause is active; use Advanced controls to inspect it."
+    detail: controls.global_paused ? "A system-wide pause is active."
       : "New research, releases and increased exposure are paused; safety supervision continues.",
     can_pause: false, can_resume: Boolean(controls.autonomy_paused) && !controls.execution_paused && !controls.global_paused };
   const critical = (operations.attention ?? []).some((item) => ["critical", "critical_risk", "execution_blocked"].includes(item.severity));
   const unhealthyData = !["healthy", "ready"].includes(String(operations.data?.status ?? "unknown").toLowerCase());
   const granularPause = controls.execution_paused || controls.research_paused || controls.release_paused || controls.ingestion_paused;
   if (critical || unhealthyData || granularPause) return { code: "degraded", label: "DEGRADED",
-    detail: granularPause ? "An Advanced subsystem pause is active; unaffected safety supervision continues."
+    detail: granularPause ? "A subsystem pause is active; unaffected safety supervision continues."
       : "Automation is running with an issue that needs attention.", can_pause: true, can_resume: false };
   return { code: "running", label: "RUNNING", detail: "The autonomous paper pipeline is supervising itself.", can_pause: true, can_resume: false };
 }
@@ -130,10 +119,7 @@ function currentWork(state, strategies, operations) {
   } else if (cohort.status && !["complete", "completed", "failed"].includes(String(cohort.status).toLowerCase())) {
     kind = "generation"; title = "Generating strategy DNA"; detail = String(cohort.status).replaceAll("_", " ");
   }
-  return { kind, title, detail, count: items.length,
-    curves: items.slice(0, 12).map((strategy) => ({ strategy_id: String(strategy.id),
-      name: strategy.name ?? strategy.id, asset: strategy.asset ?? null,
-      curve: safeCurve(strategy, 100) })).filter((item) => item.curve.length >= 2) };
+  return { kind, title, detail, count: items.length };
 }
 
 function accountSummary(state) {
@@ -228,19 +214,12 @@ function strategyExplanation(strategy) {
 export function buildStrategyDetail(state, strategyId) {
   const strategy = (state.strategies ?? []).find((item) => item.id === strategyId);
   if (!strategy) return null;
-  const summary = strategySummary(strategy), dna = strategy.strategy_dna ?? null;
+  const summary = strategySummary(strategy);
   return Object.freeze({ dto_version: STRATEGY_DETAIL_DTO_VERSION, ...summary,
-    explanation: strategyExplanation(strategy), evidence: strategyEvidenceDto(strategy),
-    lifecycle: (strategy.lifecycle?.history ?? []).slice(-30).map((item) => ({ id: item.transition_id,
+    explanation: strategyExplanation(strategy),
+    lifecycle: (strategy.lifecycle?.history ?? []).slice(-10).map((item) => ({ id: item.transition_id,
       at: iso(item.timestamp), from: item.from, to: item.target, explanation: item.explanation,
-      reason_code: item.reason_code ?? null })),
-    research: { strategy_format: strategy.strategy_format, parent_id: strategy.parent ?? null,
-      dna_hash: strategy.dna_hash ?? null, params: safeResearchValue(strategy.params ?? {}),
-      dna: dna ? { strategy_id: dna.strategy_id, dsl_version: dna.dsl_version, scope: safeResearchValue(dna.scope),
-        features: safeResearchValue(dna.features), entry: safeResearchValue(dna.entry), exit: safeResearchValue(dna.exit),
-        target: safeResearchValue(dna.target), risk: safeResearchValue(dna.risk), session: safeResearchValue(dna.session),
-        warmup_bars: dna.warmup_bars, lineage: safeResearchValue(dna.lineage) } : null,
-      regime_scores: safeResearchValue(strategy.metrics?.regime_scores ?? null) } });
+      reason_code: item.reason_code ?? null })) });
 }
 
 export function autonomyRequest(value) {
