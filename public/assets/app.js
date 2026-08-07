@@ -1,7 +1,7 @@
 "use strict";
 
 const TOKEN_KEY = "axiom-admin-token";
-const COLORS = ["#d8f66a", "#79d9cc", "#af98ee", "#e4bd5c", "#ef8f74", "#75a8e8", "#e58bc3", "#9ad17b"];
+const COLORS = ["#ef805f", "#ca5c43", "#f0a06f", "#a94735", "#db7555", "#f2b083", "#913e30", "#c98161"];
 const PIPELINE = [
   ["generation", "Generated"],
   ["backtesting", "Backtesting"],

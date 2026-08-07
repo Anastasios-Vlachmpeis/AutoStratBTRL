@@ -57,6 +57,15 @@ test("strategy labels are hidden by default and layout remains responsive", () =
   assert.match(styles, /@media \(max-width: 640px\)/);
 });
 
+test("the visual language is an old phosphor terminal rather than a rounded dashboard", () => {
+  assert.match(styles, /--bg:\s*#040504/);
+  assert.match(styles, /--acid:\s*#ef805f/);
+  assert.match(styles, /body::before[^}]*repeating-linear-gradient/s);
+  assert.match(styles, /\.panel\s*\{[^}]*border-radius:\s*0/s);
+  assert.match(styles, /text-shadow:\s*0 0 5px/);
+  assert.match(script, /#ef805f/);
+});
+
 test("tests are not shipped as public static assets", () => {
   assert.equal(publicFiles.some((name) => name.endsWith(".test.js")), false);
 });
